@@ -1,11 +1,18 @@
 #!/bin/bash
 
-VERSION=$1
+STORAGE_VERSION=$1
+TYTONAI_VERSION=$2
 
-docker build -t harbor.internal.millcrest.dev/supabase/storage-api:v$VERSION-tytonai --build-arg VERSION=v$VERSION .
+IMAGE_NAME=storage-api:v$STORAGE_VERSION-tytonai-$TYTONAI_VERSION
+HARBOR_PREFIX=${DOCKER_REGISTRY:-harbor.internal.millcrest.dev}/supabase
+GOOGLE_PREFIX=${GOOGLE_REGISTRY:-asia-southeast1-docker.pkg.dev/tytonai/docker}/supabase
 
-if [ $? -eq 0 ]; then
-    docker push harbor.internal.millcrest.dev/supabase/storage-api:v$VERSION-tytonai
-    docker tag harbor.internal.millcrest.dev/supabase/storage-api:v$VERSION-tytonai asia-southeast1-docker.pkg.dev/tytonai/docker/supabase/storage-api:v$VERSION-tytonai
-    docker push asia-southeast1-docker.pkg.dev/tytonai/docker/supabase/storage-api:v$VERSION-tytonai
-fi
+docker buildx build \
+    --builder=container \
+    -t $HARBOR_PREFIX/$IMAGE_NAME \
+    -t $GOOGLE_PREFIX/$IMAGE_NAME \
+    --build-arg VERSION=v$STORAGE_VERSION \
+    --platform linux/amd64 \
+    --provenance=false \
+    --output "type=image,compression=zstd,compression-level=22,oci-mediatypes=true,force-compression=true,push=true" \
+    .
