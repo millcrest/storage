@@ -311,7 +311,10 @@ export class S3Backend implements StorageBackendAdapter {
             )
             .catch((e) => {
               const err = StorageBackendError.fromError(e)
-              if (err.code === 'NoSuchKey') {
+              if (err.code === 'NoSuchKey' || err.error === 'The specified key does not exist.') {
+                return
+              }
+              if (typeof e === 'object' && e !== null && 'name' in e && e.name === 'NoSuchKey') {
                 return
               }
               logger.info(`[StorageBackendError] raw: ${JSON.stringify(err)}`)
