@@ -1,11 +1,11 @@
 import { Queue } from '@internal/queue'
-import {
-  ObjectAdminDelete,
-  Webhook,
-  RunMigrationsOnTenants,
-  BackupObjectEvent,
-  ResetMigrationsOnTenant,
-} from './index'
+import { Webhook } from './lifecycle/webhook'
+import { ObjectAdminDelete } from './lifecycle/object-admin-delete'
+import { RunMigrationsOnTenants } from './migrations/run-migrations'
+import { BackupObjectEvent } from './objects/backup-object'
+import { ResetMigrationsOnTenant } from './migrations/reset-migrations'
+import { JwksCreateSigningSecret } from './jwks/jwks-create-signing-secret'
+import { UpgradePgBossV10 } from './pgboss/upgrade-v10'
 
 export function registerWorkers() {
   Queue.register(Webhook)
@@ -13,4 +13,6 @@ export function registerWorkers() {
   Queue.register(RunMigrationsOnTenants)
   Queue.register(BackupObjectEvent)
   Queue.register(ResetMigrationsOnTenant)
+  Queue.register(JwksCreateSigningSecret)
+  Queue.register(UpgradePgBossV10)
 }

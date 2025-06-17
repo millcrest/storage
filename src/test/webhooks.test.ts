@@ -1,7 +1,7 @@
 import { TenantConnection } from '@internal/database'
 import { getConfig, mergeConfig } from '../config'
 
-const { serviceKey, tenantId } = getConfig()
+const { serviceKeyAsync, tenantId } = getConfig()
 
 mergeConfig({
   pgQueueEnable: true,
@@ -16,6 +16,7 @@ import { getPostgresConnection } from '@internal/database'
 import { Obj } from '@storage/schemas'
 import { randomUUID } from 'crypto'
 import { getServiceKeyUser } from '@internal/database'
+import { FastifyInstance } from 'fastify'
 
 describe('Webhooks', () => {
   useMockObject()
@@ -31,27 +32,31 @@ describe('Webhooks', () => {
     })
   })
 
+  let appInstance: FastifyInstance
   let sendSpy: jest.SpyInstance
   beforeEach(() => {
     const mocks = mockQueue()
     sendSpy = mocks.sendSpy
+    appInstance = app()
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    await appInstance.close()
     jest.clearAllMocks()
   })
 
   it('will emit a webhook upon object creation', async () => {
     const form = new FormData()
 
+    const authorization = `Bearer ${await serviceKeyAsync}`
     form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
     const headers = Object.assign({}, form.getHeaders(), {
-      authorization: `Bearer ${serviceKey}`,
+      authorization,
     })
 
     const fileName = (Math.random() + 1).toString(36).substring(7)
 
-    const response = await app().inject({
+    const response = await appInstance.inject({
       method: 'POST',
       url: `/object/bucket6/public/${fileName}.png`,
       headers,
@@ -62,7 +67,10 @@ describe('Webhooks', () => {
     expect(sendSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         name: 'webhooks',
-        options: undefined,
+        options: expect.objectContaining({
+          deadLetter: 'webhooks-dead-letter',
+          expireInSeconds: expect.any(Number),
+        }),
         data: expect.objectContaining({
           $version: 'v1',
           event: expect.objectContaining({
@@ -97,11 +105,12 @@ describe('Webhooks', () => {
   it('will emit a webhook upon object deletion', async () => {
     const obj = await createObject(pg, 'bucket6')
 
-    const response = await app().inject({
+    const authorization = `Bearer ${await serviceKeyAsync}`
+    const response = await appInstance.inject({
       method: 'DELETE',
       url: `/object/bucket6/${obj.name}`,
       headers: {
-        Authorization: `Bearer ${serviceKey}`,
+        authorization,
       },
     })
     expect(response.statusCode).toBe(200)
@@ -111,7 +120,10 @@ describe('Webhooks', () => {
       1,
       expect.objectContaining({
         name: 'webhooks',
-        options: undefined,
+        options: expect.objectContaining({
+          deadLetter: 'webhooks-dead-letter',
+          expireInSeconds: expect.any(Number),
+        }),
         data: expect.objectContaining({
           $version: 'v1',
           event: expect.objectContaining({
@@ -140,11 +152,12 @@ describe('Webhooks', () => {
   it('will emit a webhook upon object moved', async () => {
     const obj = await createObject(pg, 'bucket6')
 
-    const response = await app().inject({
+    const authorization = `Bearer ${await serviceKeyAsync}`
+    const response = await appInstance.inject({
       method: 'POST',
       url: `/object/move`,
       headers: {
-        Authorization: `Bearer ${serviceKey}`,
+        authorization,
       },
       payload: {
         bucketId: 'bucket6',
@@ -160,7 +173,10 @@ describe('Webhooks', () => {
       2,
       expect.objectContaining({
         name: 'webhooks',
-        options: undefined,
+        options: expect.objectContaining({
+          deadLetter: 'webhooks-dead-letter',
+          expireInSeconds: expect.any(Number),
+        }),
         data: expect.objectContaining({
           $version: 'v1',
           event: expect.objectContaining({
@@ -190,7 +206,10 @@ describe('Webhooks', () => {
       3,
       expect.objectContaining({
         name: 'webhooks',
-        options: undefined,
+        options: expect.objectContaining({
+          deadLetter: 'webhooks-dead-letter',
+          expireInSeconds: expect.any(Number),
+        }),
         data: expect.objectContaining({
           $version: 'v1',
           event: expect.objectContaining({
@@ -235,11 +254,12 @@ describe('Webhooks', () => {
   it('will emit a webhook upon object copied', async () => {
     const obj = await createObject(pg, 'bucket6')
 
-    const response = await app().inject({
+    const authorization = `Bearer ${await serviceKeyAsync}`
+    const response = await appInstance.inject({
       method: 'POST',
       url: `/object/copy`,
       headers: {
-        Authorization: `Bearer ${serviceKey}`,
+        authorization,
       },
       payload: {
         bucketId: 'bucket6',
@@ -254,7 +274,10 @@ describe('Webhooks', () => {
     expect(sendSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         name: 'webhooks',
-        options: undefined,
+        options: expect.objectContaining({
+          deadLetter: 'webhooks-dead-letter',
+          expireInSeconds: expect.any(Number),
+        }),
         data: expect.objectContaining({
           $version: 'v1',
           event: expect.objectContaining({
