@@ -1,4 +1,4 @@
-import { Bucket, S3MultipartUpload, Obj, S3PartUpload } from '../schemas'
+import { Bucket, S3MultipartUpload, Obj, S3PartUpload, IcebergCatalog } from '../schemas'
 import { ObjectMetadata } from '../backend'
 import { TenantConnection } from '@internal/database'
 import { DBMigration } from '@internal/database/migrations'
@@ -44,6 +44,14 @@ export interface DatabaseOptions<TNX> {
   parentConnection?: TenantConnection
 }
 
+export interface ListBucketOptions {
+  limit?: number
+  offset?: number
+  sortColumn?: string
+  sortOrder?: string
+  search?: string
+}
+
 export interface Database {
   tenantHost: string
   tenantId: string
@@ -69,13 +77,15 @@ export interface Database {
     >
   ): Promise<Pick<Bucket, 'id'>>
 
+  createIcebergBucket(data: Pick<Bucket, 'id' | 'name'>): Promise<IcebergCatalog>
+
   findBucketById<Filters extends FindBucketFilters = FindObjectFilters>(
     bucketId: string,
     columns: string,
     filters?: Filters
   ): Promise<Filters['dontErrorOnEmpty'] extends true ? Bucket | undefined : Bucket>
 
-  countObjectsInBucket(bucketId: string): Promise<number>
+  countObjectsInBucket(bucketId: string, limit?: number): Promise<number>
 
   deleteBucket(bucketId: string | string[]): Promise<Bucket[]>
 
@@ -86,6 +96,7 @@ export interface Database {
     before?: Date,
     nextToken?: string
   ): Promise<Obj[]>
+
   listObjectsV2(
     bucketId: string,
     options?: {
@@ -108,8 +119,9 @@ export interface Database {
     }
   ): Promise<S3MultipartUpload[]>
 
-  listBuckets(columns: string): Promise<Bucket[]>
+  listBuckets(columns: string, options?: ListBucketOptions): Promise<Bucket[]>
   mustLockObject(bucketId: string, objectName: string, version?: string): Promise<boolean>
+
   waitObjectLock(
     bucketId: string,
     objectName: string,
@@ -125,6 +137,7 @@ export interface Database {
   upsertObject(
     data: Pick<Obj, 'name' | 'owner' | 'bucket_id' | 'metadata' | 'version' | 'user_metadata'>
   ): Promise<Obj>
+
   updateObject(
     bucketId: string,
     name: string,
@@ -138,6 +151,7 @@ export interface Database {
   deleteObject(bucketId: string, objectName: string, version?: string): Promise<Obj | undefined>
 
   deleteObjects(bucketId: string, objectNames: string[], by: keyof Obj): Promise<Obj[]>
+
   deleteObjectVersions(
     bucketId: string,
     objectNames: { name: string; version: string }[]
@@ -148,11 +162,13 @@ export interface Database {
   updateObjectOwner(bucketId: string, objectName: string, owner?: string): Promise<Obj>
 
   findObjects(bucketId: string, objectNames: string[], columns: string): Promise<Obj[]>
+
   findObjectVersions(
     bucketId: string,
     objectNames: { name: string; version: string }[],
     columns: string
   ): Promise<Obj[]>
+
   findObject<Filters extends FindObjectFilters = FindObjectFilters>(
     bucketId: string,
     objectName: string,
@@ -161,6 +177,7 @@ export interface Database {
   ): Promise<Filters['dontErrorOnEmpty'] extends true ? Obj | undefined : Obj>
 
   searchObjects(bucketId: string, prefix: string, options: SearchObjectOption): Promise<Obj[]>
+
   healthcheck(): Promise<void>
 
   destroyConnection(): Promise<void>
@@ -190,8 +207,11 @@ export interface Database {
   deleteMultipartUpload(uploadId: string): Promise<void>
 
   insertUploadPart(part: S3PartUpload): Promise<S3PartUpload>
+
   listParts(
     uploadId: string,
     options: { afterPart?: string; maxParts: number }
   ): Promise<S3PartUpload[]>
+
+  deleteAnalyticsBucket(id: string): Promise<void>
 }

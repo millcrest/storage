@@ -3,6 +3,7 @@ import type { DBMigration } from '@internal/database/migrations'
 import { SignJWT } from 'jose'
 
 export type StorageBackendType = 'file' | 's3'
+export type IcebergCatalogAuthType = 'sigv4' | 'token'
 export enum MultitenantMigrationStrategy {
   PROGRESSIVE = 'progressive',
   ON_REQUEST = 'on_request',
@@ -97,6 +98,7 @@ type StorageConfigType = {
   responseSMaxAge: number
   anonKeyAsync: Promise<string>
   serviceKeyAsync: Promise<string>
+  emptyBucketMax: number
   storageBackendType: StorageBackendType
   tenantId: string
   requestUrlLengthLimit: number
@@ -172,6 +174,17 @@ type StorageConfigType = {
   }
   cdnPurgeEndpointURL?: string
   cdnPurgeEndpointKey?: string
+
+  icebergWarehouse: string
+  icebergCatalogUrl: string
+  icebergCatalogAuthType: IcebergCatalogAuthType
+  icebergCatalogToken?: string
+  icebergMaxNamespaceCount: number
+  icebergMaxTableCount: number
+  icebergMaxCatalogsCount: number
+  icebergBucketDetectionSuffix: string
+  icebergBucketDetectionMode: 'BUCKET' | 'FULL_PATH'
+  icebergS3DeleteEnabled: boolean
 }
 
 function getOptionalConfigFromEnv(key: string, fallback?: string): string | undefined {
@@ -313,6 +326,7 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     ),
     // Storage
     storageBackendType: getOptionalConfigFromEnv('STORAGE_BACKEND') as StorageBackendType,
+    emptyBucketMax: parseInt(getOptionalConfigFromEnv('STORAGE_EMPTY_BUCKET_MAX') || '200000', 10),
 
     // Storage - File
     storageFilePath: getOptionalConfigFromEnv(
@@ -489,6 +503,25 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       getOptionalConfigFromEnv('RATE_LIMITER_REDIS_COMMAND_TIMEOUT') || '2',
       10
     ),
+
+    icebergWarehouse: getOptionalConfigFromEnv('ICEBERG_WAREHOUSE') || '',
+    icebergCatalogUrl:
+      getOptionalConfigFromEnv('ICEBERG_CATALOG_URL') ||
+      `https://s3tables.ap-southeast-1.amazonaws.com/iceberg/v1`,
+
+    icebergBucketDetectionSuffix:
+      getOptionalConfigFromEnv('ICEBERG_BUCKET_DETECTION_SUFFIX') || `--table-s3`,
+    icebergBucketDetectionMode:
+      getOptionalConfigFromEnv('ICEBERG_BUCKET_DETECTION_MODE') || `BUCKET`,
+    icebergCatalogAuthType: getOptionalConfigFromEnv('ICEBERG_CATALOG_AUTH_TYPE') || `sigv4`,
+    icebergCatalogToken: getOptionalConfigFromEnv('ICEBERG_CATALOG_AUTH_TOKEN'),
+    icebergMaxCatalogsCount: parseInt(getOptionalConfigFromEnv('ICEBERG_MAX_CATALOGS') || '2', 10),
+    icebergMaxNamespaceCount: parseInt(
+      getOptionalConfigFromEnv('ICEBERG_MAX_NAMESPACES') || '25',
+      10
+    ),
+    icebergMaxTableCount: parseInt(getOptionalConfigFromEnv('ICEBERG_MAX_TABLES') || '10', 10),
+    icebergS3DeleteEnabled: getOptionalConfigFromEnv('ICEBERG_S3_DELETE_ENABLED') === 'true',
   } as StorageConfigType
 
   const serviceKey = getOptionalConfigFromEnv('SERVICE_KEY') || ''

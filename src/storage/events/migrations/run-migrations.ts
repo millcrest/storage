@@ -35,7 +35,6 @@ export class RunMigrationsOnTenants extends BaseEvent<RunMigrationsPayload> {
 
   static getSendOptions(payload: RunMigrationsPayload): SendOptions {
     return {
-      expireInHours: 24,
       singletonKey: `migrations_${payload.tenantId}`,
       singletonHours: 1,
       retryLimit: 3,
@@ -94,6 +93,21 @@ export class RunMigrationsOnTenants extends BaseEvent<RunMigrationsPayload> {
       } else {
         await updateTenantMigrationsState(tenantId, { state: TenantMigrationStatus.FAILED })
       }
+
+      try {
+        // get around pg-boss not allowing to have a stately queue in a state
+        // where there is a job in created state and retry state
+        const singletonKey = job.singletonKey || ''
+        await this.deleteIfActiveExists(this.getQueueName(), singletonKey, job.id)
+      } catch (e) {
+        logSchema.error(logger, `[Migrations] Error deleting job ${job.id}`, {
+          type: 'migrations',
+          error: e,
+          project: tenantId,
+        })
+        return
+      }
+
       throw e
     }
   }
