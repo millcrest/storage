@@ -1,10 +1,11 @@
-import { BaseEvent } from './base-event'
+import { BaseEvent } from '../base-event'
 import { getTenantConfig, TenantMigrationStatus } from '@internal/database'
-import { JobWithMetadata, SendOptions, WorkOptions } from 'pg-boss'
+import { JobWithMetadata, Queue, SendOptions, WorkOptions } from 'pg-boss'
 import { logger, logSchema } from '@internal/monitoring'
 import { BasePayload } from '@internal/queue'
 import {
   areMigrationsUpToDate,
+  DBMigration,
   runMigrationsOnTenant,
   updateTenantMigrationsState,
 } from '@internal/database/migrations'
@@ -12,31 +13,38 @@ import { ErrorCode, StorageBackendError } from '@internal/errors'
 
 interface RunMigrationsPayload extends BasePayload {
   tenantId: string
+  upToMigration?: keyof typeof DBMigration
 }
 
 export class RunMigrationsOnTenants extends BaseEvent<RunMigrationsPayload> {
   static queueName = 'tenants-migrations'
+  static allowSync = false
+
+  static getQueueOptions(): Queue {
+    return {
+      name: this.queueName,
+      policy: 'stately',
+    } as const
+  }
 
   static getWorkerOptions(): WorkOptions {
     return {
-      teamSize: 200,
-      teamConcurrency: 10,
       includeMetadata: true,
     }
   }
 
-  static getQueueOptions(payload: RunMigrationsPayload): SendOptions {
+  static getSendOptions(payload: RunMigrationsPayload): SendOptions {
     return {
-      expireInHours: 2,
-      singletonKey: payload.tenantId,
-      useSingletonQueue: true,
+      expireInHours: 24,
+      singletonKey: `migrations_${payload.tenantId}`,
+      singletonHours: 1,
       retryLimit: 3,
       retryDelay: 5,
       priority: 10,
     }
   }
 
-  static async handle(job: JobWithMetadata<BasePayload>) {
+  static async handle(job: JobWithMetadata<RunMigrationsPayload>) {
     const tenantId = job.data.tenant.ref
     const tenant = await getTenantConfig(tenantId)
 
@@ -51,8 +59,16 @@ export class RunMigrationsOnTenants extends BaseEvent<RunMigrationsPayload> {
         type: 'migrations',
         project: tenantId,
       })
-      await runMigrationsOnTenant(tenant.databaseUrl, tenantId, false)
-      await updateTenantMigrationsState(tenantId)
+      await runMigrationsOnTenant({
+        databaseUrl: tenant.databaseUrl,
+        tenantId,
+        waitForLock: false,
+        upToMigration: job.data.upToMigration,
+      })
+      await updateTenantMigrationsState(tenantId, {
+        migration: job.data.upToMigration,
+        state: TenantMigrationStatus.COMPLETED,
+      })
 
       logSchema.info(logger, `[Migrations] completed for tenant ${tenantId}`, {
         type: 'migrations',
@@ -73,7 +89,7 @@ export class RunMigrationsOnTenants extends BaseEvent<RunMigrationsPayload> {
         project: tenantId,
       })
 
-      if (job.retrycount === job.retrylimit) {
+      if (job.retryCount === job.retryLimit) {
         await updateTenantMigrationsState(tenantId, { state: TenantMigrationStatus.FAILED_STALE })
       } else {
         await updateTenantMigrationsState(tenantId, { state: TenantMigrationStatus.FAILED })

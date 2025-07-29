@@ -1,11 +1,52 @@
 import dotenv from 'dotenv'
-import jwt from 'jsonwebtoken'
+import type { DBMigration } from '@internal/database/migrations'
+import { SignJWT } from 'jose'
 
 export type StorageBackendType = 'file' | 's3'
 export enum MultitenantMigrationStrategy {
   PROGRESSIVE = 'progressive',
   ON_REQUEST = 'on_request',
   FULL_FLEET = 'full_fleet',
+}
+
+export interface JwksConfigKeyBase {
+  kid?: string
+  kty: string
+  alg?: string
+}
+
+export interface JwksConfigKeyOCT extends JwksConfigKeyBase {
+  k: string
+  kty: 'oct'
+}
+
+export interface JwksConfigKeyRSA extends JwksConfigKeyBase {
+  k: string
+  kty: 'RSA'
+  n: string
+  e: string
+}
+
+export interface JwksConfigKeyEC extends JwksConfigKeyBase {
+  k: string
+  kty: 'EC'
+  crv: string
+  x: string
+  y: string
+}
+
+export interface JwksConfigKeyOKP extends JwksConfigKeyBase {
+  k: string
+  kty: 'OKP'
+  crv: string
+  x: string
+}
+
+export type JwksConfigKey = JwksConfigKeyOCT | JwksConfigKeyRSA | JwksConfigKeyEC | JwksConfigKeyOKP
+
+export interface JwksConfig {
+  keys: JwksConfigKey[]
+  urlSigningKey?: JwksConfigKeyOCT
 }
 
 type StorageConfigType = {
@@ -30,7 +71,8 @@ type StorageConfigType = {
   isMultitenant: boolean
   jwtSecret: string
   jwtAlgorithm: string
-  jwtJWKS?: { keys: { kid?: string; kty: string }[] }
+  jwtCachingEnabled: boolean
+  jwtJWKS?: JwksConfig
   multitenantDatabaseUrl?: string
   dbAnonRole: string
   dbAuthenticatedRole: string
@@ -40,10 +82,12 @@ type StorageConfigType = {
   dbSuperUser: string
   dbSearchPath: string
   dbMigrationStrategy: MultitenantMigrationStrategy
+  dbMigrationFreezeAt?: keyof typeof DBMigration
   dbPostgresVersion?: string
   databaseURL: string
   databaseSSLRootCert?: string
   databasePoolURL?: string
+  databasePoolMode?: 'single_use' | 'recycle'
   databaseMaxConnections: number
   databaseFreePoolAfterInactivity: number
   databaseConnectionTimeout: number
@@ -51,8 +95,8 @@ type StorageConfigType = {
   requestTraceHeader?: string
   requestEtagHeaders: string[]
   responseSMaxAge: number
-  anonKey: string
-  serviceKey: string
+  anonKeyAsync: Promise<string>
+  serviceKeyAsync: Promise<string>
   storageBackendType: StorageBackendType
   tenantId: string
   requestUrlLengthLimit: number
@@ -62,6 +106,7 @@ type StorageConfigType = {
   logflareEnabled?: boolean
   logflareApiKey?: string
   logflareSourceToken?: string
+  logflareBatchSize: number
   pgQueueEnable: boolean
   pgQueueEnableWorkers?: boolean
   pgQueueReadWriteTimeout: number
@@ -71,6 +116,7 @@ type StorageConfigType = {
   pgQueueDeleteAfterDays?: number
   pgQueueArchiveCompletedAfterSeconds?: number
   pgQueueRetentionDays?: number
+  pgQueueConcurrentTasksPerQueue: number
   webhookURL?: string
   webhookApiKey?: string
   webhookQueuePullInterval?: number
@@ -124,6 +170,8 @@ type StorageConfigType = {
   tracingFeatures?: {
     upload: boolean
   }
+  cdnPurgeEndpointURL?: string
+  cdnPurgeEndpointKey?: string
 }
 
 function getOptionalConfigFromEnv(key: string, fallback?: string): string | undefined {
@@ -215,13 +263,10 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       'REQUEST_ADMIN_TRACE_HEADER'
     ),
 
-    // Auth
-    serviceKey: getOptionalConfigFromEnv('SERVICE_KEY') || '',
-    anonKey: getOptionalConfigFromEnv('ANON_KEY') || '',
-
     encryptionKey: getOptionalConfigFromEnv('AUTH_ENCRYPTION_KEY', 'ENCRYPTION_KEY') || '',
     jwtSecret: getOptionalIfMultitenantConfigFromEnv('AUTH_JWT_SECRET', 'PGRST_JWT_SECRET') || '',
     jwtAlgorithm: getOptionalConfigFromEnv('AUTH_JWT_ALGORITHM', 'PGRST_JWT_ALGORITHM') || 'HS256',
+    jwtCachingEnabled: getOptionalConfigFromEnv('JWT_CACHING_ENABLED') === 'true',
 
     // Upload
     uploadFileSizeLimit: Number(
@@ -299,6 +344,9 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     ),
     dbSuperUser: getOptionalConfigFromEnv('DB_SUPER_USER') || 'postgres',
     dbMigrationStrategy: getOptionalConfigFromEnv('DB_MIGRATIONS_STRATEGY') || 'on_request',
+    dbMigrationFreezeAt: getOptionalConfigFromEnv('DB_MIGRATIONS_FREEZE_AT') as
+      | keyof typeof DBMigration
+      | undefined,
 
     // Database - Connection
     dbSearchPath: getOptionalConfigFromEnv('DATABASE_SEARCH_PATH', 'DB_SEARCH_PATH') || '',
@@ -310,6 +358,7 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     databaseSSLRootCert: getOptionalConfigFromEnv('DATABASE_SSL_ROOT_CERT'),
     databaseURL: getOptionalIfMultitenantConfigFromEnv('DATABASE_URL') || '',
     databasePoolURL: getOptionalConfigFromEnv('DATABASE_POOL_URL') || '',
+    databasePoolMode: getOptionalConfigFromEnv('DATABASE_POOL_MODE'),
     databaseMaxConnections: parseInt(
       getOptionalConfigFromEnv('DATABASE_MAX_CONNECTIONS') || '20',
       10
@@ -323,11 +372,16 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       10
     ),
 
+    // CDN
+    cdnPurgeEndpointURL: getOptionalConfigFromEnv('CDN_PURGE_ENDPOINT_URL'),
+    cdnPurgeEndpointKey: getOptionalConfigFromEnv('CDN_PURGE_ENDPOINT_KEY'),
+
     // Monitoring
     logLevel: getOptionalConfigFromEnv('LOG_LEVEL') || 'info',
     logflareEnabled: getOptionalConfigFromEnv('LOGFLARE_ENABLED') === 'true',
     logflareApiKey: getOptionalConfigFromEnv('LOGFLARE_API_KEY'),
     logflareSourceToken: getOptionalConfigFromEnv('LOGFLARE_SOURCE_TOKEN'),
+    logflareBatchSize: parseInt(getOptionalConfigFromEnv('LOGFLARE_BATCH_SIZE') || '200', 10),
     defaultMetricsEnabled: !(
       getOptionalConfigFromEnv('DEFAULT_METRICS_ENABLED', 'ENABLE_DEFAULT_METRICS') === 'false'
     ),
@@ -359,6 +413,10 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       10
     ),
     pgQueueRetentionDays: parseInt(getOptionalConfigFromEnv('PG_QUEUE_RETENTION_DAYS') || '2', 10),
+    pgQueueConcurrentTasksPerQueue: parseInt(
+      getOptionalConfigFromEnv('PG_QUEUE_CONCURRENT_TASKS_PER_QUEUE') || '50',
+      10
+    ),
 
     // Webhooks
     webhookURL: getOptionalConfigFromEnv('WEBHOOK_URL'),
@@ -433,27 +491,34 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     ),
   } as StorageConfigType
 
-  if (!config.isMultitenant && !config.serviceKey) {
-    config.serviceKey = jwt.sign({ role: config.dbServiceRole }, config.jwtSecret, {
-      expiresIn: '10y',
-      algorithm: config.jwtAlgorithm as jwt.Algorithm,
-    })
+  const serviceKey = getOptionalConfigFromEnv('SERVICE_KEY') || ''
+  if (!config.isMultitenant && !serviceKey) {
+    config.serviceKeyAsync = new SignJWT({ role: config.dbServiceRole })
+      .setIssuedAt()
+      .setExpirationTime('10y')
+      .setProtectedHeader({ alg: 'HS256' })
+      .sign(new TextEncoder().encode(config.jwtSecret))
+  } else {
+    config.serviceKeyAsync = Promise.resolve(serviceKey)
   }
 
-  if (!config.isMultitenant && !config.anonKey) {
-    config.anonKey = jwt.sign({ role: config.dbAnonRole }, config.jwtSecret, {
-      expiresIn: '10y',
-      algorithm: config.jwtAlgorithm as jwt.Algorithm,
-    })
+  const anonKey = getOptionalConfigFromEnv('ANON_KEY') || ''
+  if (!config.isMultitenant && !anonKey) {
+    config.anonKeyAsync = new SignJWT({ role: config.dbAnonRole })
+      .setIssuedAt()
+      .setExpirationTime('10y')
+      .setProtectedHeader({ alg: 'HS256' })
+      .sign(new TextEncoder().encode(config.jwtSecret))
+  } else {
+    config.anonKeyAsync = Promise.resolve(anonKey)
   }
 
   const jwtJWKS = getOptionalConfigFromEnv('JWT_JWKS') || null
 
   if (jwtJWKS) {
     try {
-      const parsed = JSON.parse(jwtJWKS)
-      config.jwtJWKS = parsed
-    } catch (e: any) {
+      config.jwtJWKS = JSON.parse(jwtJWKS)
+    } catch {
       throw new Error('Unable to parse JWT_JWKS value to JSON')
     }
   }

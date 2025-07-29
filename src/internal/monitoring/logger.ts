@@ -3,8 +3,16 @@ import { getConfig } from '../../config'
 import { FastifyReply, FastifyRequest } from 'fastify'
 import { URL } from 'node:url'
 import { normalizeRawError } from '@internal/errors'
+import { resolve } from 'node:path'
 
-const { logLevel, logflareApiKey, logflareSourceToken, logflareEnabled, region } = getConfig()
+const {
+  logLevel,
+  logflareApiKey,
+  logflareSourceToken,
+  logflareEnabled,
+  logflareBatchSize,
+  region,
+} = getConfig()
 
 export const baseLogger = pino({
   transport: buildTransport(),
@@ -99,9 +107,16 @@ export const logSchema = {
   event: (logger: BaseLogger, message: string, log: EventLog) => logger.info(log, message),
 }
 
-export function buildTransport(): pino.TransportMultiOptions | undefined {
+export function buildTransport(): pino.TransportMultiOptions {
+  const stdOutTarget = {
+    level: logLevel || 'info',
+    target: 'pino/file',
+    // omitting options.destination logs to stdout using a worker thread
+    options: {},
+  }
+
   if (!logflareEnabled) {
-    return undefined
+    return { targets: [stdOutTarget] }
   }
 
   if (!logflareApiKey) {
@@ -112,17 +127,21 @@ export function buildTransport(): pino.TransportMultiOptions | undefined {
     throw new Error('must provider a logflare source token')
   }
 
+  const logflareModulePath = resolve(__dirname, 'logflare')
+
   return {
     targets: [
+      stdOutTarget,
       {
         level: logLevel || 'info',
-        target: './logflare',
-        options: {},
-      },
-      {
-        level: logLevel || 'info',
-        target: 'pino/file',
-        options: {},
+        target: 'pino-logflare',
+        options: {
+          apiKey: logflareApiKey,
+          sourceToken: logflareSourceToken,
+          batchSize: logflareBatchSize,
+          onPreparePayload: { module: logflareModulePath, method: 'onPreparePayload' },
+          onError: { module: logflareModulePath, method: 'onError' },
+        },
       },
     ],
   }
