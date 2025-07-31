@@ -1,4 +1,4 @@
-import { Bucket, S3MultipartUpload, Obj, S3PartUpload } from '../schemas'
+import { Bucket, S3MultipartUpload, Obj, S3PartUpload, IcebergCatalog } from '../schemas'
 import {
   ErrorCode,
   ERRORS,
@@ -15,12 +15,13 @@ import {
   FindBucketFilters,
   FindObjectFilters,
   SearchObjectOption,
+  ListBucketOptions,
 } from './adapter'
 import { DatabaseError } from 'pg'
-import { getTenantConfig, TenantConnection } from '@internal/database'
+import { TenantConnection } from '@internal/database'
 import { DbQueryPerformance } from '@internal/monitoring/metrics'
 import { isUuid } from '../limits'
-import { DBMigration } from '@internal/database/migrations'
+import { DBMigration, tenantHasMigrations } from '@internal/database/migrations'
 import { getConfig } from '../../config'
 
 const { isMultitenant } = getConfig()
@@ -100,13 +101,46 @@ export class StorageKnexDB implements Database {
     }
   }
 
+  deleteAnalyticsBucket(id: string): Promise<void> {
+    return this.runQuery('DeleteAnalyticsBucket', async (knex) => {
+      const deleted = await knex.from<IcebergCatalog>('buckets_analytics').where('id', id).delete()
+
+      if (deleted === 0) {
+        throw ERRORS.NoSuchBucket(id)
+      }
+    })
+  }
+
+  createIcebergBucket(data: Pick<Bucket, 'id' | 'name'>): Promise<IcebergCatalog> {
+    const bucketData: IcebergCatalog = {
+      id: data.id,
+    }
+
+    return this.runQuery('CreateAnalyticsBucket', async (knex) => {
+      const icebergBucket = await knex
+        .from<IcebergCatalog>('buckets_analytics')
+        .insert(bucketData)
+        .onConflict('id')
+        .merge({
+          updated_at: new Date().toISOString(),
+        })
+        .returning('*')
+
+      if (icebergBucket.length === 0) {
+        throw ERRORS.NoSuchBucket(data.id)
+      }
+
+      return icebergBucket[0]
+    })
+  }
+
   async createBucket(
     data: Pick<
       Bucket,
-      'id' | 'name' | 'public' | 'owner' | 'file_size_limit' | 'allowed_mime_types'
+      'id' | 'name' | 'public' | 'owner' | 'file_size_limit' | 'allowed_mime_types' | 'type'
     >
   ) {
-    const bucketData = {
+    const bucketData: Bucket = {
       id: data.id,
       name: data.name,
       owner: isUuid(data.owner || '') ? data.owner : undefined,
@@ -114,6 +148,10 @@ export class StorageKnexDB implements Database {
       public: data.public,
       allowed_mime_types: data.allowed_mime_types,
       file_size_limit: data.file_size_limit,
+    }
+
+    if (await tenantHasMigrations(this.tenantId, 'iceberg-catalog-flag-on-buckets')) {
+      bucketData.type = 'STANDARD'
     }
 
     try {
@@ -136,7 +174,15 @@ export class StorageKnexDB implements Database {
 
   async findBucketById(bucketId: string, columns = 'id', filters?: FindBucketFilters) {
     const result = await this.runQuery('FindBucketById', async (knex) => {
-      const query = knex.from<Bucket>('buckets').select(columns.split(',')).where('id', bucketId)
+      let columnNames = columns.split(',')
+
+      if (!(await tenantHasMigrations(this.tenantId, 'iceberg-catalog-flag-on-buckets'))) {
+        columnNames = columnNames.filter((name) => {
+          return name.trim() !== 'type'
+        })
+      }
+
+      const query = knex.from<Bucket>('buckets').select(columnNames).where('id', bucketId)
 
       if (typeof filters?.isPublic !== 'undefined') {
         query.where('public', filters.isPublic)
@@ -160,17 +206,21 @@ export class StorageKnexDB implements Database {
     return result
   }
 
-  async countObjectsInBucket(bucketId: string) {
+  async countObjectsInBucket(bucketId: string, limit?: number): Promise<number> {
+    // if we have a limit use select to only scan up to that limit
+    if (limit !== undefined) {
+      const result = await this.runQuery('CountObjectsInBucketWithLimit', (knex) => {
+        return knex.from('objects').where('bucket_id', bucketId).limit(limit).select(knex.raw('1'))
+      })
+      return result.length
+    }
+
+    // do full count if there is no limit
     const result = await this.runQuery('CountObjectsInBucket', (knex) => {
-      return knex
-        .from<{ count: number }>('objects')
-        .where('bucket_id', bucketId)
-        .limit(10)
-        .count()
-        .first()
+      return knex.from('objects').where('bucket_id', bucketId).count().first<{ count: number }>()
     })
 
-    return (result?.count as number) || 0
+    return result?.count || 0
   }
 
   async deleteBucket(bucketId: string | string[]) {
@@ -248,10 +298,7 @@ export class StorageKnexDB implements Database {
       let useNewSearchVersion2 = true
 
       if (isMultitenant) {
-        const { migrationVersion } = await getTenantConfig(this.tenantId)
-        if (migrationVersion) {
-          useNewSearchVersion2 = DBMigration[migrationVersion] >= DBMigration['search-v2']
-        }
+        useNewSearchVersion2 = await tenantHasMigrations(this.tenantId, 'search-v2')
       }
 
       if (useNewSearchVersion2 && options?.delimiter === '/') {
@@ -283,9 +330,99 @@ export class StorageKnexDB implements Database {
     })
   }
 
-  async listBuckets(columns = 'id') {
-    const data = await this.runQuery('ListBuckets', (knex) => {
-      return knex.from<Bucket>('buckets').select(columns.split(','))
+  async listAllBucketTypes(columns = 'id', options?: ListBucketOptions) {
+    const data = await this.runQuery('ListAllBucketTypes', async (knex) => {
+      // 1) figure out which columns we’re selecting
+      const columnNames = columns.split(',').map((c) => c.trim())
+
+      // 2) build the two “source” queries
+      const bucketQ = knex
+        .select(columnNames)
+        .from<Bucket>('buckets')
+        .modify((qb) => {
+          if (options?.search) {
+            qb.where('name', 'ilike', `%${options.search}%`)
+          }
+        })
+
+      const icebergBucketsAllowedColumnNames = ['id', 'type', 'created_at', 'updated_at']
+
+      const icebergBucketsColumns = columnNames.map((name) => {
+        if (name === 'name') {
+          return 'id as name'
+        }
+        if (!icebergBucketsAllowedColumnNames.includes(name)) {
+          return knex.raw('null as ??', [name])
+        }
+        return name
+      })
+
+      const icebergQ = knex
+        .select(icebergBucketsColumns)
+        .from('buckets_analytics')
+        .modify((qb) => {
+          // if you want to search iceberg buckets by their id:
+          if (options?.search) {
+            qb.where('id', 'ilike', `%${options.search}%`)
+          }
+        })
+
+      // 3) union them together, wrap as a sub‐query
+      const combined = knex.unionAll([bucketQ, icebergQ], /* wrapParens=*/ true).as('all_buckets')
+
+      // 4) now select * from that union, then sort / page
+      const finalQ = knex
+        .select('*')
+        .from(combined)
+        .modify((qb) => {
+          if (options?.sortColumn) {
+            qb.orderBy(options.sortColumn, options.sortOrder || 'asc')
+          }
+          if (options?.limit !== undefined) {
+            qb.limit(options.limit)
+          }
+          if (options?.offset !== undefined) {
+            qb.offset(options.offset)
+          }
+        })
+
+      return finalQ
+    })
+
+    return data as Bucket[]
+  }
+
+  async listBuckets(columns = 'id', options?: ListBucketOptions) {
+    if (await tenantHasMigrations(this.tenantId, 'iceberg-catalog-flag-on-buckets')) {
+      return this.listAllBucketTypes(columns, options)
+    }
+
+    const data = await this.runQuery('ListBuckets', async (knex) => {
+      let columnNames = columns.split(',')
+
+      columnNames = columnNames.filter((name) => {
+        return name.trim() !== 'type'
+      })
+
+      const query = knex.from<Bucket>('buckets').select(columnNames)
+
+      if (options?.search !== undefined && options.search.length > 0) {
+        query.where('name', 'ilike', `%${options.search}%`)
+      }
+
+      if (options?.sortColumn !== undefined) {
+        query.orderBy(options.sortColumn, options.sortOrder || 'asc')
+      }
+
+      if (options?.limit !== undefined) {
+        query.limit(options.limit)
+      }
+
+      if (options?.offset !== undefined) {
+        query.offset(options.offset)
+      }
+
+      return query
     })
 
     return data as Bucket[]
@@ -612,7 +749,10 @@ export class StorageKnexDB implements Database {
   async mustLockObject(bucketId: string, objectName: string, version?: string) {
     return this.runQuery('MustLockObject', async (knex) => {
       const hash = hashStringToInt(`${bucketId}/${objectName}${version ? `/${version}` : ''}`)
-      const result = await knex.raw<any>(`SELECT pg_try_advisory_xact_lock(?);`, [hash])
+      const result = await knex.raw<{ rows: { pg_try_advisory_xact_lock: boolean }[] }>(
+        `SELECT pg_try_advisory_xact_lock(?);`,
+        [hash]
+      )
       const lockAcquired = result.rows.shift()?.pg_try_advisory_xact_lock || false
 
       if (!lockAcquired) {
@@ -631,7 +771,7 @@ export class StorageKnexDB implements Database {
   ) {
     return this.runQuery('WaitObjectLock', async (knex) => {
       const hash = hashStringToInt(`${bucketId}/${objectName}${version ? `/${version}` : ''}`)
-      const query = knex.raw<any>(`SELECT pg_advisory_xact_lock(?)`, [hash])
+      const query = knex.raw(`SELECT pg_advisory_xact_lock(?)`, [hash])
 
       if (opts?.timeout) {
         let timeoutInterval: undefined | NodeJS.Timeout
@@ -661,18 +801,21 @@ export class StorageKnexDB implements Database {
 
   async searchObjects(bucketId: string, prefix: string, options: SearchObjectOption) {
     return this.runQuery('SearchObjects', async (knex) => {
-      const result = await knex.raw('select * from storage.search(?,?,?,?,?,?,?,?)', [
-        prefix,
-        bucketId,
-        options.limit || 100,
-        prefix.split('/').length,
-        options.offset || 0,
-        options.search || '',
-        options.sortBy?.column ?? 'name',
-        options.sortBy?.order ?? 'asc',
-      ])
+      const result = await knex.raw<{ rows: Obj[] }>(
+        'select * from storage.search(?,?,?,?,?,?,?,?)',
+        [
+          prefix,
+          bucketId,
+          options.limit || 100,
+          prefix.split('/').length,
+          options.offset || 0,
+          options.search || '',
+          options.sortBy?.column ?? 'name',
+          options.sortBy?.order ?? 'asc',
+        ]
+      )
 
-      return (result as any).rows
+      return result.rows
     })
   }
 
@@ -807,7 +950,7 @@ export class StorageKnexDB implements Database {
 
         if (typeof columns === 'object') {
           value.forEach((column: string) => {
-            delete (columns as Record<any, any>)[column]
+            delete (columns as Record<string, object>)[column]
           })
         }
       }

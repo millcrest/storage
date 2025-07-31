@@ -62,10 +62,10 @@ export default async function routes(fastify: FastifyInstance) {
       return reply.code(400).send({ message: 'Queue is not enabled' })
     }
     const data = await multitenantKnex
-      .table('pgboss.job')
+      .table('pgboss_v10.job')
       .where('state', 'active')
       .where('name', 'tenants-migrations')
-      .orderBy('createdon', 'desc')
+      .orderBy('created_on', 'desc')
       .limit(2000)
 
     return reply.send(data)
@@ -76,10 +76,10 @@ export default async function routes(fastify: FastifyInstance) {
       return reply.code(400).send({ message: 'Queue is not enabled' })
     }
     const data = await multitenantKnex
-      .table('pgboss.job')
+      .table('pgboss_v10.job')
       .where('state', 'active')
       .where('name', 'tenants-migrations')
-      .orderBy('createdon', 'desc')
+      .orderBy('created_on', 'desc')
       .update({ state: 'completed' })
       .limit(2000)
 

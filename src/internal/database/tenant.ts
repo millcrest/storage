@@ -1,5 +1,5 @@
 import { getConfig, JwksConfig, JwksConfigKey, JwksConfigKeyOCT } from '../../config'
-import { decrypt, verifyJWT } from '../auth'
+import { decrypt } from '../auth'
 import { JWKSManager, JWKSManagerStoreKnex } from '../auth/jwks'
 import { multitenantKnex } from './multitenant-db'
 import { JWTPayload } from 'jose'
@@ -48,6 +48,12 @@ export interface Features {
   }
   purgeCache: {
     enabled: boolean
+  }
+  icebergCatalog: {
+    enabled: boolean
+    maxNamespaces: number
+    maxTables: number
+    maxCatalogs: number
   }
 }
 
@@ -126,6 +132,10 @@ export async function getTenantConfig(tenantId: string): Promise<TenantConfig> {
       feature_purge_cache,
       feature_image_transformation,
       feature_s3_protocol,
+      feature_iceberg_catalog,
+      feature_iceberg_catalog_max_catalogs,
+      feature_iceberg_catalog_max_namespaces,
+      feature_iceberg_catalog_max_tables,
       image_transformation_max_resolution,
       database_pool_url,
       max_connections,
@@ -138,8 +148,6 @@ export async function getTenantConfig(tenantId: string): Promise<TenantConfig> {
     const serviceKey = decrypt(service_key)
     const jwtSecret = decrypt(jwt_secret)
 
-    const serviceKeyPayload = await verifyJWT<{ role: string }>(serviceKey, jwtSecret)
-
     const config = {
       anonKey: decrypt(anon_key),
       databaseUrl: decrypt(database_url),
@@ -149,7 +157,7 @@ export async function getTenantConfig(tenantId: string): Promise<TenantConfig> {
       jwtSecret: jwtSecret,
       jwks,
       serviceKey: serviceKey,
-      serviceKeyPayload,
+      serviceKeyPayload: { role: dbServiceRole },
       maxConnections: max_connections ? Number(max_connections) : undefined,
       features: {
         imageTransformation: {
@@ -161,6 +169,12 @@ export async function getTenantConfig(tenantId: string): Promise<TenantConfig> {
         },
         purgeCache: {
           enabled: feature_purge_cache,
+        },
+        icebergCatalog: {
+          enabled: feature_iceberg_catalog,
+          maxNamespaces: feature_iceberg_catalog_max_namespaces,
+          maxTables: feature_iceberg_catalog_max_tables,
+          maxCatalogs: feature_iceberg_catalog_max_catalogs,
         },
       },
       migrationVersion: migrations_version,
@@ -182,14 +196,12 @@ export async function getServiceKeyUser(tenantId: string) {
     return {
       jwt: tenant.serviceKey,
       payload: tenant.serviceKeyPayload,
-      jwtSecret: tenant.jwtSecret,
     }
   }
 
   return {
     jwt: await singleTenantServiceKey!.jwt,
     payload: singleTenantServiceKey!.payload,
-    jwtSecret: jwtSecret,
   }
 }
 
@@ -204,6 +216,7 @@ export async function getServiceKey(tenantId: string): Promise<string> {
 
 enum Capability {
   LIST_V2 = 'list_V2',
+  ICEBERG_CATALOG = 'iceberg_catalog',
 }
 
 /**
@@ -213,6 +226,7 @@ enum Capability {
 export async function getTenantCapabilities(tenantId: string) {
   const capabilities: Record<Capability, boolean> = {
     [Capability.LIST_V2]: false,
+    [Capability.ICEBERG_CATALOG]: false,
   }
 
   let latestMigrationName = dbMigrationFreezeAt || (await lastLocalMigrationName())
@@ -226,7 +240,29 @@ export async function getTenantCapabilities(tenantId: string) {
     capabilities[Capability.LIST_V2] = true
   }
 
+  if (DBMigration[latestMigrationName] >= DBMigration['iceberg-catalog-flag-on-buckets']) {
+    capabilities[Capability.ICEBERG_CATALOG] = true
+  }
+
   return capabilities
+}
+
+/**
+ * Check if a tenant has a specific feature enabled
+ *
+ * @param tenantId
+ * @param feature
+ */
+export async function tenantHasFeature(
+  tenantId: string,
+  feature: keyof Features
+): Promise<boolean> {
+  if (!isMultitenant) {
+    return true // single tenant always has all features
+  }
+
+  const { features } = await getTenantConfig(tenantId)
+  return features ? features[feature].enabled : false
 }
 
 /**
