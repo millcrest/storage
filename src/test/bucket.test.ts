@@ -118,11 +118,47 @@ describe('testing GET all buckets', () => {
     expect(responseJSON[0]).toMatchObject({
       id: expect.any(String),
       name: expect.any(String),
+      type: expect.any(String),
       public: expect.any(Boolean),
       file_size_limit: null,
       allowed_mime_types: null,
     })
   })
+
+  for (const [headers, shouldIncludeType] of [
+    [
+      { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/138.0.0.0 Safari/537.36' },
+      true,
+    ],
+    // storage-py (storage3) >= 0.12.1
+    [{ 'user-agent': 'supabase-py/storage3 v0.11.9' }, false],
+    [{ 'user-agent': 'supabase-py/storage3 v0.12.0' }, false],
+    [{ 'user-agent': 'supabase-py/storage3 v0.12.1' }, true],
+    [{ 'user-agent': 'supabase-py/storage3 v0.12.2' }, true],
+    [{ 'user-agent': 'supabase-py/storage3 v0.13.0' }, true],
+    [{ 'user-agent': 'supabase-py/storage3 v1.0.0' }, true],
+    // supabase-py >= 2.18.0
+    [{ 'x-client-info': 'supabase-py/2.17.3' }, false],
+    [{ 'x-client-info': 'supabase-py/2.18.0' }, true],
+    [{ 'x-client-info': 'supabase-py/2.18.1' }, true],
+    [{ 'x-client-info': 'supabase-py/2.19.0' }, true],
+  ]) {
+    test.only(`Should ${shouldIncludeType ? '' : 'NOT '}include type for ${JSON.stringify(
+      headers
+    )} client`, async () => {
+      const response = await appInstance.inject({
+        method: 'GET',
+        url: `/bucket`,
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+          ...(headers as Record<string, string>),
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const body = response.json()
+      expect(body[0].type).toBe(shouldIncludeType ? 'STANDARD' : undefined)
+    })
+  }
 
   test('checking RLS: anon user is not able to get all buckets', async () => {
     const response = await appInstance.inject({
@@ -159,6 +195,7 @@ describe('testing GET all buckets', () => {
     expect(responseJSON[0]).toMatchObject({
       id: 'bucket4',
       name: 'bucket4',
+      type: expect.any(String),
       public: false,
       file_size_limit: null,
       allowed_mime_types: null,
