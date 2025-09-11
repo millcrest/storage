@@ -21,9 +21,10 @@ export const baseLogger = pino({
       return normalizeRawError(error)
     },
     res(reply) {
+      const getHeaders = typeof reply?.getHeaders === 'function' ? reply.getHeaders : () => ({})
       return {
-        statusCode: reply.statusCode,
-        headers: whitelistHeaders(reply.getHeaders()),
+        statusCode: reply?.statusCode,
+        headers: whitelistHeaders(getHeaders()),
       }
     },
     req(request) {

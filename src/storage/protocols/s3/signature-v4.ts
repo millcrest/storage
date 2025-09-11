@@ -402,10 +402,7 @@ export class SignatureV4 {
     signedHeaders: string[]
   ) {
     const method = request.method
-    const xForwardedUri = this.getHeader(request, 'x-forwarded-uri')
-    const canonicalUri =
-      xForwardedUri ??
-      new URL(`http://localhost:8080${request.prefix || ''}${request.url}`).pathname
+    const canonicalUri = this.constructCanonicalUri(request)
 
     const canonicalQueryString = this.constructCanonicalQueryString(request.query || {})
     const canonicalHeaders = this.constructCanonicalHeaders(request, signedHeaders)
@@ -413,6 +410,22 @@ export class SignatureV4 {
     const payloadHash = this.getPayloadHash(clientSignature, request)
 
     return `${method}\n${canonicalUri}\n${canonicalQueryString}\n${canonicalHeaders}\n${signedHeadersString}\n${payloadHash}`
+  }
+
+  protected constructCanonicalUri(request: SignatureRequest) {
+    const xForwardedUri = this.getHeader(request, 'x-forwarded-uri')
+    if (xForwardedUri) {
+      return xForwardedUri
+    }
+
+    const uri = new URL(`http://localhost:8080${request.prefix || ''}${request.url}`).pathname
+
+    const xRemovePrefix = this.getHeader(request, 'x-remove-prefix')
+    if (xRemovePrefix) {
+      return uri.replace(new RegExp(`^${xRemovePrefix}`), '')
+    }
+
+    return uri
   }
 
   protected constructCanonicalQueryString(query: Record<string, string>) {

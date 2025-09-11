@@ -14,5 +14,5 @@ docker buildx build \
     --build-arg VERSION=v$STORAGE_VERSION \
     --platform linux/amd64 \
     --provenance=false \
-    --output "type=image,compression=zstd,compression-level=22,oci-mediatypes=true,force-compression=true,push=true" \
+    --output "type=image,compression=zstd,compression-level=15,oci-mediatypes=true,force-compression=true,push=true" \
     .
