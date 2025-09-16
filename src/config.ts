@@ -69,6 +69,7 @@ type StorageConfigType = {
   storageS3ForcePathStyle?: boolean
   storageS3Region: string
   storageS3ClientTimeout: number
+  storageS3DeleteConcurrency: number
   isMultitenant: boolean
   jwtSecret: string
   jwtAlgorithm: string
@@ -349,6 +350,10 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       'true',
     storageS3Region: getOptionalConfigFromEnv('STORAGE_S3_REGION', 'REGION') as string,
     storageS3ClientTimeout: Number(getOptionalConfigFromEnv('STORAGE_S3_CLIENT_TIMEOUT') || `0`),
+    storageS3DeleteConcurrency: parseInt(
+      getOptionalConfigFromEnv('STORAGE_S3_DELETE_CONCURRENCY') || '8',
+      10
+    ),
 
     // DB - Migrations
     dbAnonRole: getOptionalConfigFromEnv('DB_ANON_ROLE') || 'anon',
