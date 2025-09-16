@@ -18,6 +18,7 @@ import {
   startAsyncMigrations,
 } from '@internal/database/migrations'
 import { Cluster } from '@internal/cluster/cluster'
+import buildS3 from '../s3-app'
 
 const shutdownSignal = new AsyncAbortController()
 
@@ -100,6 +101,7 @@ async function main() {
 
   // HTTP Server
   const app = await httpServer(shutdownSignal.signal)
+  await httpS3Server(shutdownSignal.signal)
 
   // HTTP Admin Server
   if (isMultitenant) {
@@ -200,4 +202,51 @@ async function httpAdminServer(
     throw err
   }
   return adminApp
+}
+
+/**
+ * Starts HTTP S3 Server (no prefix)
+ * @param signal
+ */
+async function httpS3Server(signal: AbortSignal) {
+  const { s3Port, host, requestTraceHeader } = getConfig()
+
+  const app: FastifyInstance<Server, IncomingMessage, ServerResponse> = buildS3({
+    loggerInstance: logger,
+    disableRequestLogging: true,
+    requestIdHeader: requestTraceHeader,
+    maxParamLength: 2500,
+  })
+
+  const closePromise = createServerClosedPromise(app.server, () => {
+    logSchema.info(logger, '[S3 Server] Exited', {
+      type: 'server',
+    })
+  })
+
+  try {
+    signal.addEventListener(
+      'abort',
+      async () => {
+        logSchema.info(logger, '[S3 Server] Stopping', {
+          type: 'server',
+        })
+        await closePromise
+      },
+      { once: true }
+    )
+    await app.listen({ port: s3Port, host, signal })
+
+    logSchema.info(logger, `[S3 Server] Listening on port ${s3Port}`, {
+      type: 'server',
+    })
+
+    return app
+  } catch (err) {
+    logSchema.error(logger, `S3 Server failed to start`, {
+      type: 'serverStartError',
+      error: err,
+    })
+    throw err
+  }
 }
