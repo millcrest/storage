@@ -138,3 +138,38 @@ export function isUuid(value: string) {
 export function isEmptyFolder(object: string) {
   return object.endsWith('.emptyFolderPlaceholder')
 }
+
+const CLIENT_AGENT_REGEX = {
+  // storage-py (storage3) = supabase-py/storage3 v0.12.1
+  storage3: /supabase-py\/storage3 v(\d+)\.(\d+)\.(\d+)/i,
+  // supabase-py = supabase-py/2.17.0
+  'supabase-py': /supabase-py\/(\d+)\.(\d+)\.(\d+)/i,
+}
+export type ClientAgent = keyof typeof CLIENT_AGENT_REGEX
+
+/**
+ * Checks if the client is supabase-py and before the specified version
+ *
+ * @param client which client type are we checking for
+ * @param userAgent user agent header string
+ * @param version semver to check against, must be in format '0.0.0'
+ */
+export function isClientVersionBefore(
+  client: ClientAgent,
+  userAgent: string,
+  version: string
+): boolean {
+  const [minMajor, minMinor, minPatch] = version.split('.').map(Number)
+  const match = userAgent.match(CLIENT_AGENT_REGEX[client])
+  if (!match) {
+    return false
+  }
+
+  const [major, minor, patch] = match.slice(1).map(Number)
+
+  if (major < minMajor) return true
+  if (major > minMajor) return false
+  if (minor < minMinor) return true
+  if (minor > minMinor) return false
+  return patch < minPatch
+}
