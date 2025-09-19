@@ -69,6 +69,7 @@ type StorageConfigType = {
   storageS3ForcePathStyle?: boolean
   storageS3Region: string
   storageS3ClientTimeout: number
+  storageS3DeleteConcurrency: number
   isMultitenant: boolean
   jwtSecret: string
   jwtAlgorithm: string
@@ -166,6 +167,7 @@ type StorageConfigType = {
   s3ProtocolAccessKeyId?: string
   s3ProtocolAccessKeySecret?: string
   s3ProtocolNonCanonicalHostHeader?: string
+  s3Port?: number
   tracingEnabled?: boolean
   tracingMode?: string
   tracingTimeMinDuration: number
@@ -326,6 +328,7 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     s3ProtocolNonCanonicalHostHeader: getOptionalConfigFromEnv(
       'S3_PROTOCOL_NON_CANONICAL_HOST_HEADER'
     ),
+    s3Port: Number(getOptionalConfigFromEnv('S3_PORT')),
     // Storage
     storageBackendType: getOptionalConfigFromEnv('STORAGE_BACKEND') as StorageBackendType,
     emptyBucketMax: parseInt(getOptionalConfigFromEnv('STORAGE_EMPTY_BUCKET_MAX') || '200000', 10),
@@ -349,6 +352,10 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       'true',
     storageS3Region: getOptionalConfigFromEnv('STORAGE_S3_REGION', 'REGION') as string,
     storageS3ClientTimeout: Number(getOptionalConfigFromEnv('STORAGE_S3_CLIENT_TIMEOUT') || `0`),
+    storageS3DeleteConcurrency: parseInt(
+      getOptionalConfigFromEnv('STORAGE_S3_DELETE_CONCURRENCY') || '8',
+      10
+    ),
 
     // DB - Migrations
     dbAnonRole: getOptionalConfigFromEnv('DB_ANON_ROLE') || 'anon',

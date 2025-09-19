@@ -33,7 +33,8 @@ import { logger } from '@internal/monitoring'
 import { monitorStream } from '@internal/streams'
 import { BackupObjectInfo, ObjectBackup } from '@storage/backend/s3/backup'
 
-const { tracingFeatures, storageS3MaxSockets, tracingEnabled } = getConfig()
+const { tracingFeatures, storageS3MaxSockets, tracingEnabled, storageS3DeleteConcurrency } =
+  getConfig()
 
 export interface S3ClientOptions {
   endpoint?: string
@@ -208,11 +209,23 @@ export class S3Backend implements StorageBackendAdapter {
    * @param version
    */
   async deleteObject(bucket: string, key: string, version: string | undefined): Promise<void> {
-    const command = new DeleteObjectCommand({
-      Bucket: bucket,
-      Key: withOptionalVersion(key, version),
-    })
-    await this.client.send(command)
+    try {
+      const command = new DeleteObjectCommand({
+        Bucket: bucket,
+        Key: withOptionalVersion(key, version),
+      })
+      await this.client.send(command)
+    } catch (e) {
+      const err = StorageBackendError.fromError(e)
+      if (err.code === 'NoSuchKey' || err.error === 'The specified key does not exist.') {
+        return
+      }
+      if (typeof e === 'object' && e !== null && 'name' in e && e.name === 'NoSuchKey') {
+        return
+      }
+      logger.info(`[StorageBackendError] raw: ${JSON.stringify(err)}`)
+      throw e
+    }
   }
 
   /**
@@ -316,32 +329,26 @@ export class S3Backend implements StorageBackendAdapter {
    * @param prefixes
    */
   async deleteObjects(bucket: string, prefixes: string[]): Promise<void> {
-    try {
-      await Promise.all(
-        prefixes.map((ele) =>
-          this.client
-            .send(
-              new DeleteObjectCommand({
-                Bucket: bucket,
-                Key: ele,
-              })
-            )
-            .catch((e) => {
-              const err = StorageBackendError.fromError(e)
-              if (err.code === 'NoSuchKey' || err.error === 'The specified key does not exist.') {
-                return
-              }
-              if (typeof e === 'object' && e !== null && 'name' in e && e.name === 'NoSuchKey') {
-                return
-              }
-              logger.info(`[StorageBackendError] raw: ${JSON.stringify(err)}`)
-              throw e
-            })
-        )
-      )
-    } catch (e) {
-      throw StorageBackendError.fromError(e)
-    }
+    await this.runWithConcurrency(prefixes, storageS3DeleteConcurrency, async (key) => {
+      await this.deleteObject(bucket, key, undefined)
+    })
+  }
+
+  private async runWithConcurrency<T>(
+    items: T[],
+    concurrency: number,
+    worker: (item: T) => Promise<void>
+  ) {
+    if (items.length === 0) return
+    const pool = Math.max(1, concurrency)
+    let index = 0
+    const runners = new Array(Math.min(pool, items.length)).fill(0).map(async () => {
+      while (index < items.length) {
+        const i = index++
+        await worker(items[i])
+      }
+    })
+    await Promise.all(runners)
   }
 
   /**
