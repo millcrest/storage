@@ -93,3 +93,34 @@ export const HttpPoolErrorGauge = new client.Gauge({
   help: 'Number of pending requests waiting for a socket',
   labelNames: ['name', 'region', 'type', 'protocol'],
 })
+
+// Object metadata cache metrics (for COG/geospatial workloads)
+export const ObjectCacheSizeGauge = new client.Gauge({
+  name: 'storage_object_metadata_cache_size',
+  help: 'Number of objects currently cached in memory',
+  labelNames: ['region'],
+})
+
+export const ObjectCacheHitsCounter = new client.Counter({
+  name: 'storage_object_metadata_cache_hits_total',
+  help: 'Total number of cache hits (avoided DB queries)',
+  labelNames: ['region'],
+})
+
+export const ObjectCacheMissesCounter = new client.Counter({
+  name: 'storage_object_metadata_cache_misses_total',
+  help: 'Total number of cache misses (required DB queries)',
+  labelNames: ['region'],
+})
+
+export const ObjectCacheEvictionsCounter = new client.Counter({
+  name: 'storage_object_metadata_cache_evictions_total',
+  help: 'Total number of cache evictions (LRU or size-based)',
+  labelNames: ['region'],
+})
+
+export const ObjectCacheHitRateGauge = new client.Gauge({
+  name: 'storage_object_metadata_cache_hit_rate',
+  help: 'Cache hit rate (hits / total requests)',
+  labelNames: ['region'],
+})
