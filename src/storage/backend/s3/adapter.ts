@@ -597,8 +597,12 @@ export class S3Backend implements StorageBackendAdapter {
       requestHandler: new NodeHttpHandler({
         httpAgent: options.httpAgent?.httpAgent,
         httpsAgent: options.httpAgent?.httpsAgent,
-        connectionTimeout: 5000,
-        requestTimeout: options.requestTimeout,
+        // Reduced connection timeout (3s) to fail fast on network issues
+        // Prevents queuing during pod startup/shutdown
+        connectionTimeout: 3000,
+        // Socket timeout for active requests - increased for large COG files
+        // but short enough to prevent hanging on stalled connections
+        requestTimeout: options.requestTimeout || 30000,
       }),
     }
     if (options.endpoint) {

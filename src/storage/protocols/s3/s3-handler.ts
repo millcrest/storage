@@ -24,10 +24,11 @@ import { PassThrough, Readable } from 'stream'
 import stream from 'stream/promises'
 import { getFileSizeLimit, mustBeValidBucketName, mustBeValidKey } from '../../limits'
 import { ERRORS } from '@internal/errors'
-import { S3MultipartUpload, Obj } from '../../schemas'
+import { S3MultipartUpload } from '../../schemas'
 import { decrypt, encrypt } from '@internal/auth'
 import { ByteLimitTransformStream } from './byte-limit-stream'
 import { logger, logSchema } from '@internal/monitoring'
+import { objectMetadataCache } from '@internal/cache'
 
 const { storageS3Region, storageS3Bucket } = getConfig()
 
@@ -697,6 +698,9 @@ export class S3ProtocolHandler {
       signal: options.signal,
     })
 
+    // Invalidate cache entry as object was updated
+    objectMetadataCache.invalidate(this.tenantId, command.Bucket, command.Key)
+
     return {
       headers: {
         etag: upload.metadata.eTag,
@@ -805,7 +809,7 @@ export class S3ProtocolHandler {
       throw ERRORS.NoSuchKey(Key)
     }
 
-    let metadataHeaders: Record<string, any> = {}
+    let metadataHeaders: Record<string, unknown> = {}
 
     if (object.user_metadata) {
       metadataHeaders = toAwsMeatadataHeaders(object.user_metadata)
@@ -868,12 +872,31 @@ export class S3ProtocolHandler {
     const key = command.Key as string
 
     let version: string | undefined
-    let userMetadata: Record<string, any> | undefined | null
+    let userMetadata: Record<string, unknown> | undefined | null
 
     if (!options?.skipDbCheck) {
-      const object = await this.storage.from(bucket).findObject(key, 'version,user_metadata')
-      version = object.version
-      userMetadata = object.user_metadata
+      // Try to get from cache first (critical for COG workloads with many range requests)
+      const cached = objectMetadataCache.get(this.tenantId, bucket, key)
+
+      if (cached) {
+        version = cached.version
+        userMetadata = cached.user_metadata
+      } else {
+        // Cache miss - fetch from DB and cache it
+        const object = await this.storage.from(bucket).findObject(key, 'version,user_metadata')
+        version = object.version
+        userMetadata = object.user_metadata
+
+        // Cache for subsequent requests (COG tiles will reuse this)
+        if (object.id && object.version) {
+          objectMetadataCache.set(this.tenantId, bucket, key, {
+            id: object.id,
+            version: object.version,
+            bucket_id: bucket,
+            user_metadata: object.user_metadata || undefined,
+          })
+        }
+      }
     }
 
     const response = await this.storage.backend.getObject(
@@ -892,7 +915,7 @@ export class S3ProtocolHandler {
       options?.signal
     )
 
-    let metadataHeaders: Record<string, any> = {}
+    let metadataHeaders: Record<string, unknown> = {}
 
     if (userMetadata) {
       metadataHeaders = toAwsMeatadataHeaders(userMetadata)
@@ -933,6 +956,9 @@ export class S3ProtocolHandler {
 
     await this.storage.from(Bucket).deleteObject(Key)
 
+    // Invalidate cache entry for deleted object
+    objectMetadataCache.invalidate(this.tenantId, Bucket, Key)
+
     return {}
   }
 
@@ -965,6 +991,11 @@ export class S3ProtocolHandler {
     const deletedResult = await this.storage
       .from(Bucket)
       .deleteObjects(Delete.Objects.map((o) => o.Key || ''))
+
+    // Invalidate cache entries for all deleted objects
+    for (const obj of deletedResult) {
+      objectMetadataCache.invalidate(this.tenantId, Bucket, obj.name)
+    }
 
     const deleted = Delete.Objects.filter((o) => deletedResult.find((d) => d.name === o.Key)).map(
       (o) => ({ Key: o.Key })
@@ -1249,14 +1280,14 @@ export class S3ProtocolHandler {
     }
   }
 
-  parseMetadataHeaders(headers: Record<string, any>): Record<string, any> | undefined {
-    let metadata: Record<string, any> | undefined = undefined
+  parseMetadataHeaders(headers: Record<string, unknown>): Record<string, string> | undefined {
+    let metadata: Record<string, string> | undefined = undefined
 
     Object.keys(headers)
       .filter((key) => key.startsWith('x-amz-meta-'))
       .forEach((key) => {
         if (!metadata) metadata = {}
-        metadata[key.replace('x-amz-meta-', '')] = headers[key]
+        metadata[key.replace('x-amz-meta-', '')] = headers[key] as string
       })
 
     return metadata
@@ -1329,14 +1360,14 @@ export function isValidHeader(name: string, value: string | string[]): boolean {
   )
 }
 
-function toAwsMeatadataHeaders(records: Record<string, any>) {
-  const metadataHeaders: Record<string, any> = {}
+function toAwsMeatadataHeaders(records: Record<string, unknown>) {
+  const metadataHeaders: Record<string, unknown> = {}
   let missingCount = 0
 
   if (records) {
     Object.keys(records).forEach((key) => {
       const value = records[key]
-      if (value && isUSASCII(value) && isValidHeader(key, value)) {
+      if (!!value && isUSASCII(value as string) && isValidHeader(key, value as string)) {
         metadataHeaders['x-amz-meta-' + key.toLowerCase()] = value
       } else {
         missingCount++

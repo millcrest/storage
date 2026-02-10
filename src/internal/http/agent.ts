@@ -28,13 +28,27 @@ export interface AgentStats {
 /**
  * Creates an instrumented agent
  * Adding prometheus metrics to the agent
+ * Optimized for COG/range request workloads with:
+ * - Longer socket reuse timeout (60s instead of 15s) for burst patterns
+ * - Faster keep-alive probes (100ms) to detect stale connections
+ * - FIFO scheduling for better handling of concurrent burst requests
+ * - Increased free socket pool to reduce connection overhead
  */
 export function createAgent(name: string, options: { maxSockets: number }): InstrumentedAgent {
   const agentOptions = {
     maxSockets: options.maxSockets,
     keepAlive: true,
-    keepAliveMsecs: 1000,
-    freeSocketTimeout: 1000 * 15,
+    // Faster keep-alive probes to quickly reuse connections during burst COG tile requests
+    keepAliveMsecs: 200,
+    // Hold sockets longer (60s) to handle COG workloads where GDAL makes many requests in bursts
+    // then pauses, avoiding constant reconnection overhead
+    freeSocketTimeout: 1000 * 60,
+    // Increase free socket pool to avoid connection churn during concurrent range requests
+    maxFreeSockets: Math.floor(options.maxSockets * 0.25),
+    // Use FIFO scheduling for better handling of burst request patterns (vs LIFO default)
+    scheduling: 'fifo' as const,
+    // Timeout for socket creation (prevents hanging on connection issues)
+    timeout: 30000,
   }
 
   const httpAgent = new Agent(agentOptions)
