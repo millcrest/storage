@@ -1,11 +1,10 @@
+import { ERRORS } from '@internal/errors'
+import { Obj } from '@storage/schemas'
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
-import { IncomingMessage, Server, ServerResponse } from 'http'
 import { getConfig } from '../../../config'
 import { AuthenticatedRangeRequest } from '../../types'
 import { ROUTE_OPERATIONS } from '../operations'
-import { ERRORS } from '@internal/errors'
-import { Obj } from '@storage/schemas'
 
 const { storageS3Bucket } = getConfig()
 
@@ -30,16 +29,9 @@ interface getObjectRequestInterface extends AuthenticatedRangeRequest {
   Querystring: FromSchema<typeof getObjectQuerySchema>
 }
 
-async function requestHandler(
-  request: FastifyRequest<getObjectRequestInterface, Server, IncomingMessage>,
-  response: FastifyReply<
-    getObjectRequestInterface,
-    Server,
-    IncomingMessage,
-    ServerResponse,
-    unknown
-  >
-) {
+type GetObjectRequest = FastifyRequest<getObjectRequestInterface>
+
+async function requestHandler(request: GetObjectRequest, response: FastifyReply) {
   const { bucketName } = request.params
   const { download } = request.query
   const objectName = request.params['*']
@@ -71,10 +63,13 @@ async function requestHandler(
 
   if (bucket.public) {
     // request is authenticated but we still use the superUser as we don't need to check RLS
-    obj = await request.storage.asSuperUser().from(bucketName).findObject(objectName, 'id, version')
+    obj = await request.storage
+      .asSuperUser()
+      .from(bucketName)
+      .findObject(objectName, 'id, version, metadata')
   } else {
     // request is authenticated use RLS
-    obj = await request.storage.from(bucketName).findObject(objectName, 'id, version')
+    obj = await request.storage.from(bucketName).findObject(objectName, 'id, version, metadata')
   }
 
   return request.storage.renderer('asset').render(request, response, {
@@ -82,6 +77,7 @@ async function requestHandler(
     key: s3Key,
     version: obj.version,
     download,
+    xRobotsTag: obj.metadata?.['xRobotsTag'] as string | undefined,
     signal: request.signals.disconnect.signal,
   })
 }
@@ -95,6 +91,7 @@ export default async function routes(fastify: FastifyInstance) {
       // @todo add success response schema here
       schema: {
         params: getObjectParamsSchema,
+        querystring: getObjectQuerySchema,
         headers: { $ref: 'authSchema#' },
         summary,
         response: { '4xx': { $ref: 'errorSchema#', description: 'Error response' } },

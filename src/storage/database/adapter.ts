@@ -1,7 +1,7 @@
-import { Bucket, S3MultipartUpload, Obj, S3PartUpload, IcebergCatalog } from '../schemas'
-import { ObjectMetadata } from '../backend'
 import { TenantConnection } from '@internal/database'
 import { DBMigration } from '@internal/database/migrations'
+import { ObjectMetadata } from '../backend'
+import { Bucket, IcebergCatalog, Obj, S3MultipartUpload, S3PartUpload } from '../schemas'
 
 export interface SearchObjectOption {
   search?: string
@@ -32,6 +32,7 @@ export interface TransactionOptions {
   isolation?: string
   retry?: number
   readOnly?: boolean
+  timeout?: number
 }
 
 export interface DatabaseOptions<TNX> {
@@ -77,7 +78,7 @@ export interface Database {
     >
   ): Promise<Pick<Bucket, 'id'>>
 
-  createIcebergBucket(data: Pick<Bucket, 'id' | 'name'>): Promise<IcebergCatalog>
+  createAnalyticsBucket(data: Pick<Bucket, 'name'>): Promise<IcebergCatalog>
 
   findBucketById<Filters extends FindBucketFilters = FindObjectFilters>(
     bucketId: string,
@@ -87,7 +88,7 @@ export interface Database {
 
   countObjectsInBucket(bucketId: string, limit?: number): Promise<number>
 
-  deleteBucket(bucketId: string | string[]): Promise<Bucket[]>
+  deleteBucket(bucketId: string | string[]): Promise<number>
 
   listObjects(
     bucketId: string,
@@ -105,6 +106,11 @@ export interface Database {
       nextToken?: string
       maxKeys?: number
       startAfter?: string
+      sortBy?: {
+        order?: string
+        column?: string
+        after?: string
+      }
     }
   ): Promise<Obj[]>
 
@@ -189,7 +195,8 @@ export interface Database {
     version: string,
     signature: string,
     owner?: string,
-    metadata?: Record<string, string | null>
+    userMetadata?: Record<string, string | null>,
+    metadata?: Partial<ObjectMetadata>
   ): Promise<S3MultipartUpload>
 
   findMultipartUpload(
@@ -213,5 +220,10 @@ export interface Database {
     options: { afterPart?: string; maxParts: number }
   ): Promise<S3PartUpload[]>
 
-  deleteAnalyticsBucket(id: string): Promise<void>
+  deleteAnalyticsBucket(id: string, opts?: { soft: boolean }): Promise<IcebergCatalog>
+  listAnalyticsBuckets(
+    columns: string,
+    options: ListBucketOptions | undefined
+  ): Promise<IcebergCatalog[]>
+  findAnalyticsBucketByName(name: string): Promise<IcebergCatalog>
 }

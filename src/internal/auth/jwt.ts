@@ -1,17 +1,22 @@
+import { createHash } from 'node:crypto'
+import {
+  createLruCache,
+  DEFAULT_CACHE_PURGE_STALE_INTERVAL_MS,
+  JWT_CACHE_NAME,
+} from '@internal/cache'
 import { ERRORS } from '@internal/errors'
-import { getConfig, JwksConfig, JwksConfigKey, JwksConfigKeyOCT } from '../../config'
 import {
   exportJWK,
   generateSecret,
   importJWK,
   JWTHeaderParameters,
   JWTPayload,
-  jwtVerify,
   JWTVerifyGetKey,
+  jwtVerify,
   SignJWT,
 } from 'jose'
-import { LRUCache } from 'lru-cache'
 import objectSizeOf from 'object-sizeof'
+import { getConfig, JwksConfig, JwksConfigKey, JwksConfigKeyOCT } from '../../config'
 
 const { jwtAlgorithm } = getConfig()
 
@@ -19,6 +24,7 @@ const JWT_HMAC_ALGOS = ['HS256', 'HS384', 'HS512']
 const JWT_RSA_ALGOS = ['RS256', 'RS384', 'RS512']
 const JWT_ECC_ALGOS = ['ES256', 'ES384', 'ES512']
 const JWT_ED_ALGOS = ['EdDSA']
+const MAX_ABSOLUTE_JWT_EXPIRATION_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000)
 
 export type SignedToken = {
   url: string
@@ -32,6 +38,8 @@ export type SignedUploadToken = {
   url: string
   exp: number
 }
+
+const jwtJwksFingerprintCache = new WeakMap<object, string>()
 
 async function findJWKFromHeader(
   header: JWTHeaderParameters,
@@ -113,12 +121,46 @@ function getJWTAlgorithms(jwks: JwksConfig | null) {
   return algorithms
 }
 
-const jwtCache = new LRUCache<string, { token: string; payload: JWTPayload }>({
-  maxSize: 1024 * 1024 * 50, // 50MB
-  sizeCalculation: (value) => {
-    return objectSizeOf(value)
-  },
-  ttlResolution: 5000, // 5 seconds
+function getJWTJwksFingerprint(jwks?: { keys: JwksConfigKey[] } | null): string {
+  if (!jwks) {
+    return 'null'
+  }
+
+  const cachedFingerprint = jwtJwksFingerprintCache.get(jwks)
+  if (cachedFingerprint) {
+    return cachedFingerprint
+  }
+
+  const fingerprint = createHash('sha256')
+    .update(JSON.stringify(jwks.keys ?? null))
+    .digest('base64url')
+  jwtJwksFingerprintCache.set(jwks, fingerprint)
+  return fingerprint
+}
+
+function getJWTCacheKey(token: string, secret: string, jwks?: { keys: JwksConfigKey[] } | null) {
+  const hash = createHash('sha256')
+    .update(token)
+    .update('\0')
+    .update(secret)
+    .update('\0')
+    .update(getJWTJwksFingerprint(jwks))
+
+  return hash.digest('base64url')
+}
+
+// JWT payloads are comparatively small and high-churn, so keep a higher
+// cardinality guardrail than the longer-lived config-style caches.
+export const JWT_CACHE_MAX_ITEMS = 65536
+export const JWT_CACHE_MAX_SIZE_BYTES = 1024 * 1024 * 50 // 50 MiB
+export const JWT_CACHE_TTL_RESOLUTION_MS = 5000 // 5 seconds
+
+const jwtCache = createLruCache<string, JWTPayload>(JWT_CACHE_NAME, {
+  max: JWT_CACHE_MAX_ITEMS,
+  maxSize: JWT_CACHE_MAX_SIZE_BYTES,
+  sizeCalculation: (value) => objectSizeOf(value),
+  ttlResolution: JWT_CACHE_TTL_RESOLUTION_MS,
+  purgeStaleIntervalMs: DEFAULT_CACHE_PURGE_STALE_INTERVAL_MS,
 })
 
 /**
@@ -133,13 +175,10 @@ export async function verifyJWTWithCache(
   secret: string,
   jwks?: { keys: JwksConfigKey[] } | null
 ) {
-  const cachedVerification = jwtCache.get(token)
-  if (
-    cachedVerification &&
-    cachedVerification.payload.exp &&
-    cachedVerification.payload.exp * 1000 > Date.now()
-  ) {
-    return Promise.resolve(cachedVerification.payload)
+  const cacheKey = getJWTCacheKey(token, secret, jwks)
+  const cachedPayload = jwtCache.get(cacheKey)
+  if (cachedPayload && cachedPayload.exp && cachedPayload.exp * 1000 > Date.now()) {
+    return Promise.resolve(cachedPayload)
   }
 
   try {
@@ -148,13 +187,10 @@ export async function verifyJWTWithCache(
       return payload
     }
 
-    jwtCache.set(
-      token,
-      { token, payload: payload },
-      {
-        ttl: payload.exp * 1000 - Date.now(),
-      }
-    )
+    const ttl = payload.exp * 1000 - Date.now()
+    if (ttl > 0) {
+      jwtCache.set(cacheKey, payload, { ttl })
+    }
     return payload
   } catch (e) {
     throw e
@@ -195,9 +231,13 @@ export async function signJWT(
   expiresIn: string | number | undefined
 ): Promise<string> {
   const signer = new SignJWT(payload).setIssuedAt()
-  if (expiresIn) {
-    const expiresInStr = typeof expiresIn === 'string' ? expiresIn : Math.floor(expiresIn) + 's'
-    signer.setExpirationTime(expiresInStr)
+  if (expiresIn !== undefined) {
+    const expiresInStr = getJWTExpirationTime(expiresIn)
+    try {
+      signer.setExpirationTime(expiresInStr)
+    } catch (e) {
+      throw ERRORS.InvalidParameter('expiresIn', { error: e as Error })
+    }
   }
 
   if (typeof secret === 'string') {
@@ -211,10 +251,48 @@ export async function signJWT(
   }
 }
 
+function getJWTExpirationTime(expiresIn: string | number) {
+  if (typeof expiresIn === 'string') {
+    return expiresIn
+  }
+
+  assertValidNumericJWTExpiration(expiresIn)
+  return `${Math.floor(expiresIn)}s`
+}
+
+export function getMaxNumericJWTExpiration(nowMs = Date.now()) {
+  const nowSeconds = Math.floor(nowMs / 1000)
+  return Math.max(0, MAX_ABSOLUTE_JWT_EXPIRATION_SECONDS - nowSeconds)
+}
+
+export function assertValidNumericJWTExpiration(expiresIn: number, nowMs = Date.now()) {
+  if (!Number.isFinite(expiresIn)) {
+    throw ERRORS.InvalidParameter('expiresIn')
+  }
+
+  const expiresInSeconds = Math.floor(expiresIn)
+  const maxRelativeExpirationSeconds = getMaxNumericJWTExpiration(nowMs)
+
+  if (
+    !Number.isSafeInteger(expiresInSeconds) ||
+    expiresInSeconds < 1 ||
+    expiresInSeconds > maxRelativeExpirationSeconds
+  ) {
+    throw ERRORS.InvalidParameter('expiresIn')
+  }
+}
+
 /**
  * Generate a new random HS512 JWK that can be used for signing JWTs
  */
 export async function generateHS512JWK(): Promise<JwksConfigKeyOCT> {
   const secret = await generateSecret('HS512', { extractable: true })
   return (await exportJWK(secret)) as JwksConfigKeyOCT
+}
+
+const JWT_SHAPE =
+  /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)?$/
+
+export function isJwtToken(token: string) {
+  return token.replace('Bearer ', '').match(JWT_SHAPE)
 }

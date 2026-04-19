@@ -1,7 +1,14 @@
+import { tenantHasFeature } from '@internal/database'
+import { tenantHasMigrations } from '@internal/database/migrations'
+import { ERRORS, StorageBackendError } from '@internal/errors'
+import { logger, logSchema } from '@internal/monitoring'
+import { BucketCreatedEvent, BucketDeleted } from '@storage/events'
+import { StorageObjectLocator } from '@storage/locator'
+import { InfoRenderer } from '@storage/renderer/info'
+import { getConfig } from '../config'
 import { StorageBackendAdapter } from './backend'
 import { Database, FindBucketFilters, ListBucketOptions } from './database'
-import { ERRORS } from '@internal/errors'
-import { AssetRenderer, HeadRenderer, ImageRenderer } from './renderer'
+import { ObjectAdminDeleteAllBefore } from './events'
 import {
   BucketType,
   getFileSizeLimit,
@@ -9,15 +16,8 @@ import {
   mustBeValidBucketName,
   parseFileSizeToBytes,
 } from './limits'
-import { getConfig } from '../config'
 import { ObjectStorage } from './object'
-import { InfoRenderer } from '@storage/renderer/info'
-import { logger, logSchema } from '@internal/monitoring'
-import { StorageObjectLocator } from '@storage/locator'
-import { BucketCreatedEvent, BucketDeleted } from '@storage/events'
-import { tenantHasMigrations } from '@internal/database/migrations'
-import { tenantHasFeature } from '@internal/database'
-import { ObjectAdminDeleteAllBefore } from './events'
+import { AssetRenderer, HeadRenderer, ImageRenderer } from './renderer'
 
 const { emptyBucketMax } = getConfig()
 
@@ -56,18 +56,14 @@ export class Storage {
    * @param type
    */
   renderer(type: 'asset' | 'head' | 'image' | 'info') {
-    switch (type) {
-      case 'asset':
-        return new AssetRenderer(this.backend)
-      case 'head':
-        return new HeadRenderer()
-      case 'image':
-        return new ImageRenderer(this.backend)
-      case 'info':
-        return new InfoRenderer()
+    const renderers = {
+      asset: () => new AssetRenderer(this.backend),
+      head: () => new HeadRenderer(),
+      image: () => new ImageRenderer(this.backend),
+      info: () => new InfoRenderer(),
     }
 
-    throw new Error(`renderer of type "${type}" not supported`)
+    return renderers[type]()
   }
 
   /**
@@ -87,6 +83,10 @@ export class Storage {
    */
   listBuckets(columns = 'id', options?: ListBucketOptions) {
     return this.db.listBuckets(columns, options)
+  }
+
+  listAnalyticsBuckets(columns = 'name', options?: ListBucketOptions) {
+    return this.db.listAnalyticsBuckets(columns, options)
   }
 
   /**
@@ -122,7 +122,7 @@ export class Storage {
         )
       }
 
-      const icebergBucketData = data as Parameters<Database['createIcebergBucket']>[0]
+      const icebergBucketData = data as Parameters<Database['createAnalyticsBucket']>[0]
       return this.createIcebergBucket(icebergBucketData)
     }
 
@@ -144,18 +144,35 @@ export class Storage {
     return this.db.createBucket(bucketData)
   }
 
-  async createIcebergBucket(data: Parameters<Database['createIcebergBucket']>[0]) {
+  async createIcebergBucket(data: Parameters<Database['createAnalyticsBucket']>[0]) {
     return this.db.withTransaction(async (db) => {
-      const result = await db.createIcebergBucket(data)
+      const result = await db.createAnalyticsBucket(data)
 
-      await BucketCreatedEvent.invoke({
-        bucketId: result.id,
-        type: 'ANALYTICS',
-        tenant: {
-          ref: db.tenantId,
-          host: db.tenantHost,
+      await BucketCreatedEvent.invokeOrSend(
+        {
+          bucketId: result.id,
+          bucketName: result.name,
+          type: 'ANALYTICS',
+          tenant: {
+            ref: db.tenantId,
+            host: db.tenantHost,
+          },
         },
-      })
+        {
+          sendWhenError: (error) => {
+            if (error instanceof StorageBackendError) {
+              return false
+            }
+
+            logSchema.error(logger, 'Failed to invoke BucketCreatedEvent handler', {
+              project: db.tenantId,
+              type: 'event',
+              error,
+            })
+            return true
+          },
+        }
+      )
 
       return result
     })
@@ -199,13 +216,8 @@ export class Storage {
   /**
    * Delete a specific bucket if empty
    * @param id
-   * @param type
    */
-  async deleteBucket(id: string, type: BucketType = 'STANDARD') {
-    if (type === 'ANALYTICS') {
-      return this.deleteIcebergBucket(id)
-    }
-
+  async deleteBucket(id: string) {
     return this.db.withTransaction(async (db) => {
       await db.asSuperUser().findBucketById(id, 'id', {
         forUpdate: true,
@@ -227,7 +239,7 @@ export class Storage {
     })
   }
 
-  async deleteIcebergBucket(id: string) {
+  async deleteIcebergBucket(name: string) {
     if (
       !(await tenantHasMigrations(this.db.tenantId, 'iceberg-catalog-flag-on-buckets')) ||
       !(await tenantHasFeature(this.db.tenantId, 'icebergCatalog'))
@@ -238,18 +250,15 @@ export class Storage {
       )
     }
 
-    return this.db.withTransaction(async (db) => {
-      const deleted = await db.deleteAnalyticsBucket(id)
+    const catalog = await this.db.findAnalyticsBucketByName(name)
 
-      await BucketDeleted.invoke({
-        bucketId: id,
-        type: 'ANALYTICS',
-        tenant: {
-          ref: db.tenantId,
-          host: db.tenantHost,
-        },
-      })
-      return deleted
+    await BucketDeleted.invoke({
+      bucketId: catalog.id,
+      type: 'ANALYTICS',
+      tenant: {
+        ref: this.db.tenantId,
+        host: this.db.tenantHost,
+      },
     })
   }
 
@@ -263,7 +272,10 @@ export class Storage {
 
     const count = await this.db.countObjectsInBucket(bucketId, emptyBucketMax + 1)
     if (count > emptyBucketMax) {
-      throw ERRORS.UnableToEmptyBucket(bucketId)
+      throw ERRORS.UnableToEmptyBucket(
+        bucketId,
+        'Unable to empty the bucket because it contains too many objects'
+      )
     }
 
     const objects = await this.db.listObjects(bucketId, 'id, name', 1, before)
@@ -273,8 +285,12 @@ export class Storage {
     }
 
     // ensure delete permissions
-    await this.db.testPermission((db) => {
-      return db.deleteObject(bucketId, objects[0].id!)
+    await this.db.testPermission(async (db) => {
+      const deleted = await db.deleteObject(bucketId, objects[0].name)
+
+      if (!deleted) {
+        throw ERRORS.NoSuchKey(objects[0].name)
+      }
     })
 
     // use queue to recursively delete all objects created before the specified time

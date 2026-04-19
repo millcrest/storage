@@ -1,8 +1,8 @@
+import fastifyMultipart from '@fastify/multipart'
 import { FastifyInstance, RequestGenericInterface } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
 import { createDefaultSchema } from '../../routes-helper'
 import { ROUTE_OPERATIONS } from '../operations'
-import fastifyMultipart from '@fastify/multipart'
 
 const createObjectParamsSchema = {
   type: 'object',
@@ -32,6 +32,7 @@ interface createObjectRequestInterface extends RequestGenericInterface {
     'content-type': string
     'cache-control'?: string
     'x-upsert'?: string
+    'x-robots-tag'?: string
   }
 }
 
@@ -79,7 +80,7 @@ export default async function routes(fastify: FastifyInstance) {
         .uploadFromRequest(request, {
           objectName,
           signal: request.signals.body.signal,
-          owner: owner,
+          owner,
           isUpsert,
         })
 

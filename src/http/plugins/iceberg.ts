@@ -1,10 +1,11 @@
-import fastifyPlugin from 'fastify-plugin'
-import { FastifyInstance } from 'fastify'
-import { KnexMetastore, TableIndex } from '@storage/protocols/iceberg/knex'
 import { getTenantConfig, multitenantKnex } from '@internal/database'
-import { getCatalogAuthStrategy, TenantAwareRestCatalog } from '@storage/protocols/iceberg/catalog'
-import { getConfig } from '../../config'
+import { KnexShardStoreFactory, ShardCatalog, SingleShard } from '@internal/sharding'
 import { ICEBERG_BUCKET_RESERVED_SUFFIX } from '@storage/limits'
+import { getCatalogAuthStrategy, TenantAwareRestCatalog } from '@storage/protocols/iceberg/catalog'
+import { KnexMetastore, TableIndex } from '@storage/protocols/iceberg/knex'
+import { FastifyInstance } from 'fastify'
+import fastifyPlugin from 'fastify-plugin'
+import { getConfig } from '../../config'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -46,10 +47,15 @@ export const icebergRestCatalog = fastifyPlugin(async function (fastify: Fastify
 
     req.icebergCatalog = new TenantAwareRestCatalog({
       tenantId: req.tenantId,
-      limits: limits,
+      limits,
       restCatalogUrl: icebergCatalogUrl,
-      warehouse: icebergWarehouse,
       auth: catalogAuthType,
+      sharding: isMultitenant
+        ? new ShardCatalog(new KnexShardStoreFactory(multitenantKnex))
+        : new SingleShard({
+            shardKey: icebergWarehouse,
+            capacity: 10000,
+          }),
       metastore: new KnexMetastore(isMultitenant ? multitenantKnex : req.db.pool.acquire(), {
         multiTenant: isMultitenant,
         schema: isMultitenant ? 'public' : 'storage',

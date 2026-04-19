@@ -1,10 +1,10 @@
-import Agent, { HttpsAgent } from 'agentkeepalive'
 import {
-  HttpPoolErrorGauge,
-  HttpPoolFreeSocketsGauge,
-  HttpPoolPendingRequestsGauge,
-  HttpPoolSocketsGauge,
+  httpPoolBusySockets,
+  httpPoolErrors,
+  httpPoolFreeSockets,
+  httpPoolPendingRequests,
 } from '@internal/monitoring/metrics'
+import Agent, { HttpsAgent } from 'agentkeepalive'
 import { getConfig } from '../../config'
 
 const { region } = getConfig()
@@ -27,12 +27,7 @@ export interface AgentStats {
 
 /**
  * Creates an instrumented agent
- * Adding prometheus metrics to the agent
- * Optimized for COG/range request workloads with:
- * - Longer socket reuse timeout (60s instead of 15s) for burst patterns
- * - Faster keep-alive probes (100ms) to detect stale connections
- * - FIFO scheduling for better handling of concurrent burst requests
- * - Increased free socket pool to reduce connection overhead
+ * Adding metrics to the agent
  */
 export function createAgent(name: string, options: { maxSockets: number }): InstrumentedAgent {
   const agentOptions = {
@@ -72,31 +67,17 @@ export function createAgent(name: string, options: { maxSockets: number }): Inst
 }
 
 /**
- * Metrics
- *
- * HttpPoolSockets
- * HttpPoolFreeSockets
- * HttpPoolPendingRequests
- * HttpPoolError
- *
- * @param name
- * @param protocol
- * @param stats
+ * Updates HTTP agent metrics
  */
 function updateHttpAgentMetrics(name: string, protocol: string, stats: AgentStats) {
-  // Update the metrics with calculated values
-  HttpPoolSocketsGauge.set({ name, region, protocol }, stats.busySocketCount)
-  HttpPoolFreeSocketsGauge.set({ name, region, protocol }, stats.freeSocketCount)
-  HttpPoolPendingRequestsGauge.set({ name, region }, stats.pendingRequestCount)
-  HttpPoolErrorGauge.set({ name, region, type: 'socket_error', protocol }, stats.errorSocketCount)
-  HttpPoolErrorGauge.set(
-    { name, region, type: 'timeout_socket_error', protocol },
-    stats.timeoutSocketCount
-  )
-  HttpPoolErrorGauge.set(
-    { name, region, type: 'create_socket_error', protocol },
-    stats.createSocketErrorCount
-  )
+  const baseAttrs = { name, protocol }
+
+  httpPoolBusySockets.record(stats.busySocketCount, baseAttrs)
+  httpPoolFreeSockets.record(stats.freeSocketCount, baseAttrs)
+  httpPoolPendingRequests.record(stats.pendingRequestCount, { name, region })
+  httpPoolErrors.record(stats.errorSocketCount, { ...baseAttrs, type: 'socket_error' })
+  httpPoolErrors.record(stats.timeoutSocketCount, { ...baseAttrs, type: 'timeout_socket_error' })
+  httpPoolErrors.record(stats.createSocketErrorCount, { ...baseAttrs, type: 'create_socket_error' })
 }
 
 export function watchAgent(name: string, protocol: 'http' | 'https', agent: Agent | HttpsAgent) {
@@ -109,7 +90,7 @@ export function watchAgent(name: string, protocol: 'http' | 'https', agent: Agen
   }, 5000)
 }
 
-// Function to update Prometheus metrics based on the current status of the agent
+// Function to update metrics based on the current status of the agent
 export function gatherHttpAgentStats(status: Agent.AgentStatus) {
   // Calculate the number of busy sockets by iterating over the `sockets` object
   let busySocketCount = 0
