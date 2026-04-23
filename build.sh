@@ -14,3 +14,4 @@ docker buildx build \
     --build-arg VERSION=v$STORAGE_VERSION \
     --output "type=image,compression=zstd,push=true" \
     .
+    
