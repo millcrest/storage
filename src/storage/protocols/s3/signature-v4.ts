@@ -16,6 +16,7 @@ interface SignatureV4Options {
   allowBodyHashing?: boolean
   nonCanonicalForwardedHost?: string
   publicUrl?: URL
+  s3OmitPrefixFromCanonicalUri?: string
   credentials: Omit<Credentials, 'shortDate'> & { secretKey: string }
 }
 
@@ -103,6 +104,7 @@ export class SignatureV4 {
   allowBodyHashing?: boolean
   nonCanonicalForwardedHost?: string
   publicUrl?: URL
+  s3OmitPrefixFromCanonicalUri?: string
   private readonly signingKeyCache = new Map<string, Buffer>()
 
   constructor(options: SignatureV4Options) {
@@ -112,6 +114,7 @@ export class SignatureV4 {
     this.allowBodyHashing = options.allowBodyHashing
     this.nonCanonicalForwardedHost = options.nonCanonicalForwardedHost
     this.publicUrl = options.publicUrl
+    this.s3OmitPrefixFromCanonicalUri = options.s3OmitPrefixFromCanonicalUri
   }
 
   static parseAuthorizationHeader(headers: Record<string, any>) {
@@ -426,7 +429,10 @@ export class SignatureV4 {
   ) {
     const method = request.method
     const prefix = request.prefix ? request.prefix.replace(/\/+$/, '') : ''
-    const canonicalUri = new URL(`http://localhost:8080${prefix}${request.url}`).pathname
+    let canonicalUri = new URL(`http://localhost:8080${prefix}${request.url}`).pathname
+    if (this.s3OmitPrefixFromCanonicalUri) {
+      canonicalUri = canonicalUri.replace(new RegExp(`^${this.s3OmitPrefixFromCanonicalUri}`), '')
+    }
     const canonicalQueryString = this.constructCanonicalQueryString(request.query || {})
     const canonicalHeaders = this.constructCanonicalHeaders(request, signedHeaders)
     const signedHeadersString = signedHeaders.sort().join(';')

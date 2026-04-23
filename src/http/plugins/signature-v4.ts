@@ -30,6 +30,7 @@ const {
   s3ProtocolAccessKeySecret,
   s3ProtocolNonCanonicalHostHeader,
   storagePublicUrl,
+  s3OmitPrefixFromCanonicalUri,
 } = getConfig()
 
 const parsedPublicUrl = storagePublicUrl ? new URL(storagePublicUrl) : undefined
@@ -262,6 +263,7 @@ async function createServerSignature(
       allowBodyHashing: allowBodyHash,
       nonCanonicalForwardedHost: s3ProtocolNonCanonicalHostHeader,
       publicUrl: parsedPublicUrl,
+      s3OmitPrefixFromCanonicalUri: s3OmitPrefixFromCanonicalUri,
       credentials: {
         accessKey: tenantId,
         secretKey: tenantAnonKey,
@@ -285,6 +287,7 @@ async function createServerSignature(
       allowBodyHashing: allowBodyHash,
       nonCanonicalForwardedHost: s3ProtocolNonCanonicalHostHeader,
       publicUrl: parsedPublicUrl,
+      s3OmitPrefixFromCanonicalUri: s3OmitPrefixFromCanonicalUri,
       credentials: {
         accessKey: credential.accessKey,
         secretKey: credential.secretKey,
@@ -308,6 +311,7 @@ async function createServerSignature(
     allowBodyHashing: allowBodyHash,
     nonCanonicalForwardedHost: s3ProtocolNonCanonicalHostHeader,
     publicUrl: parsedPublicUrl,
+    s3OmitPrefixFromCanonicalUri: s3OmitPrefixFromCanonicalUri,
     credentials: {
       accessKey: s3ProtocolAccessKeyId,
       secretKey: s3ProtocolAccessKeySecret,

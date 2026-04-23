@@ -177,6 +177,7 @@ type StorageConfigType = {
   s3ProtocolAccessKeyId?: string
   s3ProtocolAccessKeySecret?: string
   s3ProtocolNonCanonicalHostHeader?: string
+  s3OmitPrefixFromCanonicalUri?: string
   tracingEnabled?: boolean
   tracingMode?: string
   tracingTimeMinDuration: number
@@ -354,6 +355,8 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     s3ProtocolNonCanonicalHostHeader: getOptionalConfigFromEnv(
       'S3_PROTOCOL_NON_CANONICAL_HOST_HEADER'
     ),
+    s3OmitPrefixFromCanonicalUri:
+      getOptionalConfigFromEnv('S3_OMIT_PREFIX_FROM_CANONICAL_URI') === 'true' ? "/s3" : undefined,
     // Storage
     storageBackendType: getOptionalConfigFromEnv('STORAGE_BACKEND') as StorageBackendType,
     emptyBucketMax: parseInt(getOptionalConfigFromEnv('STORAGE_EMPTY_BUCKET_MAX') || '200000', 10),
