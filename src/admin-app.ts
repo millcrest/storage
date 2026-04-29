@@ -25,6 +25,15 @@ const build = (opts: buildOpts = {}): FastifyInstance => {
           description: 'Admin API documentation for Supabase Storage',
           version,
         },
+        components: {
+          securitySchemes: {
+            apiKeyAuth: {
+              type: 'apiKey',
+              in: 'header',
+              name: 'ApiKey',
+            },
+          },
+        },
         tags: [
           { name: 'tenant', description: 'Tenant management' },
           { name: 'object', description: 'Object management' },
@@ -45,6 +54,7 @@ const build = (opts: buildOpts = {}): FastifyInstance => {
     })
   }
 
+  app.register(plugins.requestContext)
   app.register(plugins.signals)
   app.register(plugins.adminTenantId)
   app.register(plugins.logRequest({ excludeUrls: ['/status', '/metrics', '/health', '/version'] }))

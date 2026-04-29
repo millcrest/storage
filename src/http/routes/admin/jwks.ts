@@ -4,7 +4,7 @@ import { logSchema } from '@internal/monitoring'
 import { JwksRollUrlSigningKey } from '@storage/events'
 import { FastifyInstance, RequestGenericInterface } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
-import apiKey from '../../plugins/apikey'
+import { registerApiKeyAuth } from '../../plugins/apikey'
 
 const addSchema = {
   body: {
@@ -105,7 +105,7 @@ function validateAddJwkRequest({ jwk, kind }: JwksAddRequestInterface['Body']): 
 }
 
 export default async function routes(fastify: FastifyInstance) {
-  fastify.register(apiKey)
+  registerApiKeyAuth(fastify)
 
   fastify.post<JwksAddRequestInterface>(
     '/:tenantId/jwks',
@@ -144,7 +144,9 @@ export default async function routes(fastify: FastifyInstance) {
         tenantId,
         tenant: {
           ref: tenantId,
+          host: '',
         },
+        sbReqId: request.sbReqId,
       })
 
       return reply.send({ started: true })
@@ -162,11 +164,16 @@ export default async function routes(fastify: FastifyInstance) {
           .send(`Generate missing jwks is already running, and has sent ${sent} items so far`)
       }
 
-      UrlSigningJwkGenerator.generateUrlSigningJwksOnAllTenants(
-        request.signals.disconnect.signal
-      ).catch((e) => {
+      UrlSigningJwkGenerator.generateUrlSigningJwksOnAllTenants({
+        sbReqId: request.sbReqId,
+        signal: request.signals.disconnect.signal,
+      }).catch((e) => {
         logSchema.error(request.log, 'Error generating url signing jwks for all tenants', {
           type: 'jwk-generator',
+          tenantId: request.tenantId,
+          project: request.tenantId,
+          reqId: request.id,
+          sbReqId: request.sbReqId,
           error: e,
         })
       })
