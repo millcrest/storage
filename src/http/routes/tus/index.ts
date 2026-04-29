@@ -1,6 +1,6 @@
 import * as https from 'node:https'
 import { S3Client } from '@aws-sdk/client-s3'
-import { PubSub, TenantConnection } from '@internal/database'
+import { PubSub } from '@internal/database'
 import { ERRORS } from '@internal/errors'
 import { createAgent } from '@internal/http'
 import { logSchema } from '@internal/monitoring'
@@ -8,19 +8,19 @@ import { NodeHttpHandler } from '@smithy/node-http-handler'
 import { getFileSizeLimit } from '@storage/limits'
 import { AlsMemoryKV, FileStore, LockNotifier, PgLocker, UploadId } from '@storage/protocols/tus'
 import { S3Locker } from '@storage/protocols/tus/s3-locker'
-import { Storage } from '@storage/storage'
 import { S3Store } from '@tus/s3-store'
 import { DataStore, Server, ServerOptions } from '@tus/server'
-import { FastifyBaseLogger, FastifyInstance } from 'fastify'
+import { FastifyInstance } from 'fastify'
 import fastifyPlugin from 'fastify-plugin'
 import * as http from 'http'
 import type { ServerRequest as Request } from 'srvx'
 import { getConfig } from '../../../config'
-import { db, dbSuperUser, jwt, storage } from '../../plugins'
+import { db, dbSuperUser, registerJwtAuth, storage } from '../../plugins'
 import { ROUTE_OPERATIONS } from '../operations'
 import {
   generateUrl,
   getFileIdFromRequest,
+  type MultiPartRequest,
   namingFunction,
   onCreate,
   onIncomingRequest,
@@ -46,18 +46,6 @@ const {
   storageBackendType,
   storageFilePath,
 } = getConfig()
-
-type MultiPartRequest = http.IncomingMessage & {
-  log: FastifyBaseLogger
-  upload: {
-    storage: Storage
-    owner?: string
-    tenantId: string
-    db: TenantConnection
-    isUpsert: boolean
-    resources?: string[]
-  }
-}
 
 function createTusStore(agent: { httpsAgent: https.Agent; httpAgent: http.Agent }) {
   if (storageBackendType === 's3') {
@@ -197,7 +185,7 @@ export default async function routes(fastify: FastifyInstance) {
 
   // authenticated routes
   fastify.register(async (fastify) => {
-    fastify.register(jwt)
+    registerJwtAuth(fastify)
     fastify.register(db)
     fastify.register(storage)
 
@@ -258,11 +246,13 @@ const authenticatedRoutes = fastifyPlugin(
       fastify.addHook('preHandler', async (req) => {
         ;(req.raw as MultiPartRequest).log = req.log
         ;(req.raw as MultiPartRequest).upload = {
+          tenantId: req.tenantId,
           storage: req.storage,
           owner: req.owner,
-          tenantId: req.tenantId,
           db: req.db,
           isUpsert: req.headers['x-upsert'] === 'true',
+          reqId: req.id,
+          sbReqId: req.sbReqId,
         }
       })
 
@@ -350,7 +340,7 @@ const authenticatedRoutes = fastifyPlugin(
   }
 )
 
-const publicRoutes = fastifyPlugin(
+export const publicRoutes = fastifyPlugin(
   async (fastify: FastifyInstance, options: { tusServer: Server; operation?: string }) => {
     fastify.register(async (fastify) => {
       fastify.addContentTypeParser('application/offset+octet-stream', (request, payload, done) =>
@@ -360,11 +350,13 @@ const publicRoutes = fastifyPlugin(
       fastify.addHook('preHandler', async (req) => {
         ;(req.raw as MultiPartRequest).log = req.log
         ;(req.raw as MultiPartRequest).upload = {
+          tenantId: req.tenantId,
           storage: req.storage,
           owner: req.owner,
-          tenantId: req.tenantId,
           db: req.db,
           isUpsert: req.headers['x-upsert'] === 'true',
+          reqId: req.id,
+          sbReqId: req.sbReqId,
         }
       })
 
