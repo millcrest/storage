@@ -1,31 +1,51 @@
 import dotenv from 'dotenv'
 import path from 'path'
+
 dotenv.config({ path: path.resolve(__dirname, '..', '..', '.env.test') })
 
 import {
-  S3Client,
   CreateBucketCommand,
   DeleteObjectsCommand,
+  GetObjectCommand,
   ListObjectsV2Command,
   PutObjectCommand,
-  GetObjectCommand,
+  S3Client,
 } from '@aws-sdk/client-s3'
+import type { PubSubAdapter } from '@internal/pubsub'
+import type { Mock } from 'vitest'
 import { getConfig } from '../config'
-import { S3Locker, S3Lock } from '../storage/protocols/tus/s3-locker'
-import { LockNotifier } from '../storage/protocols/tus/postgres-locker'
-import { checkBucketExists } from './common'
 import { backends } from '../storage'
+import { LockNotifier } from '../storage/protocols/tus/postgres-locker'
+import { S3Lock, S3Locker } from '../storage/protocols/tus/s3-locker'
+import { checkBucketExists } from './common'
 
 const { storageS3Bucket, storageBackendType } = getConfig()
 const backend = backends.createStorageBackend(storageBackendType)
 const s3ClientFromBackend = backend.client
+
+type TrackedLock = ReturnType<S3Locker['newLock']>
+
+function getErrorDetails(error: unknown) {
+  if (error instanceof Error) {
+    return error
+  }
+
+  if (typeof error === 'object' && error !== null) {
+    return {
+      name: 'name' in error && typeof error.name === 'string' ? error.name : undefined,
+      message: 'message' in error && typeof error.message === 'string' ? error.message : undefined,
+    }
+  }
+
+  return {}
+}
 
 describe('S3Locker', () => {
   let s3Client: S3Client
   let locker: S3Locker
   let testBucket: string
   let mockNotifier: LockNotifier
-  let allLocks: Array<{ lock: any; locker: S3Locker }> = []
+  let allLocks: TrackedLock[] = []
 
   beforeAll(async () => {
     // Use the configured S3 client from the backend
@@ -48,12 +68,21 @@ describe('S3Locker', () => {
     await cleanupTestLocks()
 
     // Create mock notifier
-    mockNotifier = {
-      release: jest.fn(),
-      onRelease: jest.fn(),
-      unsubscribe: jest.fn(),
-      subscribe: jest.fn(),
-    } as any
+    const pubSub: PubSubAdapter = {
+      async start() {},
+      async publish() {},
+      async subscribe() {},
+      async unsubscribe() {},
+      async close() {},
+      on() {
+        return this
+      },
+    }
+
+    mockNotifier = new LockNotifier(pubSub)
+    vi.spyOn(mockNotifier, 'release').mockResolvedValue()
+    vi.spyOn(mockNotifier, 'onRelease')
+    vi.spyOn(mockNotifier, 'unsubscribe')
 
     // Create fresh locker instance
     locker = new S3Locker({
@@ -66,19 +95,19 @@ describe('S3Locker', () => {
       maxRetries: 5,
       retryDelayMs: 100,
       logger: {
-        log: jest.fn(),
-        warn: jest.fn(),
-        error: jest.fn(),
+        log: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
       },
     })
   })
 
   afterEach(async () => {
     // Clean up all tracked locks first
-    for (const { lock } of allLocks) {
+    for (const lock of allLocks) {
       try {
         await lock.unlock()
-      } catch (error) {
+      } catch {
         // Ignore cleanup errors
       }
     }
@@ -89,10 +118,10 @@ describe('S3Locker', () => {
 
   afterAll(async () => {
     // Final cleanup - ensure all locks are released
-    for (const { lock } of allLocks) {
+    for (const lock of allLocks) {
       try {
         await lock.unlock()
-      } catch (error) {
+      } catch {
         // Ignore cleanup errors
       }
     }
@@ -106,13 +135,13 @@ describe('S3Locker', () => {
       if (s3Client && typeof s3Client.destroy === 'function') {
         s3Client.destroy()
       }
-    } catch (error) {
+    } catch {
       // Ignore cleanup errors
     }
   })
 
-  function trackLock(lock: any, lockLocker: S3Locker = locker) {
-    allLocks.push({ lock, locker: lockLocker })
+  function trackLock(lock: TrackedLock) {
+    allLocks.push(lock)
     return lock
   }
 
@@ -135,7 +164,7 @@ describe('S3Locker', () => {
           })
         )
       }
-    } catch (error) {
+    } catch {
       // Ignore cleanup errors
     }
   }
@@ -149,7 +178,7 @@ describe('S3Locker', () => {
     test('should acquire and release a lock successfully', async () => {
       const lock = locker.newLock('test-lock-1')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // Should be able to acquire lock
       await expect(lock.lock(abortController.signal, cancelReq)).resolves.not.toThrow()
@@ -169,7 +198,7 @@ describe('S3Locker', () => {
         renewalIntervalMs: 1000,
         maxRetries: 3,
         retryDelayMs: 200,
-        logger: { log: jest.fn(), warn: jest.fn(), error: jest.fn() },
+        logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
       })
 
       const lock1 = locker.newLock('test-lock-1')
@@ -177,7 +206,7 @@ describe('S3Locker', () => {
 
       const abortController1 = new AbortController()
       const abortController2 = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // Both locks should succeed since they have different IDs
       await lock1.lock(abortController1.signal, cancelReq)
@@ -196,7 +225,7 @@ describe('S3Locker', () => {
 
       const abortController1 = new AbortController()
       const abortController2 = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // First lock
       await lock1.lock(abortController1.signal, cancelReq)
@@ -218,7 +247,7 @@ describe('S3Locker', () => {
       const lock3 = locker.newLock('test-lock-3')
 
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // All should succeed since they have different IDs
       await Promise.all([
@@ -239,7 +268,7 @@ describe('S3Locker', () => {
       // Create multiple locker instances to simulate different processes
       const lockers = Array.from(
         { length: numInstances },
-        (_, index) =>
+        () =>
           new S3Locker({
             s3Client,
             bucket: testBucket,
@@ -249,13 +278,13 @@ describe('S3Locker', () => {
             renewalIntervalMs: 1000,
             maxRetries: 2,
             retryDelayMs: 150,
-            logger: { log: jest.fn(), warn: jest.fn(), error: jest.fn() },
+            logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
           })
       )
 
       // Each locker gets a unique lock ID
       const locks = lockers.map((locker, index) => locker.newLock(`unique-lock-${index}`))
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // All lock attempts should succeed since they have unique IDs
       const lockPromises = locks.map(async (lock, index) => {
@@ -284,7 +313,7 @@ describe('S3Locker', () => {
     test('should renew lock automatically', async () => {
       const lock = locker.newLock('renewable-lock')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       await lock.lock(abortController.signal, cancelReq)
 
@@ -305,16 +334,16 @@ describe('S3Locker', () => {
         renewalIntervalMs: 1800, // 1.8 seconds (less than TTL but long enough to prevent renewal)
         maxRetries: 5,
         retryDelayMs: 100,
-        logger: { log: jest.fn(), warn: jest.fn(), error: jest.fn() },
+        logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
       })
 
       const lock1 = shortTtlLocker.newLock('expiring-lock')
       const abortController1 = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // Acquire first lock
       await lock1.lock(abortController1.signal, cancelReq)
-      trackLock(lock1, shortTtlLocker)
+      trackLock(lock1)
 
       // Manually abort the first lock to stop its renewal timer
       abortController1.abort()
@@ -366,9 +395,9 @@ describe('S3Locker', () => {
             Key: testLockKey,
           })
         )
-        fail('Lock should have been deleted')
-      } catch (error: any) {
-        expect(error.name).toBe('NoSuchKey')
+        throw new Error('Lock should have been deleted')
+      } catch (error) {
+        expect(getErrorDetails(error).name).toBe('NoSuchKey')
       }
     })
   })
@@ -380,7 +409,7 @@ describe('S3Locker', () => {
 
       const abortController1 = new AbortController()
       const abortController2 = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // First lock succeeds
       await lock1.lock(abortController1.signal, cancelReq)
@@ -404,6 +433,100 @@ describe('S3Locker', () => {
       await lock1.unlock()
     })
 
+    test('should not create zombie locks with rapid lock cycling and contention', async () => {
+      // This test reproduces the zombie lock race condition by using a spy to inject
+      // delays in the S3 client, simulating slow network between GET and PUT in renewLock:
+      // 1. Lock acquired, starts renewal timer (fires at T=1000)
+      // 2. Renewal GET completes, then we inject a delay before PUT
+      // 3. During the delay, unlock() DELETEs the lock
+      // 4. renewLock() PUT happens AFTER DELETE
+      // WITHOUT IfMatch: PUT succeeds, creating zombie
+      // WITH IfMatch: PUT fails (ETag mismatch), no zombie created
+
+      const lockId = 'contention-race-test'
+      const cancelReq = vi.fn()
+
+      // Spy on S3 client to inject delay after GET and before PUT in renewLock
+      const originalSend = s3Client.send.bind(s3Client)
+      const sendSpy = vi.spyOn(s3Client, 'send').mockImplementation(async (command) => {
+        const result = await originalSend(command)
+
+        // Inject delay after GET in renewLock to simulate slow network
+        if (command instanceof GetObjectCommand && command.input.Key?.includes(lockId)) {
+          await new Promise((resolve) => setTimeout(resolve, 200))
+        }
+
+        return result
+      })
+
+      try {
+        for (let i = 0; i < 3; i++) {
+          const lock1 = locker.newLock(lockId)
+          const abortController1 = new AbortController()
+
+          // Acquire first lock
+          const start = Date.now()
+          try {
+            await lock1.lock(abortController1.signal, cancelReq)
+          } catch (error) {
+            const errorDetails = getErrorDetails(error)
+            const lockDuration = Date.now() - start
+            throw new Error(
+              `Lock acquisition failed on iteration ${i} after ${lockDuration}ms with error: ${errorDetails.message}. This likely means a zombie lock exists from a previous iteration.`
+            )
+          }
+          const lockDuration = Date.now() - start
+
+          // Lock should be acquired quickly (< 1000ms)
+          // Longer times indicate retries due to zombie locks from previous iteration
+          if (lockDuration > 1000) {
+            await lock1.unlock()
+            throw new Error(
+              `Lock acquisition took ${lockDuration}ms on iteration ${i}, indicating a zombie lock exists`
+            )
+          }
+
+          // Wait for renewal timer to fire (1000ms) plus buffer
+          await new Promise((resolve) => setTimeout(resolve, 1100))
+
+          // Manually delete the lock to simulate unlock
+          await locker.releaseLock(lockId)
+          abortController1.abort()
+
+          // Wait for the zombie-creating PUT to complete
+          // WITHOUT IfMatch fix: renewLock's in-flight PUT will succeed, creating a zombie
+          // WITH IfMatch fix: renewLock's PUT will fail (ETag mismatch), no zombie created
+          await new Promise((resolve) => setTimeout(resolve, 100))
+
+          // Check if a zombie lock exists
+          try {
+            const lockKey = `test-locks/${lockId}.lock`
+            await s3Client.send(
+              new GetObjectCommand({
+                Bucket: testBucket,
+                Key: lockKey,
+              })
+            )
+            // If we got here, a lock exists - this is a zombie!
+            await locker.releaseLock(lockId)
+            throw new Error(
+              `Zombie lock detected on iteration ${i}! A lock exists after deletion, indicating the IfMatch fix is missing.`
+            )
+          } catch (error) {
+            if (getErrorDetails(error).name === 'NoSuchKey') {
+              // Good - no zombie lock exists
+              continue
+            }
+            // Re-throw if it's our zombie detection error or other error
+            throw error
+          }
+        }
+      } finally {
+        // Restore original S3 client behavior
+        sendSpy.mockRestore()
+      }
+    })
+
     test('should handle unlock without lock', async () => {
       const lock = locker.newLock('test-lock-1')
 
@@ -414,7 +537,7 @@ describe('S3Locker', () => {
     test('should handle double unlock', async () => {
       const lock = locker.newLock('test-lock-1')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       await lock.lock(abortController.signal, cancelReq)
       await lock.unlock()
@@ -434,12 +557,12 @@ describe('S3Locker', () => {
         renewalIntervalMs: 1000,
         maxRetries: 2,
         retryDelayMs: 100,
-        logger: { log: jest.fn(), warn: jest.fn(), error: jest.fn() },
+        logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
       })
 
       const lock = invalidLocker.newLock('test-lock-1')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // Should fail with an error when trying to access non-existent bucket
       await expect(lock.lock(abortController.signal, cancelReq)).rejects.toThrow()
@@ -480,7 +603,7 @@ describe('S3Locker', () => {
       const abortController1 = new AbortController()
       const abortController2 = new AbortController()
       const abortController3 = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // First two locks should succeed (different IDs)
       await lock1.lock(abortController1.signal, cancelReq)
@@ -501,12 +624,12 @@ describe('S3Locker', () => {
 
       await lock1.unlock()
       await lock2.unlock()
-    }, 10000)
+    })
 
     test('should automatically renew locks', async () => {
       const lock = locker.newLock('renewal-test-lock')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       await lock.lock(abortController.signal, cancelReq)
 
@@ -523,7 +646,7 @@ describe('S3Locker', () => {
 
       const lock1 = locker.newLock(lockId)
       const abortController1 = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // First acquisition
       await lock1.lock(abortController1.signal, cancelReq)
@@ -541,7 +664,7 @@ describe('S3Locker', () => {
     test('should cleanup lock when stop signal is fired', async () => {
       const lock = locker.newLock('stop-signal-lock')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       await lock.lock(abortController.signal, cancelReq)
       trackLock(lock)
@@ -575,7 +698,7 @@ describe('S3Locker', () => {
         renewalIntervalMs: 1000,
         maxRetries: 3,
         retryDelayMs: 100,
-        logger: { log: jest.fn(), warn: jest.fn(), error: jest.fn() },
+        logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
       })
 
       const lock1 = locker.newLock('isolation-lock')
@@ -583,7 +706,7 @@ describe('S3Locker', () => {
 
       const abortController1 = new AbortController()
       const abortController2 = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // First instance acquires lock
       await lock1.lock(abortController1.signal, cancelReq)
@@ -594,7 +717,7 @@ describe('S3Locker', () => {
         await lock2.lock(abortController2.signal, cancelReq)
         // If it succeeds unexpectedly, unlock it
         await lock2.unlock()
-      } catch (error) {
+      } catch {
         // Expected behavior - lock contention
         secondLockFailed = true
       }
@@ -615,7 +738,7 @@ describe('S3Locker', () => {
 
       const lock = locker.newLock('integration-test-lock')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       // First, acquire the lock successfully
       await lock.lock(abortController.signal, cancelReq)
@@ -640,7 +763,7 @@ describe('S3Locker', () => {
     test('should set up release notification listener when lock is acquired', async () => {
       const lock = locker.newLock('release-listener-test')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       await lock.lock(abortController.signal, cancelReq)
 
@@ -656,7 +779,7 @@ describe('S3Locker', () => {
     test('should unsubscribe from notifications when lock is released', async () => {
       const lock = locker.newLock('unsubscribe-test')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       await lock.lock(abortController.signal, cancelReq)
       await lock.unlock()
@@ -668,16 +791,19 @@ describe('S3Locker', () => {
     test('should call cancelReq when notifier triggers release', async () => {
       const lock = locker.newLock('cancel-req-test')
       const abortController = new AbortController()
-      const cancelReq = jest.fn()
+      const cancelReq = vi.fn()
 
       await lock.lock(abortController.signal, cancelReq)
 
       // Get the callback function that was registered with onRelease
-      const onReleaseCall = (mockNotifier.onRelease as jest.Mock).mock.calls.find(
-        ([id]) => id === 'cancel-req-test'
+      const onReleaseCall = (mockNotifier.onRelease as Mock).mock.calls.find(
+        (call) => call[0] === 'cancel-req-test'
       )
       expect(onReleaseCall).toBeDefined()
-      const releaseCallback = onReleaseCall[1]
+      if (!onReleaseCall) {
+        throw new Error('Expected onRelease callback to be registered')
+      }
+      const releaseCallback = onReleaseCall[1] as () => void
 
       // Simulate the notifier triggering the release
       releaseCallback()

@@ -10,6 +10,7 @@ export enum ErrorCode {
   EntityTooLarge = 'EntityTooLarge',
   InternalError = 'InternalError',
   ResourceAlreadyExists = 'ResourceAlreadyExists',
+  ResourceNotEmpty = 'ResourceNotEmpty',
   InvalidBucketName = 'InvalidBucketName',
   InvalidKey = 'InvalidKey',
   InvalidRange = 'InvalidRange',
@@ -18,12 +19,17 @@ export enum ErrorCode {
   KeyAlreadyExists = 'KeyAlreadyExists',
   BucketAlreadyExists = 'BucketAlreadyExists',
   DatabaseTimeout = 'DatabaseTimeout',
+  DatabaseConnectionLimit = 'DatabaseConnectionLimit',
+  DatabaseReadOnly = 'DatabaseReadOnly',
+  DatabaseInvalidObjectDefinition = 'DatabaseInvalidObjectDefinition',
+  DatabaseSchemaMismatch = 'DatabaseSchemaMismatch',
   InvalidSignature = 'InvalidSignature',
   ExpiredToken = 'ExpiredToken',
   SignatureDoesNotMatch = 'SignatureDoesNotMatch',
   AccessDenied = 'AccessDenied',
   ResourceLocked = 'ResourceLocked',
   DatabaseError = 'DatabaseError',
+  TransactionError = 'TransactionError',
   MissingContentLength = 'MissingContentLength',
   MissingParameter = 'MissingParameter',
   InvalidParameter = 'InvalidParameter',
@@ -40,15 +46,23 @@ export enum ErrorCode {
   AbortedTerminate = 'AbortedTerminate',
   FeatureNotEnabled = 'FeatureNotEnabled',
   NotSupported = 'NotSupported',
-  IcebergError = 'IcebergError',
   IcebergMaximumResourceLimit = 'IcebergMaximumResourceLimit',
+  IcebergResourceNotEmpty = 'IcebergResourceNotEmpty',
   NoSuchCatalog = 'NoSuchCatalog',
+
+  S3VectorConflictException = 'ConflictException',
+  S3VectorNotFoundException = 'NotFoundException',
+  S3VectorBucketNotEmpty = 'VectorBucketNotEmpty',
+  S3VectorMaxBucketsExceeded = 'S3VectorMaxBucketsExceeded',
+  S3VectorMaxIndexesExceeded = 'S3VectorMaxIndexesExceeded',
+  NoAvailableShard = 'NoAvailableShard',
+  ShardNotFound = 'ShardNotFound',
 }
 
 export const ERRORS = {
   BucketNotEmpty: (bucket: string, e?: Error) =>
     new StorageBackendError({
-      code: ErrorCode.InvalidRequest,
+      code: ErrorCode.ResourceNotEmpty,
       resource: bucket,
       httpStatusCode: 409,
       message: `The bucket you tried to delete is not empty`,
@@ -61,27 +75,34 @@ export const ERRORS = {
       message: `The maximum number of this resource ${limit} is reached`,
       originalError: e,
     }),
+  IcebergResourceNotEmpty: (resource: string, name: string, e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.IcebergResourceNotEmpty,
+      httpStatusCode: 400,
+      message: `The resource ${resource}: ${name} is not empty`,
+      originalError: e,
+    }),
   FeatureNotEnabled: (resource: string, feature: string, e?: Error) =>
     new StorageBackendError({
-      code: ErrorCode.InvalidRequest,
-      resource: resource,
+      code: ErrorCode.FeatureNotEnabled,
+      resource,
       httpStatusCode: 409,
       message: `The feature ${feature} is not enabled for this resource`,
       originalError: e,
     }),
   NotSupported: (feature: string, e?: Error) =>
     new StorageBackendError({
-      code: ErrorCode.InvalidRequest,
+      code: ErrorCode.NotSupported,
       httpStatusCode: 409,
       message: `The feature ${feature} is not enabled for this resource`,
       originalError: e,
     }),
-  UnableToEmptyBucket: (bucket: string) =>
+  UnableToEmptyBucket: (bucket: string, msg: string) =>
     new StorageBackendError({
       code: ErrorCode.InvalidRequest,
       resource: bucket,
       httpStatusCode: 409,
-      message: `Unable to empty the bucket because it contains too many objects`,
+      message: msg,
     }),
   NoSuchBucket: (bucket: string, e?: Error) =>
     new StorageBackendError({
@@ -120,7 +141,7 @@ export const ERRORS = {
 
   InvalidParameter: (parameter: string, opts?: { error?: Error; message?: string }) =>
     new StorageBackendError({
-      code: ErrorCode.MissingParameter,
+      code: ErrorCode.InvalidParameter,
       httpStatusCode: 400,
       message: opts?.message || `Invalid Parameter ${parameter}`,
       originalError: opts?.error,
@@ -217,7 +238,7 @@ export const ERRORS = {
     new StorageBackendError({
       code: ErrorCode.TusError,
       httpStatusCode: statusCode,
-      message: message,
+      message,
     }),
 
   MissingTenantConfig: (tenantId: string) =>
@@ -235,6 +256,22 @@ export const ERRORS = {
       message: `mime type ${mimeType} is not supported`,
     }),
 
+  InvalidXRobotsTag: (message: string) =>
+    new StorageBackendError({
+      error: 'invalid_x_robots_tag',
+      code: ErrorCode.InvalidRequest,
+      httpStatusCode: 400,
+      message: `Invalid X-Robots-Tag header: ${message}`,
+    }),
+
+  InvalidHeaderChar: (headerName: string, headerValue: string) =>
+    new StorageBackendError({
+      error: 'invalid_header_char',
+      code: ErrorCode.InvalidRequest,
+      httpStatusCode: 400,
+      message: `Invalid character in response header "${headerName}": ${headerValue.substring(0, 50)}`,
+    }),
+
   InvalidRange: () =>
     new StorageBackendError({
       error: 'invalid_range',
@@ -243,12 +280,12 @@ export const ERRORS = {
       message: `invalid range provided`,
     }),
 
-  EntityTooLarge: (e?: Error, entity = 'object') =>
+  EntityTooLarge: (e?: Error, entity = 'object', limit = 'the maximum allowed size') =>
     new StorageBackendError({
       error: 'Payload too large',
       code: ErrorCode.EntityTooLarge,
       httpStatusCode: 413,
-      message: `The ${entity} exceeded the maximum allowed size`,
+      message: `The ${entity} exceeded ${limit}`,
       originalError: e,
     }),
 
@@ -264,7 +301,7 @@ export const ERRORS = {
     new StorageBackendError({
       code: statusCode > 499 ? ErrorCode.InternalError : ErrorCode.InvalidRequest,
       httpStatusCode: statusCode,
-      message: message,
+      message,
       originalError: e,
     }),
 
@@ -339,6 +376,39 @@ export const ERRORS = {
       originalError: e,
     }),
 
+  DatabaseConnectionLimit: (e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.DatabaseConnectionLimit,
+      httpStatusCode: 503,
+      message:
+        'The database has reached its maximum number of connections. Please try again later.',
+      originalError: e,
+    }),
+
+  DatabaseReadOnly: (e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.DatabaseReadOnly,
+      httpStatusCode: 503,
+      message: 'The database is currently in read-only mode. Please try again later.',
+      originalError: e,
+    }),
+
+  InvalidObjectDefinition: (e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.DatabaseInvalidObjectDefinition,
+      httpStatusCode: 503,
+      message: 'The database schema is invalid or incompatible.',
+      originalError: e,
+    }),
+
+  DatabaseSchemaMismatch: (e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.DatabaseSchemaMismatch,
+      httpStatusCode: 503,
+      message: 'The database schema is out of sync. Please run migrations or contact support.',
+      originalError: e,
+    }),
+
   ResourceLocked: (e?: Error) =>
     new StorageBackendError({
       code: ErrorCode.ResourceLocked,
@@ -355,11 +425,19 @@ export const ERRORS = {
       originalError: e,
     }),
 
+  TransactionError: (message: string, err?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.TransactionError,
+      httpStatusCode: 409,
+      message,
+      originalError: err,
+    }),
+
   DatabaseError: (message: string, err?: Error) =>
     new StorageBackendError({
       code: ErrorCode.DatabaseError,
       httpStatusCode: 500,
-      message: message,
+      message,
       originalError: err,
     }),
 
@@ -390,7 +468,7 @@ export const ERRORS = {
     new StorageBackendError({
       code: ErrorCode.InvalidChecksum,
       httpStatusCode: 400,
-      message: message,
+      message,
     }),
 
   MissingPart: (partNumber: number, uploadId: string) =>
@@ -404,21 +482,70 @@ export const ERRORS = {
     new StorageBackendError({
       code: ErrorCode.Aborted,
       httpStatusCode: 500,
-      message: message,
+      message,
       originalError,
     }),
   AbortedTerminate: (message: string, originalError?: unknown) =>
     new StorageBackendError({
       code: ErrorCode.AbortedTerminate,
       httpStatusCode: 500,
-      message: message,
+      message,
       originalError,
-    }),
+    }).withConnectionClose(),
   NoSuchCatalog: (name: string) => {
     return new StorageBackendError({
       code: ErrorCode.NoSuchCatalog,
       httpStatusCode: 404,
       message: `Catalog name "${name}" not found`,
+    })
+  },
+  S3VectorConflictException(resource: string, name: string) {
+    return new StorageBackendError({
+      code: ErrorCode.S3VectorConflictException,
+      httpStatusCode: 409,
+      message: `${resource} "${name}" already exists`,
+    })
+  },
+  S3VectorNotFoundException(resource: string, name: string) {
+    return new StorageBackendError({
+      code: ErrorCode.S3VectorNotFoundException,
+      httpStatusCode: 404,
+      message: `resource "${name}" not found`,
+    })
+  },
+  S3VectorBucketNotEmpty(name: string) {
+    return new StorageBackendError({
+      code: ErrorCode.S3VectorBucketNotEmpty,
+      httpStatusCode: 400,
+      message: `Vector Bucket "${name}" not empty`,
+    })
+  },
+  S3VectorMaxBucketsExceeded(maxBuckets: number) {
+    return new StorageBackendError({
+      code: ErrorCode.S3VectorMaxBucketsExceeded,
+      httpStatusCode: 400,
+      message: `Maximum number of buckets exceeded. Max allowed is ${maxBuckets}. Contact support to increase your limit.`,
+    })
+  },
+  S3VectorMaxIndexesExceeded(maxIndexes: number) {
+    return new StorageBackendError({
+      code: ErrorCode.S3VectorMaxIndexesExceeded,
+      httpStatusCode: 400,
+      message: `Maximum number of indexes exceeded. Max allowed is ${maxIndexes}. Contact support to increase your limit.`,
+    })
+  },
+  NoAvailableShard() {
+    return new StorageBackendError({
+      code: ErrorCode.NoAvailableShard,
+      httpStatusCode: 500,
+      message: `No available shards are available to host the resource. Please try again later.`,
+    })
+  },
+  ShardNotFound(shardId: string) {
+    return new StorageBackendError({
+      code: ErrorCode.ShardNotFound,
+      httpStatusCode: 404,
+      message: `Shard not found: ${shardId}`,
     })
   },
 }
@@ -427,10 +554,20 @@ export function isStorageError(errorType: ErrorCode, error: any): error is Stora
   return error instanceof StorageBackendError && error.code === errorType
 }
 
+function hasStatusCode(error: Error): error is Error & { statusCode: number } {
+  return 'statusCode' in error && typeof (error as any).statusCode === 'number'
+}
+
 export function normalizeRawError(error: any) {
   if (error instanceof Error) {
-    const statusCode =
-      error instanceof StorageBackendError && error.httpStatusCode ? error.httpStatusCode : 0
+    let statusCode = 0
+    if (error instanceof StorageBackendError && error.httpStatusCode) {
+      statusCode = error.httpStatusCode
+    } else if (hasStatusCode(error)) {
+      // Fastify validation errors include statusCode we can use
+      statusCode = error.statusCode
+    }
+
     return {
       raw: JSON.stringify(error),
       name: error.name,
@@ -444,7 +581,7 @@ export function normalizeRawError(error: any) {
     return {
       raw: JSON.stringify(error),
     }
-  } catch (e) {
+  } catch {
     return {
       raw: 'Failed to stringify error',
     }

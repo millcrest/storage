@@ -1,16 +1,16 @@
-import { createBucketIfNotExists, useStorage } from './utils/storage'
-import makeApp from '../app'
-import { getConfig } from '../config'
+import assert from 'node:assert'
+import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { isS3Error } from '@internal/errors'
 import {
   CreateTableResponse,
   LoadTableResult,
   RestCatalogClient,
 } from '@storage/protocols/iceberg/catalog'
-import { FastifyInstance } from 'fastify'
 import { KnexMetastore, Metastore } from '@storage/protocols/iceberg/knex'
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
-import assert from 'node:assert'
-import { isS3Error } from '@internal/errors'
+import { FastifyInstance } from 'fastify'
+import makeApp from '../app'
+import { getConfig, mergeConfig } from '../config'
+import { createBucketIfNotExists, useStorage } from './utils/storage'
 
 const {
   serviceKeyAsync,
@@ -31,15 +31,78 @@ describe('Iceberg Catalog', () => {
       multiTenant: false,
       schema: 'storage',
     })
+
+    mergeConfig({
+      icebergMaxCatalogsCount: 1e8,
+      icebergMaxNamespaceCount: 1e8,
+    })
   })
 
   afterEach(async () => {
-    jest.restoreAllMocks()
+    vi.restoreAllMocks()
   })
 
   afterAll(async () => {
     await app.close()
     await t.database.connection.pool.destroy()
+  })
+
+  it('can create an analytic bucket', async () => {
+    const bucketName = t.random.name('ice-bucket')
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/iceberg/bucket',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${await serviceKeyAsync}`,
+      },
+      payload: {
+        name: bucketName,
+      },
+    })
+
+    const resp = await response.json()
+    expect(response.statusCode).toBe(200)
+    expect(resp.id).toBe(bucketName)
+  })
+
+  it('can list analytic buckets', async () => {
+    const bucketName = t.random.name('ice-bucket')
+    await t.storage.createIcebergBucket({
+      name: bucketName,
+    })
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/iceberg/bucket',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${await serviceKeyAsync}`,
+      },
+    })
+
+    const resp = await response.json()
+    expect(response.statusCode).toBe(200)
+    expect(resp.length).toBeGreaterThan(0)
+  })
+
+  it('can delete analytic bucket', async () => {
+    const bucketName = t.random.name('ice-bucket')
+    await t.storage.createIcebergBucket({
+      name: bucketName,
+    })
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/iceberg/bucket/${bucketName}`,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${await serviceKeyAsync}`,
+      },
+    })
+
+    expect(response.statusCode).toBe(200)
   })
 
   it('can create a table bucket', async () => {
@@ -67,19 +130,16 @@ describe('Iceberg Catalog', () => {
     const bucketName = t.random.name('ice-bucket')
     await t.storage.createIcebergBucket({
       name: bucketName,
-      id: bucketName,
     })
 
-    jest.spyOn(RestCatalogClient.prototype, 'getConfig').mockResolvedValue(
-      Promise.resolve({
-        defaults: {
-          prefix: bucketName,
-        },
-        overrides: {
-          prefix: bucketName,
-        },
-      })
-    )
+    vi.spyOn(RestCatalogClient.prototype, 'getConfig').mockResolvedValue({
+      defaults: {
+        prefix: bucketName,
+      },
+      overrides: {
+        prefix: bucketName,
+      },
+    })
 
     const response = await app.inject({
       method: 'GET',
@@ -93,7 +153,12 @@ describe('Iceberg Catalog', () => {
     const resp = await response.json()
     expect(response.statusCode).toBe(200)
     expect(resp.defaults).toEqual({
+      'io-impl': 'org.apache.iceberg.aws.s3.S3FileIO',
       prefix: bucketName,
+      'rest-metrics-reporting-enabled': 'false',
+      's3.delete-enabled': 'false',
+      'write.object-storage.enabled': 'true',
+      'write.object-storage.partitioned-paths': 'false',
     })
     expect(resp.overrides).toEqual({
       prefix: bucketName,
@@ -105,19 +170,16 @@ describe('Iceberg Catalog', () => {
       const bucketName = t.random.name('ice-bucket')
       await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
 
-      jest.spyOn(RestCatalogClient.prototype, 'createNamespace').mockResolvedValue(
-        Promise.resolve({
-          namespace: [namespaceName],
-          properties: {
-            test: 'hello',
-          },
-        })
-      )
+      vi.spyOn(RestCatalogClient.prototype, 'createNamespace').mockResolvedValue({
+        namespace: [namespaceName],
+        properties: {
+          test: 'hello',
+        },
+      })
 
       const response = await app.inject({
         method: 'POST',
@@ -144,27 +206,54 @@ describe('Iceberg Catalog', () => {
       })
     })
 
+    it('returns InvalidParameter for invalid namespace names', async () => {
+      const bucketName = t.random.name('ice-bucket')
+      await t.storage.createIcebergBucket({
+        name: bucketName,
+      })
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/iceberg/v1/${bucketName}/namespaces`,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+        payload: {
+          namespace: 'awsnamespace',
+        },
+      })
+
+      expect(response.statusCode).toBe(400)
+      expect(await response.json()).toEqual({
+        error: {
+          code: 400,
+          message: 'Resource name must not start with the reserved prefix "aws"',
+          type: 'InvalidParameter',
+        },
+      })
+    })
+
     it('can list namespaces', async () => {
       const bucketName = t.random.name('ice-bucket')
 
       const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
 
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
+        bucketName: bucket.name,
         bucketId: bucket.id,
         tenantId: '',
+        metadata: {},
       })
 
-      jest.spyOn(RestCatalogClient.prototype, 'listNamespaces').mockResolvedValue(
-        Promise.resolve({
-          namespaces: [[namespaceName]],
-        })
-      )
+      vi.spyOn(RestCatalogClient.prototype, 'listNamespaces').mockResolvedValue({
+        namespaces: [[namespaceName]],
+      })
 
       const response = await app.inject({
         method: 'GET',
@@ -187,20 +276,22 @@ describe('Iceberg Catalog', () => {
 
       const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
+        bucketName: bucket.name,
         bucketId: bucket.id,
+        tenantId: '',
+        metadata: {},
       })
 
       const initialNamespaces = await icebergMetastore.listNamespaces({
-        bucketId: bucket.id,
+        catalogId: bucket.id,
       })
 
-      jest.spyOn(RestCatalogClient.prototype, 'dropNamespace').mockResolvedValue(Promise.resolve())
+      vi.spyOn(RestCatalogClient.prototype, 'dropNamespace').mockResolvedValue(undefined)
 
       const response = await app.inject({
         method: 'DELETE',
@@ -217,7 +308,7 @@ describe('Iceberg Catalog', () => {
 
       const afterDropNamespaces = await icebergMetastore.listNamespaces({
         tenantId: '',
-        bucketId: bucket.id,
+        catalogId: bucket.id,
       })
 
       expect(afterDropNamespaces.length).toEqual(initialNamespaces.length - 1)
@@ -228,23 +319,25 @@ describe('Iceberg Catalog', () => {
 
       const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
+        bucketName: bucket.name,
         bucketId: bucket.id,
+        tenantId: '',
+        metadata: {
+          test: 'hello',
+        },
       })
 
-      jest.spyOn(RestCatalogClient.prototype, 'loadNamespaceMetadata').mockResolvedValue(
-        Promise.resolve({
-          namespace: [namespace.name],
-          properties: {
-            test: 'hello',
-          },
-        })
-      )
+      vi.spyOn(RestCatalogClient.prototype, 'loadNamespaceMetadata').mockResolvedValue({
+        namespace: [namespace.name],
+        properties: {
+          test: 'hello',
+        },
+      })
 
       const response = await app.inject({
         method: 'GET',
@@ -270,18 +363,18 @@ describe('Iceberg Catalog', () => {
 
       const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
+        bucketName: bucket.name,
         bucketId: bucket.id,
+        tenantId: '',
+        metadata: {},
       })
 
-      jest
-        .spyOn(RestCatalogClient.prototype, 'namespaceExists')
-        .mockResolvedValue(Promise.resolve())
+      vi.spyOn(RestCatalogClient.prototype, 'namespaceExists').mockResolvedValue(undefined)
 
       const response = await app.inject({
         method: 'HEAD',
@@ -299,15 +392,17 @@ describe('Iceberg Catalog', () => {
   describe('Table', () => {
     it('can create a table', async () => {
       const bucketName = t.random.name('ice-bucket')
-      await t.storage.createIcebergBucket({
+      const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
+        tenantId: '',
+        metadata: {},
       })
 
       const tableName = t.random.name('table')
@@ -355,9 +450,12 @@ describe('Iceberg Catalog', () => {
           's3://821c6598-0032-4345-h1sokpwnexm17nfi7n1axwxmnncg1aps1b--table-s3/metadata/00000-2eed5277-661d-47b5-84c0-30ce9dbad149.metadata.json',
       } as const
 
-      jest
-        .spyOn(RestCatalogClient.prototype, 'createTable')
-        .mockResolvedValue(Promise.resolve(loadTable))
+      vi.spyOn(RestCatalogClient.prototype, 'createTable').mockResolvedValue(loadTable)
+
+      vi.spyOn(RestCatalogClient.prototype, 'createNamespace').mockResolvedValue({
+        namespace: [namespace.name],
+        properties: {},
+      })
 
       const response = await app.inject({
         method: 'POST',
@@ -407,15 +505,17 @@ describe('Iceberg Catalog', () => {
 
     it('can list tables in a namespace', async () => {
       const bucketName = t.random.name('ice-bucket')
-      await t.storage.createIcebergBucket({
+      const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
+        tenantId: '',
+        metadata: {},
       })
 
       const tableName = t.random.name('table')
@@ -423,19 +523,18 @@ describe('Iceberg Catalog', () => {
         name: tableName,
         location: `s3://${bucketName}/tables/${tableName}`,
         namespaceId: namespace.id,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
       })
 
-      jest.spyOn(RestCatalogClient.prototype, 'listTables').mockResolvedValue(
-        Promise.resolve({
-          identifiers: [
-            {
-              namespace: [namespace.name],
-              name: tableName,
-            },
-          ],
-        })
-      )
+      vi.spyOn(RestCatalogClient.prototype, 'listTables').mockResolvedValue({
+        identifiers: [
+          {
+            namespace: [namespace.name],
+            name: tableName,
+          },
+        ],
+      })
 
       const response = await app.inject({
         method: 'GET',
@@ -459,6 +558,7 @@ describe('Iceberg Catalog', () => {
 
       const newTable = await icebergMetastore.findTableByName({
         name: tableName,
+        namespaceId: namespace.id,
       })
 
       expect(newTable.name).toEqual(tableName)
@@ -466,26 +566,31 @@ describe('Iceberg Catalog', () => {
 
     it('check if table exists', async () => {
       const bucketName = t.random.name('ice-bucket')
-      await t.storage.createIcebergBucket({
+      const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
+        tenantId: '',
+        metadata: {},
       })
 
       const tableName = t.random.name('table')
       await icebergMetastore.createTable({
         name: tableName,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
         location: `s3://${bucketName}/tables/${tableName}`,
         namespaceId: namespace.id,
+        shardId: 'my-warehouse',
+        shardKey: 'my-warehouse',
       })
 
-      jest.spyOn(RestCatalogClient.prototype, 'tableExists').mockResolvedValue(Promise.resolve())
+      vi.spyOn(RestCatalogClient.prototype, 'tableExists').mockResolvedValue(undefined)
 
       const response = await app.inject({
         method: 'HEAD',
@@ -501,26 +606,34 @@ describe('Iceberg Catalog', () => {
 
     it('can drop a table', async () => {
       const bucketName = t.random.name('ice-bucket')
-      await t.storage.createIcebergBucket({
+      const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
+        tenantId: '',
+        metadata: {},
       })
 
       const tableName = t.random.name('table')
       await icebergMetastore.createTable({
         name: tableName,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
         location: `s3://${bucketName}/tables/${tableName}`,
         namespaceId: namespace.id,
+        shardId: 'my-warehouse',
+        shardKey: 'my-warehouse',
       })
 
-      jest.spyOn(RestCatalogClient.prototype, 'dropTable').mockResolvedValue(Promise.resolve())
+      vi.spyOn(RestCatalogClient.prototype, 'dropTable').mockResolvedValue(undefined)
+      vi.spyOn(RestCatalogClient.prototype, 'listTables').mockResolvedValue({ identifiers: [] })
+
+      vi.spyOn(RestCatalogClient.prototype, 'dropNamespace').mockResolvedValue(undefined)
 
       const response = await app.inject({
         method: 'DELETE',
@@ -537,23 +650,28 @@ describe('Iceberg Catalog', () => {
 
     it('can load table metadata', async () => {
       const bucketName = t.random.name('ice-bucket')
-      await t.storage.createIcebergBucket({
+      const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const namespaceName = t.random.name('namespace')
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
+        tenantId: '',
+        metadata: {},
       })
 
       const tableName = t.random.name('table')
       await icebergMetastore.createTable({
         name: tableName,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
         location: `s3://${bucketName}/tables/${tableName}`,
         namespaceId: namespace.id,
+        shardId: 'my-warehouse',
+        shardKey: 'my-warehouse',
       })
 
       const tableMetadata: LoadTableResult = {
@@ -599,9 +717,7 @@ describe('Iceberg Catalog', () => {
         'metadata-location': `s3://${bucketName}/tables/${tableName}/metadata/00000-2eed5277-661d-47b5-84c0-30ce9dbad149.metadata.json`,
       }
 
-      jest
-        .spyOn(RestCatalogClient.prototype, 'loadTable')
-        .mockResolvedValue(Promise.resolve(tableMetadata))
+      vi.spyOn(RestCatalogClient.prototype, 'loadTable').mockResolvedValue(tableMetadata)
 
       const response = await app.inject({
         method: 'GET',
@@ -619,6 +735,7 @@ describe('Iceberg Catalog', () => {
       const table = await icebergMetastore.findTableByName({
         name: tableName,
         tenantId: '',
+        namespaceId: namespace.id,
       })
 
       expect(table.name).toEqual(tableName)
@@ -683,24 +800,27 @@ describe('Iceberg Catalog', () => {
 
       await createBucketIfNotExists(internalBucketName, minioClient)
 
-      await t.storage.createIcebergBucket({
+      const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
-        id: bucketName,
       })
 
       const tableName = t.random.name('table')
       const namespaceName = t.random.name('namespace')
 
-      const namespace = await icebergMetastore.assignNamespace({
+      const namespace = await icebergMetastore.createNamespace({
         name: namespaceName,
-        bucketId: bucketName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
+        tenantId: '',
+        metadata: {},
       })
 
       await icebergMetastore.createTable({
         name: tableName,
+        bucketName: bucket.name,
+        bucketId: bucket.id,
         location: `s3://${internalBucketName}`,
         namespaceId: namespace.id,
-        bucketId: bucketName,
       })
 
       const uploadFile = new PutObjectCommand({

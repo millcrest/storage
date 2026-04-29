@@ -1,6 +1,21 @@
-import axios, { AxiosError, AxiosInstance, InternalAxiosRequestConfig } from 'axios'
-import { ErrorCode, ERRORS, StorageBackendError } from '@internal/errors'
+import { ERRORS } from '@internal/errors'
 import { signRequest } from 'aws-sigv4-sign'
+import axios, { AxiosError, AxiosInstance, InternalAxiosRequestConfig } from 'axios'
+import JSONBigint from 'json-bigint'
+import {
+  createAlreadyExistsError,
+  createAuthenticationTimeoutError,
+  createBadRequestError,
+  createForbiddenError,
+  createInternalServerError,
+  createNoSuchNamespaceError,
+  createSlowDownError,
+  createUnauthorizedError,
+  createUnprocessableEntityError,
+  createUnsupportedOperationError,
+  IcebergError,
+  IcebergHttpStatusCode,
+} from './errors'
 
 export interface GetConfigRequest {
   tenantId?: string
@@ -27,7 +42,7 @@ export interface ListNamespacesRequest {
 
 export interface ListNamespacesResponse {
   namespaces: string[][]
-  nextPageToken?: string
+  'next-page-token'?: string
 }
 
 interface CatalogAuth {
@@ -39,8 +54,7 @@ interface CatalogAuth {
 export type CatalogAuthType = CatalogAuth
 
 export interface RestCatalogClientOptions {
-  connectionString: string
-  warehouse: string
+  catalogUrl: string
   auth: CatalogAuthType
 }
 
@@ -200,6 +214,7 @@ export interface ListTableRequest {
 }
 
 export interface ListTableResponse {
+  'next-page-token'?: string | undefined
   identifiers: {
     namespace: string[]
     name: string
@@ -268,6 +283,9 @@ export interface TableMetadata {
   schemas?: Schema[]
   /** The ID of the current schema in the `schemas` array. */
   'current-schema-id'?: number
+
+  'current-snapshot-id'?: number
+
   /** The last column ID assigned (for tracking new columns). */
   'last-column-id'?: number
   /** All known partition specs for the table. */
@@ -329,19 +347,36 @@ export type CreateTableResponse = LoadTableResult
 
 export class RestCatalogClient {
   httpClient: AxiosInstance
-  warehouse: string
   auth: CatalogAuthType
 
   constructor(options: RestCatalogClientOptions) {
     this.httpClient = axios.create({
-      baseURL: options.connectionString,
+      baseURL: options.catalogUrl,
     })
 
-    this.warehouse = options.warehouse
     this.auth = options.auth
 
     this.httpClient.interceptors.request.use((req) => {
       return this.auth.authorize(req)
+    })
+
+    // request interceptor, preventing the response the default behaviour of parsing the response with JSON.parse
+    this.httpClient.interceptors.request.use((request) => {
+      request.transformRequest = [
+        (data) => {
+          return data ? JSONBigint.stringify(data) : data
+        },
+      ]
+      request.transformResponse = [(data) => data]
+      return request
+    })
+
+    // response interceptor parsing the response data with JSONbigint, and returning the response
+    this.httpClient.interceptors.response.use((response) => {
+      if (response.data) {
+        response.data = JSONBigint.parse(response.data)
+      }
+      return response
     })
 
     this.httpClient.interceptors.response.use(
@@ -350,31 +385,72 @@ export class RestCatalogClient {
 
       // On errors…
       (error) => {
-        // If there's no response, it’s a network / CORS / timeout error
+        // If there's no response, it's a network / CORS / timeout error
         if (!error.response) {
           throw ERRORS.InternalError(error, 'Network error')
         }
 
         if (error instanceof AxiosError) {
-          console.log('Iceberg request failed:', {
-            status: error.response.status,
-            data: error.response.data,
-            headers: error.response.headers,
-            message: error.message,
-          })
-          // Throw your custom error
-          throw new StorageBackendError({
-            message: error.message,
-            error: error.message,
-            httpStatusCode: error.response.status,
-            code: ErrorCode.IcebergError,
-            originalError: error,
-          })
+          const body = error.response?.data
+          const jsonResponse = typeof body === 'string' ? JSONBigint.parse(body) : body
+
+          // Parse Iceberg error response and throw appropriate error
+          throw this.parseIcebergError(error.response.status, jsonResponse)
         }
 
         throw ERRORS.InternalError(error, 'Iceberg request failed')
       }
     )
+  }
+
+  /**
+   * Parse HTTP response status and body to create appropriate Iceberg error
+   * Handles all HTTP error codes from the Iceberg REST specification
+   */
+  private parseIcebergError(status: number, data: unknown): IcebergError {
+    // Try to extract error details from response body
+    if (data && typeof data === 'object') {
+      try {
+        // Map error types to specific error creators
+        return IcebergError.fromResponse(data)
+      } catch {
+        // Fall through to status code handling
+      }
+    }
+
+    // Handle specific status codes as per Iceberg spec
+    return this.createErrorByStatusCode(status)
+  }
+
+  /**
+   * Create appropriate error based on HTTP status code
+   */
+  private createErrorByStatusCode(status: number): IcebergError {
+    switch (status) {
+      case IcebergHttpStatusCode.BadRequest:
+        return createBadRequestError('Bad request')
+      case IcebergHttpStatusCode.Unauthorized:
+        return createUnauthorizedError('Unauthorized')
+      case IcebergHttpStatusCode.Forbidden:
+        return createForbiddenError('Forbidden')
+      case IcebergHttpStatusCode.NotFound:
+        return createNoSuchNamespaceError('Not found')
+      case IcebergHttpStatusCode.NotAcceptable:
+        return createUnsupportedOperationError('Unsupported operation')
+      case IcebergHttpStatusCode.Conflict:
+        return createAlreadyExistsError('Conflict')
+      case IcebergHttpStatusCode.UnprocessableEntity:
+        return createUnprocessableEntityError('Unprocessable entity')
+      case IcebergHttpStatusCode.AuthenticationTimeout:
+        return createAuthenticationTimeoutError('Authentication timeout')
+      case IcebergHttpStatusCode.ServiceUnavailable:
+        return createSlowDownError('Service unavailable')
+      default:
+        if (status >= 500) {
+          return createInternalServerError('Internal server error')
+        }
+        return createInternalServerError(`HTTP ${status}`)
+    }
   }
 
   /**
@@ -388,7 +464,7 @@ export class RestCatalogClient {
     return this.httpClient
       .get<GetConfigResponse>('/config', {
         params: {
-          warehouse: this.warehouse,
+          warehouse: params.warehouse,
         },
       })
       .then((response) => {
@@ -422,7 +498,7 @@ export class RestCatalogClient {
    * @returns List of namespace identifiers
    */
   listNamespaces(params: ListNamespacesRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(params.warehouse)
     return this.httpClient
       .get<ListNamespacesResponse>(`${warehouse}/namespaces`, { params })
       .then((response) => response.data)
@@ -442,7 +518,7 @@ export class RestCatalogClient {
    * @returns The created namespace response
    */
   createNamespace(params: CreateNamespaceRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(params.warehouse)
     return this.httpClient
       .post<CreateNamespaceResponse>(`${warehouse}/namespaces`, {
         namespace: params.namespace,
@@ -465,7 +541,7 @@ export class RestCatalogClient {
    * @returns The namespace metadata
    */
   loadNamespaceMetadata(params: LoadNamespaceMetadataRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(params.warehouse)
     return this.httpClient
       .get<LoadNamespaceMetadataResponse>(`${warehouse}/namespaces/${params.namespace}`)
       .then((response) => response.data)
@@ -477,11 +553,8 @@ export class RestCatalogClient {
       })
   }
 
-  getWarehouse() {
-    if (!this.warehouse) {
-      return ''
-    }
-    return '/' + encodeURIComponent(this.warehouse)
+  getEncodedWarehouse(warehouse: string) {
+    return '/' + encodeURIComponent(warehouse)
   }
 
   /**
@@ -492,7 +565,7 @@ export class RestCatalogClient {
    * @returns Void response after successful deletion
    */
   dropNamespace(params: DeleteNamespaceRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(params.warehouse)
     return this.httpClient
       .delete<void>(`${warehouse}/namespaces/${params.namespace}`)
       .then((response) => response.data)
@@ -512,7 +585,7 @@ export class RestCatalogClient {
    * @returns List of table identifiers
    */
   listTables({ namespace, ...rest }: ListTableRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(rest.warehouse)
 
     return this.httpClient
       .get<ListTableResponse>(`${warehouse}/namespaces/${namespace}/tables`, {
@@ -535,7 +608,7 @@ export class RestCatalogClient {
    * @returns The created table metadata
    */
   createTable({ namespace, ...rest }: CreateTableRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(rest.warehouse)
     return this.httpClient
       .post<CreateTableResponse>(`${warehouse}/namespaces/${namespace}/tables`, rest)
       .then((response) => response.data)
@@ -555,14 +628,20 @@ export class RestCatalogClient {
    * @returns The table metadata and location
    */
   loadTable(params: LoadTableRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(params.warehouse)
     return this.httpClient
       .get<LoadTableResult>(`${warehouse}/namespaces/${params.namespace}/tables/${params.table}`, {
         params: {
           snapshots: params.snapshots,
         },
       })
-      .then((response) => response.data)
+      .then((response) => {
+        // console.log({
+        //   url: response.request.,
+        //   headers: response.request.headers,
+        // })
+        return response.data
+      })
       .catch((error) => {
         if (error instanceof AxiosError) {
           console.error('Error fetching configuration:', error.response?.data)
@@ -579,7 +658,7 @@ export class RestCatalogClient {
    * @returns The updated table metadata
    */
   updateTable(params: CommitTableRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(params.warehouse)
     return this.httpClient
       .post<LoadTableResult>(
         `${warehouse}/namespaces/${params.namespace}/tables/${params.table}`,
@@ -602,7 +681,7 @@ export class RestCatalogClient {
    * @returns Void response after successful deletion
    */
   dropTable(params: DropTableRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(params.warehouse)
     const query: Record<string, string> = {}
 
     if (params.purgeRequested) {
@@ -639,7 +718,7 @@ export class RestCatalogClient {
    * @returns Boolean indicating if the table exists
    */
   tableExists(params: TableExistsRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(params.warehouse)
     return this.httpClient
       .head<void>(`${warehouse}/namespaces/${params.namespace}/tables/${params.table}`)
       .then((response) => response.data)
@@ -659,7 +738,7 @@ export class RestCatalogClient {
    * @returns Boolean indicating if the namespace exists
    */
   namespaceExists(params: NamespaceExistsRequest) {
-    const warehouse = this.getWarehouse()
+    const warehouse = this.getEncodedWarehouse(params.warehouse)
     return this.httpClient
       .head<void>(`${warehouse}/namespaces/${params.namespace}`)
       .then((response) => response.data)
@@ -681,13 +760,16 @@ export class SignV4Auth {
   constructor(private readonly opts: { region: string }) {}
 
   async authorize(req: InternalAxiosRequestConfig<string>) {
-    const queryParams = Object.keys(req.params || {}).reduce((acc, name) => {
-      if (req.params[name]) {
-        acc[name] = req.params[name]
-      }
+    const queryParams = Object.keys(req.params || {}).reduce(
+      (acc, name) => {
+        if (req.params[name]) {
+          acc[name] = req.params[name]
+        }
 
-      return acc
-    }, {} as Record<string, string>)
+        return acc
+      },
+      {} as Record<string, string>
+    )
 
     const queryString = new URLSearchParams(queryParams).toString()
 
@@ -696,7 +778,7 @@ export class SignV4Auth {
       {
         method: req.method?.toUpperCase(),
         headers: req.headers,
-        body: req.data ? JSON.stringify(req.data) : undefined,
+        body: req.data ? JSONBigint.stringify(req.data) : undefined,
       },
       {
         service: 's3tables',
@@ -704,6 +786,7 @@ export class SignV4Auth {
       }
     )
 
+    // Keep the original code for setting headers
     signedReq.headers.forEach((headerValue, headerName) => {
       req.headers.set(headerName, headerValue as string, true)
     })
@@ -713,11 +796,11 @@ export class SignV4Auth {
 }
 
 /**
- * TokenAuth class for Bearer token authentication
+ * BearerTokenAuth class for Bearer token authentication
  * This class implements the CatalogAuth interface
  * to add a Bearer token to the request headers.
  */
-export class TokenAuth {
+export class BearerTokenAuth {
   constructor(private readonly opts: { token: string }) {}
 
   async authorize(req: InternalAxiosRequestConfig<string>) {

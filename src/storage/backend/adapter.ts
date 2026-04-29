@@ -31,6 +31,7 @@ export type ObjectMetadata = {
   eTag: string
   contentRange?: string
   httpStatusCode?: number
+  xRobotsTag?: string
 }
 
 export type UploadPart = {
@@ -96,7 +97,8 @@ export abstract class StorageBackendAdapter {
     body: NodeJS.ReadableStream,
     contentType: string,
     cacheControl: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    contentLength?: number
   ): Promise<ObjectMetadata> {
     throw new Error('uploadObject not implemented')
   }

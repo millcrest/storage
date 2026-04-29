@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { SignedUploadToken, signJWT, verifyJWT } from '@internal/auth'
-import { ERRORS } from '@internal/errors'
 import { getJwtSecret } from '@internal/database'
-
+import { ERRORS } from '@internal/errors'
+import { StorageObjectLocator } from '@storage/locator'
+import { Obj } from '@storage/schemas'
+import { FastifyRequest } from 'fastify/types/request'
+import { getConfig } from '../config'
 import { ObjectMetadata, StorageBackendAdapter } from './backend'
 import { Database, FindObjectFilters, SearchObjectOption } from './database'
-import { mustBeValidKey } from './limits'
-import { fileUploadFromRequest, Uploader, UploadRequest } from './uploader'
-import { getConfig } from '../config'
 import {
   ObjectAdminDelete,
   ObjectCreatedCopyEvent,
@@ -16,9 +16,8 @@ import {
   ObjectRemovedMove,
   ObjectUpdatedMetadata,
 } from './events'
-import { FastifyRequest } from 'fastify/types/request'
-import { Obj } from '@storage/schemas'
-import { StorageObjectLocator } from '@storage/locator'
+import { mustBeValidKey } from './limits'
+import { CanUploadMetadata, fileUploadFromRequest, Uploader, UploadRequest } from './uploader'
 
 const { requestUrlLengthLimit } = getConfig()
 
@@ -40,6 +39,13 @@ interface CopyObjectParams {
     ifModifiedSince?: Date
     ifUnmodifiedSince?: Date
   }
+}
+export interface ListObjectsV2Result {
+  folders: Obj[]
+  objects: Obj[]
+  hasNext: boolean
+  nextCursor?: string
+  nextCursorKey?: string
 }
 
 /**
@@ -91,6 +97,7 @@ export class ObjectStorage {
       owner: file.owner,
       isUpsert: Boolean(file.isUpsert),
       signal: file.signal,
+      userMetadata: uploadRequest.userMetadata,
     })
   }
 
@@ -318,7 +325,6 @@ export class ObjectStorage {
       'bucket_id,metadata,user_metadata,version'
     )
 
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const baseMetadata = originObject.metadata || {}
     const destinationMetadata = copyMetadata
       ? baseMetadata
@@ -327,11 +333,15 @@ export class ObjectStorage {
           ...(fileMetadata || {}),
         }
 
+    const destinationUserMetadata = copyMetadata ? originObject.user_metadata : userMetadata
+
     await this.uploader.canUpload({
       bucketId: destinationBucket,
       objectName: destinationKey,
       owner,
       isUpsert: upsert,
+      userMetadata: destinationUserMetadata || undefined,
+      metadata: destinationMetadata,
     })
 
     try {
@@ -376,7 +386,7 @@ export class ObjectStorage {
             lastModified: copyResult.lastModified,
             eTag: copyResult.eTag,
           },
-          user_metadata: copyMetadata ? originObject.user_metadata : userMetadata,
+          user_metadata: destinationUserMetadata,
           version: newVersion,
         })
 
@@ -397,7 +407,7 @@ export class ObjectStorage {
         tenant: this.db.tenant(),
         name: destinationKey,
         version: newVersion,
-        bucketId: this.bucketId,
+        bucketId: destinationBucket,
         metadata,
         reqId: this.db.reqId,
       })
@@ -504,7 +514,7 @@ export class ObjectStorage {
           name: destinationObjectName,
           bucket_id: destinationBucket,
           version: newVersion,
-          owner: owner,
+          owner,
           metadata,
           user_metadata: sourceObj.user_metadata,
         })
@@ -530,8 +540,8 @@ export class ObjectStorage {
             tenant: this.db.tenant(),
             name: destinationObjectName,
             version: newVersion,
-            bucketId: this.bucketId,
-            metadata: metadata,
+            bucketId: destinationBucket,
+            metadata,
             oldObject: {
               name: sourceObjectName,
               bucketId: this.bucketId,
@@ -548,7 +558,7 @@ export class ObjectStorage {
             name: destinationObjectName,
             bucket_id: destinationBucket,
             version: newVersion,
-            owner: owner,
+            owner,
             metadata,
           },
         }
@@ -556,7 +566,7 @@ export class ObjectStorage {
     } catch (e) {
       await ObjectAdminDelete.send({
         name: destinationObjectName,
-        bucketId: this.bucketId,
+        bucketId: destinationBucket,
         tenant: this.db.tenant(),
         version: newVersion,
         reqId: this.db.reqId,
@@ -586,18 +596,27 @@ export class ObjectStorage {
     startAfter?: string
     maxKeys?: number
     encodingType?: 'url'
-  }) {
+    sortBy?: {
+      column: 'name' | 'created_at' | 'updated_at'
+      order?: string
+    }
+  }): Promise<ListObjectsV2Result> {
     const limit = Math.min(options?.maxKeys || 1000, 1000)
     const prefix = options?.prefix || ''
     const delimiter = options?.delimiter
 
-    const cursor = options?.cursor ? decodeContinuationToken(options?.cursor) : undefined
+    const cursor = options?.cursor ? decodeContinuationToken(options.cursor) : undefined
     let searchResult = await this.db.listObjectsV2(this.bucketId, {
       prefix: options?.prefix,
       delimiter: options?.delimiter,
       maxKeys: limit + 1,
-      nextToken: cursor,
-      startAfter: cursor || options?.startAfter,
+      nextToken: cursor?.startAfter,
+      startAfter: cursor?.startAfter || options?.startAfter,
+      sortBy: {
+        order: cursor?.sortOrder || options?.sortBy?.order,
+        column: cursor?.sortColumn || options?.sortBy?.column,
+        after: cursor?.sortColumnAfter,
+      },
     })
 
     let prevPrefix = ''
@@ -638,21 +657,41 @@ export class ObjectStorage {
     const objects: Obj[] = []
     searchResult.forEach((obj) => {
       const target = obj.id === null ? folders : objects
+      const name = obj.id === null && !obj.name.endsWith('/') ? obj.name + '/' : obj.name
       target.push({
         ...obj,
-        name: options?.encodingType === 'url' ? encodeURIComponent(obj.name) : obj.name,
+        name: options?.encodingType === 'url' ? encodeURIComponent(name) : name,
       })
     })
 
-    const nextContinuationToken = isTruncated
-      ? encodeContinuationToken(searchResult[searchResult.length - 1].name)
-      : undefined
+    let nextContinuationToken: string | undefined
+    let nextCursorKey: string | undefined
+
+    if (isTruncated) {
+      const sortColumn = (cursor?.sortColumn || options?.sortBy?.column) as
+        | 'name'
+        | 'created_at'
+        | 'updated_at'
+        | undefined
+
+      nextContinuationToken = encodeContinuationToken({
+        startAfter: searchResult[searchResult.length - 1].name,
+        sortOrder: cursor?.sortOrder || options?.sortBy?.order,
+        sortColumn,
+        sortColumnAfter:
+          sortColumn && sortColumn !== 'name' && searchResult[searchResult.length - 1][sortColumn]
+            ? new Date(searchResult[searchResult.length - 1][sortColumn] || '').toISOString()
+            : undefined,
+      })
+      nextCursorKey = searchResult[searchResult.length - 1].name
+    }
 
     return {
       hasNext: isTruncated,
       nextCursor: nextContinuationToken,
-      folders: folders,
-      objects: objects,
+      nextCursorKey,
+      folders,
+      objects,
     }
   }
 
@@ -756,7 +795,11 @@ export class ObjectStorage {
     url: string,
     expiresIn: number,
     owner?: string,
-    options?: { upsert?: boolean }
+    options?: {
+      upsert?: boolean
+      userMetadata?: Record<string, unknown>
+      metadata?: CanUploadMetadata
+    }
   ) {
     // check if user has INSERT permissions
     await this.uploader.canUpload({
@@ -764,6 +807,8 @@ export class ObjectStorage {
       objectName,
       owner,
       isUpsert: options?.upsert ?? false,
+      userMetadata: options?.userMetadata,
+      metadata: options?.metadata,
     })
 
     const { urlSigningKey } = await getJwtSecret(this.db.tenantId)
@@ -806,16 +851,42 @@ export class ObjectStorage {
   }
 }
 
-function encodeContinuationToken(name: string) {
-  return Buffer.from(`l:${name}`).toString('base64')
+interface ContinuationToken {
+  startAfter: string
+  sortOrder?: string // 'asc' | 'desc'
+  sortColumn?: string
+  sortColumnAfter?: string
 }
 
-function decodeContinuationToken(token: string) {
-  const decoded = Buffer.from(token, 'base64').toString().split(':')
+const CONTINUATION_TOKEN_PART_MAP: Record<string, keyof ContinuationToken> = {
+  l: 'startAfter',
+  o: 'sortOrder',
+  c: 'sortColumn',
+  a: 'sortColumnAfter',
+}
 
-  if (decoded.length === 0) {
-    throw new Error('Invalid continuation token')
+function encodeContinuationToken(tokenInfo: ContinuationToken) {
+  let result = ''
+  for (const [k, v] of Object.entries(CONTINUATION_TOKEN_PART_MAP)) {
+    if (tokenInfo[v]) {
+      result += `${k}:${tokenInfo[v]}\n`
+    }
   }
+  return Buffer.from(result.slice(0, -1)).toString('base64')
+}
 
-  return decoded[1]
+function decodeContinuationToken(token: string): ContinuationToken {
+  const decodedParts = Buffer.from(token, 'base64').toString().split('\n')
+  const result: ContinuationToken = {
+    startAfter: '',
+    sortOrder: 'asc',
+  }
+  for (const part of decodedParts) {
+    const partMatch = part.match(/^(\S):(.*)/)
+    if (!partMatch || partMatch.length !== 3 || !(partMatch[1] in CONTINUATION_TOKEN_PART_MAP)) {
+      throw new Error('Invalid continuation token')
+    }
+    result[CONTINUATION_TOKEN_PART_MAP[partMatch[1]]] = partMatch[2]
+  }
+  return result
 }

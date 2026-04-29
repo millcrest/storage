@@ -1,14 +1,16 @@
-import { BaseEvent } from '../base-event'
+import { getTenantConfig, multitenantKnex } from '@internal/database'
 import { BasePayload } from '@internal/queue'
+import { KnexShardStoreFactory, ShardCatalog, SingleShard } from '@internal/sharding'
 import { BucketType } from '@storage/limits'
-import { Job } from 'pg-boss'
 import { getCatalogAuthStrategy, TenantAwareRestCatalog } from '@storage/protocols/iceberg/catalog'
 import { KnexMetastore } from '@storage/protocols/iceberg/knex'
-import { getTenantConfig, multitenantKnex } from '@internal/database'
+import { Job } from 'pg-boss'
 import { getConfig } from '../../../config'
+import { BaseEvent } from '../base-event'
 
 interface ObjectCreatedEvent extends BasePayload {
   bucketId: string
+  bucketName: string
   type: BucketType
 }
 
@@ -38,7 +40,12 @@ export class BucketCreatedEvent extends BaseEvent<ObjectCreatedEvent> {
         maxCatalogsCount: features.icebergCatalog.maxCatalogs,
       },
       restCatalogUrl: icebergCatalogUrl,
-      warehouse: icebergWarehouse,
+      sharding: isMultitenant
+        ? new ShardCatalog(new KnexShardStoreFactory(multitenantKnex))
+        : new SingleShard({
+            shardKey: icebergWarehouse,
+            capacity: 10000,
+          }),
       auth: catalogAuthType,
       metastore: new KnexMetastore(multitenantKnex, {
         multiTenant: true,
@@ -48,6 +55,7 @@ export class BucketCreatedEvent extends BaseEvent<ObjectCreatedEvent> {
 
     await restCatalog.registerCatalog({
       bucketId: job.data.bucketId,
+      bucketName: job.data.bucketName,
       tenantId: job.data.tenant.ref,
     })
   }

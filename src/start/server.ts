@@ -1,28 +1,36 @@
-import '@internal/monitoring/otel'
-import { FastifyInstance } from 'fastify'
+import '@internal/monitoring/otel-tracing'
+import '@internal/monitoring/otel-metrics'
+
 import { IncomingMessage, Server, ServerResponse } from 'node:http'
-
-import build from '../app'
-import buildAdmin from '../admin-app'
-import { getConfig } from '../config'
-import { listenForTenantUpdate, PubSub, TenantConnection } from '@internal/database'
-import { logger, logSchema } from '@internal/monitoring'
-import { Queue } from '@internal/queue'
-import { registerWorkers } from '@storage/events'
+import { Cluster } from '@internal/cluster/cluster'
 import { AsyncAbortController } from '@internal/concurrency'
-
-import { bindShutdownSignals, createServerClosedPromise, shutdown } from './shutdown'
+import {
+  listenForTenantUpdate,
+  multitenantKnex,
+  PubSub,
+  TenantConnection,
+} from '@internal/database'
 import {
   runMigrationsOnTenant,
   runMultitenantMigrations,
   startAsyncMigrations,
 } from '@internal/database/migrations'
-import { Cluster } from '@internal/cluster/cluster'
-import buildS3 from '../s3-app'
+import { logger, logSchema } from '@internal/monitoring'
+import { Queue } from '@internal/queue'
+import { KnexShardStoreFactory, ShardCatalog } from '@internal/sharding'
+import { getGlobal } from '@platformatic/globals'
+import { registerWorkers } from '@storage/events'
+import { SyncCatalogIds } from '@storage/events/upgrades/sync-catalog-ids'
+import { FastifyInstance } from 'fastify'
+import buildAdmin from '../admin-app'
+import build from '../app'
+import { getConfig } from '../config'
+import { bindShutdownSignals, createServerClosedPromise, shutdown } from './shutdown'
 
 const shutdownSignal = new AsyncAbortController()
 
 bindShutdownSignals(shutdownSignal)
+registerPlatformaticCloseHandler()
 
 // Start API server
 main()
@@ -37,7 +45,7 @@ main()
       error: e,
     })
 
-    await shutdown(shutdownSignal)
+    await close()
     process.exit(1)
   })
   .catch(() => {
@@ -48,28 +56,60 @@ main()
  * Start Storage API server
  */
 async function main() {
-  const { databaseURL, isMultitenant, pgQueueEnable, dbMigrationFreezeAt } = getConfig()
-
-  // Migrations
-  if (isMultitenant) {
-    await runMultitenantMigrations()
-    await listenForTenantUpdate(PubSub)
-  } else {
-    await runMigrationsOnTenant({
-      databaseUrl: databaseURL,
-      upToMigration: dbMigrationFreezeAt,
-    })
-  }
+  const {
+    databaseURL,
+    isMultitenant,
+    pgQueueEnable,
+    dbMigrationFreezeAt,
+    vectorS3Buckets,
+    icebergShards,
+    numWorkers,
+  } = getConfig()
 
   // Queue
   if (pgQueueEnable) {
     await Queue.start({
       signal: shutdownSignal.nextGroup.signal,
-      registerWorkers: registerWorkers,
+      registerWorkers,
     })
 
     logSchema.info(logger, '[Queue] Started', {
       type: 'queue',
+    })
+  }
+
+  // Sharding for special buckets (vectors, analytics)
+  const sharding = new ShardCatalog(new KnexShardStoreFactory(multitenantKnex))
+
+  // Migrations
+  if (isMultitenant) {
+    await runMultitenantMigrations()
+    await upgrades()
+    await listenForTenantUpdate(PubSub)
+
+    // Create shards for vector S3 buckets
+    await sharding.createShards(
+      vectorS3Buckets?.map((s) => ({
+        shardKey: s,
+        kind: 'vector',
+        capacity: 10000,
+        status: 'active',
+      }))
+    )
+
+    // Create shards for analytics buckets
+    await sharding.createShards(
+      icebergShards.map((shard) => ({
+        shardKey: shard,
+        kind: 'iceberg-table',
+        capacity: 10000,
+        status: 'active',
+      }))
+    )
+  } else {
+    await runMigrationsOnTenant({
+      databaseUrl: databaseURL,
+      upToMigration: dbMigrationFreezeAt,
     })
   }
 
@@ -83,17 +123,21 @@ async function main() {
     startAsyncMigrations(shutdownSignal.nextGroup.signal)
   }
 
-  // PoolManager Monitoring
-  TenantConnection.poolManager.monitor(shutdownSignal.nextGroup.signal)
+  // PoolManager
+  TenantConnection.poolManager.setNumWorkers(numWorkers)
+  TenantConnection.poolManager.monitor()
 
   // Cluster information
   await Cluster.init(shutdownSignal.nextGroup.signal)
 
   Cluster.on('change', (data) => {
-    logger.info(`[Cluster] Cluster size changed to ${data.size}`, {
-      type: 'cluster',
-      clusterSize: data.size,
-    })
+    logger.info(
+      {
+        type: 'cluster',
+        clusterSize: data.size,
+      },
+      `[Cluster] Cluster size changed to ${data.size}`
+    )
     TenantConnection.poolManager.rebalanceAll({
       clusterSize: data.size,
     })
@@ -101,7 +145,6 @@ async function main() {
 
   // HTTP Server
   const app = await httpServer(shutdownSignal.signal)
-  await httpS3Server(shutdownSignal.signal)
 
   // HTTP Admin Server
   if (isMultitenant) {
@@ -121,10 +164,10 @@ async function httpServer(signal: AbortSignal) {
     disableRequestLogging: true,
     exposeDocs,
     requestIdHeader: requestTraceHeader,
-    maxParamLength: 2500,
+    routerOptions: { maxParamLength: 2500 },
   })
 
-  const closePromise = createServerClosedPromise(app.server, () => {
+  const serverClosedPromise = createServerClosedPromise(app.server, () => {
     logSchema.info(logger, '[Server] Exited', {
       type: 'server',
     })
@@ -138,7 +181,7 @@ async function httpServer(signal: AbortSignal) {
           type: 'server',
         })
 
-        await closePromise
+        await serverClosedPromise
       },
       { once: true }
     )
@@ -163,18 +206,16 @@ async function httpAdminServer(
   app: FastifyInstance<Server, IncomingMessage, ServerResponse>,
   signal: AbortSignal
 ) {
-  const { adminRequestIdHeader, adminPort, host } = getConfig()
+  const { exposeDocs, adminRequestIdHeader, adminPort, host } = getConfig()
 
-  const adminApp = buildAdmin(
-    {
-      loggerInstance: logger,
-      disableRequestLogging: true,
-      requestIdHeader: adminRequestIdHeader,
-    },
-    app
-  )
+  const adminApp = buildAdmin({
+    loggerInstance: logger,
+    disableRequestLogging: true,
+    exposeDocs,
+    requestIdHeader: adminRequestIdHeader,
+  })
 
-  const closePromise = createServerClosedPromise(adminApp.server, () => {
+  const adminServerClosedPromise = createServerClosedPromise(adminApp.server, () => {
     logSchema.info(logger, '[Admin Server] Exited', {
       type: 'server',
     })
@@ -187,7 +228,7 @@ async function httpAdminServer(
         type: 'server',
       })
 
-      await closePromise
+      await adminServerClosedPromise
     },
     { once: true }
   )
@@ -204,49 +245,22 @@ async function httpAdminServer(
   return adminApp
 }
 
-/**
- * Starts HTTP S3 Server (no prefix)
- * @param signal
- */
-async function httpS3Server(signal: AbortSignal) {
-  const { s3Port, host, requestTraceHeader } = getConfig()
+export async function close() {
+  return shutdown(shutdownSignal)
+}
 
-  const app: FastifyInstance<Server, IncomingMessage, ServerResponse> = buildS3({
-    loggerInstance: logger,
-    disableRequestLogging: true,
-    requestIdHeader: requestTraceHeader,
-    maxParamLength: 2500,
-  })
+function registerPlatformaticCloseHandler() {
+  const platformatic = getGlobal()
 
-  const closePromise = createServerClosedPromise(app.server, () => {
-    logSchema.info(logger, '[S3 Server] Exited', {
-      type: 'server',
-    })
-  })
-
-  try {
-    signal.addEventListener(
-      'abort',
-      async () => {
-        logSchema.info(logger, '[S3 Server] Stopping', {
-          type: 'server',
-        })
-        await closePromise
-      },
-      { once: true }
-    )
-    await app.listen({ port: s3Port, host, signal })
-
-    logSchema.info(logger, `[S3 Server] Listening on port ${s3Port}`, {
-      type: 'server',
-    })
-
-    return app
-  } catch (err) {
-    logSchema.error(logger, `S3 Server failed to start`, {
-      type: 'serverStartError',
-      error: err,
-    })
-    throw err
+  if (!platformatic?.events) {
+    return
   }
+
+  platformatic.events.on('close', () => {
+    void close()
+  })
+}
+
+async function upgrades() {
+  return Promise.all([SyncCatalogIds.invoke({})])
 }

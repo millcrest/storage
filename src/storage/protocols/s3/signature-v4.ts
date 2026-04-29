@@ -1,10 +1,22 @@
-import crypto from 'crypto'
+import { createHash } from 'node:crypto'
+import { Writable } from 'node:stream'
 import { ERRORS } from '@internal/errors'
+import crypto from 'crypto'
+import { Readable } from 'stream'
+import { pipeline } from 'stream/promises'
+
+export enum SignatureV4Service {
+  S3 = 's3',
+  S3VECTORS = 's3vectors',
+}
 
 interface SignatureV4Options {
   enforceRegion: boolean
   allowForwardedHeader?: boolean
+  allowBodyHashing?: boolean
   nonCanonicalForwardedHost?: string
+  publicUrl?: URL
+  s3OmitPrefixFromCanonicalUri?: string
   credentials: Omit<Credentials, 'shortDate'> & { secretKey: string }
 }
 
@@ -23,11 +35,12 @@ export interface ClientSignature {
 
 interface SignatureRequest {
   url: string
-  body?: string | ReadableStream | Buffer
+  body?: string | ReadableStream | Buffer | Readable
   headers: Record<string, string | string[]>
   method: string
   query?: Record<string, string>
   prefix?: string
+  payloadHasher?: Writable & { digestHex: () => string }
 }
 
 interface Credentials {
@@ -82,17 +95,26 @@ export const ALWAYS_UNSIGNABLE_QUERY_PARAMS = {
   'X-Amz-Signature': true,
 }
 
+export const EMPTY_SHA256_HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
 export class SignatureV4 {
   public readonly serverCredentials: SignatureV4Options['credentials']
   enforceRegion: boolean
   allowForwardedHeader?: boolean
+  allowBodyHashing?: boolean
   nonCanonicalForwardedHost?: string
+  publicUrl?: URL
+  s3OmitPrefixFromCanonicalUri?: string
+  private readonly signingKeyCache = new Map<string, Buffer>()
 
   constructor(options: SignatureV4Options) {
     this.serverCredentials = options.credentials
     this.enforceRegion = options.enforceRegion
     this.allowForwardedHeader = options.allowForwardedHeader
+    this.allowBodyHashing = options.allowBodyHashing
     this.nonCanonicalForwardedHost = options.nonCanonicalForwardedHost
+    this.publicUrl = options.publicUrl
+    this.s3OmitPrefixFromCanonicalUri = options.s3OmitPrefixFromCanonicalUri
   }
 
   static parseAuthorizationHeader(headers: Record<string, any>) {
@@ -252,12 +274,12 @@ export class SignatureV4 {
    * @param clientSignature
    * @param request
    */
-  verify(clientSignature: ClientSignature, request: SignatureRequest) {
+  async verify(clientSignature: ClientSignature, request: SignatureRequest) {
     if (typeof clientSignature.policy?.raw === 'string') {
       return this.verifyPostPolicySignature(clientSignature, clientSignature.policy.raw)
     }
 
-    const serverSignature = this.sign(clientSignature, request)
+    const serverSignature = await this.sign(clientSignature, request)
     return crypto.timingSafeEqual(
       Buffer.from(clientSignature.signature),
       Buffer.from(serverSignature.signature)
@@ -283,11 +305,8 @@ export class SignatureV4 {
     chunkSignature: string,
     prevSignature: string = clientSignature.signature
   ): boolean {
-    const { secretKey } = this.serverCredentials
     const { shortDate, region, service } = clientSignature.credentials
-    const signingKey = this.signingKey(secretKey, shortDate, region, service)
-
-    const emptyHash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    const signingKey = this.getCachedSigningKey(shortDate, region, service)
 
     // Build the “String to Sign” for this chunk exactly per AWS:
     //    AWS4-HMAC-SHA256-PAYLOAD
@@ -302,7 +321,7 @@ export class SignatureV4 {
       clientSignature.longDate,
       scope,
       prevSignature,
-      emptyHash,
+      EMPTY_SHA256_HASH,
       chunkHash,
     ].join('\n')
 
@@ -318,8 +337,7 @@ export class SignatureV4 {
     this.validateCredentials(clientSignature.credentials)
     const selectedRegion = this.getSelectedRegion(clientSignature.credentials.region)
 
-    const signingKey = this.signingKey(
-      serverCredentials.secretKey,
+    const signingKey = this.getCachedSigningKey(
       clientSignature.credentials.shortDate,
       selectedRegion,
       serverCredentials.service
@@ -333,7 +351,7 @@ export class SignatureV4 {
    * @param clientSignature
    * @param request
    */
-  sign(clientSignature: ClientSignature, request: SignatureRequest) {
+  async sign(clientSignature: ClientSignature, request: SignatureRequest) {
     const serverCredentials = this.serverCredentials
 
     this.validateCredentials(clientSignature.credentials)
@@ -344,11 +362,12 @@ export class SignatureV4 {
     }
 
     const selectedRegion = this.getSelectedRegion(clientSignature.credentials.region)
-    const canonicalRequest = this.constructCanonicalRequest(
+    const canonicalRequest = await this.constructCanonicalRequest(
       clientSignature,
       request,
       clientSignature.signedHeaders
     )
+
     const stringToSign = this.constructStringToSign(
       longDate,
       clientSignature.credentials.shortDate,
@@ -356,8 +375,8 @@ export class SignatureV4 {
       serverCredentials.service,
       canonicalRequest
     )
-    const signingKey = this.signingKey(
-      serverCredentials.secretKey,
+
+    const signingKey = this.getCachedSigningKey(
       clientSignature.credentials.shortDate,
       selectedRegion,
       serverCredentials.service
@@ -366,7 +385,7 @@ export class SignatureV4 {
     return { signature: this.hmac(signingKey, stringToSign).toString('hex'), canonicalRequest }
   }
 
-  protected getPayloadHash(clientSignature: ClientSignature, request: SignatureRequest) {
+  protected async getPayloadHash(clientSignature: ClientSignature, request: SignatureRequest) {
     const body = request.body
 
     // For presigned URLs and GET requests, use UNSIGNED-PAYLOAD
@@ -380,8 +399,8 @@ export class SignatureV4 {
     }
 
     // If the body is undefined, use the hash of an empty string
-    if (body == undefined) {
-      return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    if (body === null || body === undefined) {
+      return EMPTY_SHA256_HASH
     }
 
     // Calculate the SHA256 hash of the body
@@ -392,47 +411,57 @@ export class SignatureV4 {
         .digest('hex')
     }
 
+    // If body is a ReadableStream, calculate the SHA256 hash of the stream
+    if (body instanceof Readable && this.allowBodyHashing && request.payloadHasher) {
+      return await pipeline(body, request.payloadHasher).then(() => {
+        return request.payloadHasher?.digestHex()
+      })
+    }
+
     // Default to UNSIGNED-PAYLOAD if body is not a string or ArrayBuffer
     return 'UNSIGNED-PAYLOAD'
   }
 
-  protected constructCanonicalRequest(
+  protected async constructCanonicalRequest(
     clientSignature: ClientSignature,
     request: SignatureRequest,
     signedHeaders: string[]
   ) {
     const method = request.method
-    const canonicalUri = this.constructCanonicalUri(request)
-
+    const prefix = request.prefix ? request.prefix.replace(/\/+$/, '') : ''
+    let canonicalUri = new URL(`http://localhost:8080${prefix}${request.url}`).pathname
+    if (this.s3OmitPrefixFromCanonicalUri) {
+      canonicalUri = canonicalUri.replace(new RegExp(`^${this.s3OmitPrefixFromCanonicalUri}`), '')
+    }
     const canonicalQueryString = this.constructCanonicalQueryString(request.query || {})
     const canonicalHeaders = this.constructCanonicalHeaders(request, signedHeaders)
     const signedHeadersString = signedHeaders.sort().join(';')
-    const payloadHash = this.getPayloadHash(clientSignature, request)
+    const payloadHash = await this.getPayloadHash(clientSignature, request)
 
     return `${method}\n${canonicalUri}\n${canonicalQueryString}\n${canonicalHeaders}\n${signedHeadersString}\n${payloadHash}`
   }
 
-  protected constructCanonicalUri(request: SignatureRequest) {
-    const xForwardedUri = this.getHeader(request, 'x-forwarded-uri')
-    if (xForwardedUri) {
-      return xForwardedUri
-    }
-
-    const uri = new URL(`http://localhost:8080${request.prefix || ''}${request.url}`).pathname
-
-    const xRemovePrefix = this.getHeader(request, 'x-remove-prefix')
-    if (xRemovePrefix) {
-      return uri.replace(new RegExp(`^${xRemovePrefix}`), '')
-    }
-
-    return uri
+  /**
+   * Encodes a URI component according to RFC 3986, as required by AWS Signature V4.
+   * This differs from encodeURIComponent which doesn't encode certain characters
+   * like parentheses that AWS requires to be percent-encoded.
+   */
+  protected encodeRFC3986URIComponent(str: string): string {
+    return encodeURIComponent(str).replace(/[!'()*]/g, (c) => {
+      return '%' + c.charCodeAt(0).toString(16).toUpperCase()
+    })
   }
 
   protected constructCanonicalQueryString(query: Record<string, string>) {
     return Object.keys(query)
       .filter((key) => !(key in ALWAYS_UNSIGNABLE_QUERY_PARAMS))
       .sort()
-      .map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(query[key] as string)}`)
+      .map(
+        (key) =>
+          `${this.encodeRFC3986URIComponent(key)}=${this.encodeRFC3986URIComponent(
+            query[key] as string
+          )}`
+      )
       .join('&')
   }
 
@@ -471,6 +500,12 @@ export class SignatureV4 {
   }
 
   protected getHostHeader(request: SignatureRequest) {
+    // When a public URL is configured, use its host for signature verification.
+    // This avoids proxy header issues (e.g., Kong overwriting X-Forwarded-Port).
+    if (this.publicUrl) {
+      return `host:${this.publicUrl.host}`
+    }
+
     if (this.allowForwardedHeader) {
       const forwarded = this.getHeader(request, 'forwarded')
       if (forwarded) {
@@ -490,9 +525,7 @@ export class SignatureV4 {
 
     const xForwardedHost = this.getHeader(request, 'x-forwarded-host')
     if (xForwardedHost) {
-      return `host:${xForwardedHost.toLowerCase()}`
-      // TODO something always sets 'x-forwarded-port' to internal port, so we can't use it
-      /* const port = this.getHeader(request, 'x-forwarded-port')
+      const port = this.getHeader(request, 'x-forwarded-port')
       const host = `host:${xForwardedHost.toLowerCase()}`
 
       if (port && !['443', '80'].includes(port)) {
@@ -502,7 +535,7 @@ export class SignatureV4 {
           return 'host:' + xForwardedHost.replace(/:\d+$/, `:${port}`)
         }
       }
-      return host */
+      return host
     }
 
     return `host:${this.getHeader(request, 'host')}`
@@ -559,6 +592,31 @@ export class SignatureV4 {
     const kRegion = this.hmac(kDate, regionName)
     const kService = this.hmac(kRegion, serviceName)
     return this.hmac(kService, 'aws4_request')
+  }
+
+  private getCachedSigningKey(dateStamp: string, regionName: string, serviceName: string) {
+    const cacheKey = `${dateStamp}\0${regionName}\0${serviceName}`
+    let signingKey = this.signingKeyCache.get(cacheKey)
+
+    if (!signingKey) {
+      signingKey = this.signingKey(
+        this.serverCredentials.secretKey,
+        dateStamp,
+        regionName,
+        serviceName
+      )
+      this.signingKeyCache.set(cacheKey, signingKey)
+    }
+
+    return signingKey
+  }
+
+  protected async sha256OfRequest(req: Readable) {
+    const hash = createHash('sha256')
+    for await (const chunk of req) {
+      hash.update(chunk)
+    }
+    return hash.digest('hex')
   }
 
   protected hmac(key: string | Buffer, data: string): Buffer {

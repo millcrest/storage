@@ -1,10 +1,10 @@
-import { getConfig } from '../../../config'
-import { FromSchema } from 'json-schema-to-ts'
-import { FastifyInstance } from 'fastify'
+import { getTenantConfig } from '@internal/database'
 import { ImageRenderer } from '@storage/renderer'
+import { FastifyInstance } from 'fastify'
+import { FromSchema } from 'json-schema-to-ts'
+import { getConfig } from '../../../config'
 import { transformationOptionsSchema } from '../../schemas/transformations'
 import { ROUTE_OPERATIONS } from '../operations'
-import { getTenantConfig } from '@internal/database'
 
 const { storageS3Bucket, isMultitenant } = getConfig()
 
@@ -51,7 +51,9 @@ export default async function routes(fastify: FastifyInstance) {
       const { bucketName } = request.params
       const objectName = request.params['*']
 
-      const obj = await request.storage.from(bucketName).findObject(objectName, 'id,version')
+      const obj = await request.storage
+        .from(bucketName)
+        .findObject(objectName, 'id,version,metadata')
 
       const s3Key = request.storage.location.getKeyLocation({
         tenantId: request.tenantId,
@@ -73,6 +75,7 @@ export default async function routes(fastify: FastifyInstance) {
         key: s3Key,
         version: obj.version,
         download,
+        xRobotsTag: obj.metadata?.['xRobotsTag'] as string | undefined,
         signal: request.signals.disconnect.signal,
       })
     }

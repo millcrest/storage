@@ -1,23 +1,27 @@
-'use strict'
-import dotenv from 'dotenv'
-import app from '../app'
-import { S3Backend } from '../storage/backend'
-import { FastifyInstance } from 'fastify'
 import { getPostgresConnection, getServiceKeyUser } from '@internal/database'
 import { StorageKnexDB } from '@storage/database'
+import { randomUUID } from 'crypto'
+import dotenv from 'dotenv'
+import { FastifyInstance } from 'fastify'
+import app from '../app'
 import { getConfig } from '../config'
+import { S3Backend } from '../storage/backend'
 
 dotenv.config({ path: '.env.test' })
 const anonKey = process.env.ANON_KEY || ''
+const authenticatedKey = process.env.AUTHENTICATED_KEY || ''
+const serviceKey = process.env.SERVICE_KEY || ''
+const { tenantId } = getConfig()
 
 let appInstance: FastifyInstance
+let adminDb: StorageKnexDB
 
-beforeAll(() => {
-  jest.spyOn(S3Backend.prototype, 'deleteObjects').mockImplementation(() => {
+beforeAll(async () => {
+  vi.spyOn(S3Backend.prototype, 'deleteObjects').mockImplementation(() => {
     return Promise.resolve()
   })
 
-  jest.spyOn(S3Backend.prototype, 'getObject').mockImplementation(() => {
+  vi.spyOn(S3Backend.prototype, 'getObject').mockImplementation(() => {
     return Promise.resolve({
       metadata: {
         httpStatusCode: 200,
@@ -32,16 +36,74 @@ beforeAll(() => {
       body: Buffer.from(''),
     })
   })
+
+  const serviceKeyUser = await getServiceKeyUser(tenantId)
+  const pg = await getPostgresConnection({
+    superUser: serviceKeyUser,
+    user: serviceKeyUser,
+    tenantId,
+    host: 'localhost',
+  })
+
+  adminDb = new StorageKnexDB(pg, {
+    host: 'localhost',
+    tenantId,
+  })
 })
 
 beforeEach(() => {
-  jest.clearAllMocks()
+  vi.clearAllMocks()
   appInstance = app()
 })
 
 afterEach(async () => {
   await appInstance.close()
 })
+
+afterAll(async () => {
+  await adminDb.destroyConnection()
+})
+
+async function createBucket(name: string, authorization = authenticatedKey) {
+  const response = await appInstance.inject({
+    method: 'POST',
+    url: '/bucket',
+    headers: {
+      authorization: `Bearer ${authorization}`,
+    },
+    payload: {
+      name,
+    },
+  })
+
+  expect(response.statusCode).toBe(200)
+  expect(response.json()).toEqual({
+    name,
+  })
+}
+
+async function seedObjects(bucketId: string, objectNames: string[]) {
+  await Promise.all(
+    objectNames.map((name) =>
+      adminDb.createObject({
+        name,
+        owner: randomUUID(),
+        bucket_id: bucketId,
+        metadata: { size: 1 },
+        user_metadata: null,
+        version: undefined,
+      })
+    )
+  )
+}
+
+async function cleanupBucket(bucketId: string, objectNames: string[] = []) {
+  if (objectNames.length > 0) {
+    await adminDb.deleteObjects(bucketId, objectNames, 'name')
+  }
+
+  await adminDb.deleteBucket(bucketId)
+}
 
 /*
  * GET /bucket/:id
@@ -143,7 +205,7 @@ describe('testing GET all buckets', () => {
     [{ 'x-client-info': 'supabase-py/2.18.1' }, true],
     [{ 'x-client-info': 'supabase-py/2.19.0' }, true],
   ]) {
-    test.only(`Should ${shouldIncludeType ? '' : 'NOT '}include type for ${JSON.stringify(
+    test(`Should ${shouldIncludeType ? '' : 'NOT '}include type for ${JSON.stringify(
       headers
     )} client`, async () => {
       const response = await appInstance.inject({
@@ -182,24 +244,37 @@ describe('testing GET all buckets', () => {
   })
 
   test('user is able to get buckets with limit, offset, search and sorting', async () => {
-    const response = await appInstance.inject({
-      method: 'GET',
-      url: `/bucket?limit=1&offset=3&sortColumn=name&sortOrder=asc&search=bucket`,
-      headers: {
-        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
-      },
-    })
-    expect(response.statusCode).toBe(200)
-    const responseJSON = JSON.parse(response.body)
-    expect(responseJSON.length).toEqual(1)
-    expect(responseJSON[0]).toMatchObject({
-      id: 'bucket4',
-      name: 'bucket4',
-      type: expect.any(String),
-      public: false,
-      file_size_limit: null,
-      allowed_mime_types: null,
-    })
+    const prefix = `list-bucket-${randomUUID()}`
+    const bucketIds = ['a', 'b', 'c', 'd'].map((suffix) => `${prefix}-${suffix}`)
+
+    try {
+      for (const bucketId of bucketIds) {
+        await createBucket(bucketId)
+      }
+
+      const response = await appInstance.inject({
+        method: 'GET',
+        url: `/bucket?limit=1&offset=3&sortColumn=name&sortOrder=asc&search=${encodeURIComponent(
+          prefix
+        )}`,
+        headers: {
+          authorization: `Bearer ${authenticatedKey}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json()
+      expect(responseJSON).toHaveLength(1)
+      expect(responseJSON[0]).toMatchObject({
+        id: bucketIds[3],
+        name: bucketIds[3],
+        type: expect.any(String),
+        public: false,
+        file_size_limit: null,
+        allowed_mime_types: null,
+      })
+    } finally {
+      await Promise.all(bucketIds.map((bucketId) => cleanupBucket(bucketId)))
+    }
   })
 
   test('limit=0 returns 400', async () => {
@@ -230,19 +305,25 @@ describe('testing GET all buckets', () => {
  */
 describe('testing POST bucket', () => {
   test('user is able to create a bucket', async () => {
-    const response = await appInstance.inject({
-      method: 'POST',
-      url: `/bucket`,
-      headers: {
-        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
-      },
-      payload: {
-        name: 'newbucket',
-      },
-    })
-    expect(response.statusCode).toBe(200)
-    const responseJSON = JSON.parse(response.body)
-    expect(responseJSON.name).toBe('newbucket')
+    const bucketId = `newbucket-${randomUUID()}`
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/bucket`,
+        headers: {
+          authorization: `Bearer ${authenticatedKey}`,
+        },
+        payload: {
+          name: bucketId,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json()
+      expect(responseJSON.name).toBe(bucketId)
+    } finally {
+      await cleanupBucket(bucketId)
+    }
   })
 
   test('user is not able to create a bucket with a /', async () => {
@@ -361,10 +442,11 @@ describe('testing public bucket functionality', () => {
       url: `/object/public/public-bucket/favicon.ico`,
     })
     expect(publicResponse.statusCode).toBe(200)
+    expect(publicResponse.headers['x-robots-tag']).toBe('none')
     expect(publicResponse.headers['etag']).toBe('abc')
     expect(publicResponse.headers['last-modified']).toBe('Thu, 12 Aug 2021 16:00:00 GMT')
 
-    const mockGetObject = jest.spyOn(S3Backend.prototype, 'getObject')
+    const mockGetObject = vi.spyOn(S3Backend.prototype, 'getObject')
     mockGetObject.mockRejectedValue({
       $metadata: {
         httpStatusCode: 304,
@@ -443,18 +525,35 @@ describe('testing public bucket functionality', () => {
     })
     expect(response.statusCode).toBe(400)
   })
+
+  test('user is not able to update a bucket with empty payload', async () => {
+    const bucketId = 'public-bucket'
+    const response = await appInstance.inject({
+      method: 'PUT',
+      url: `/bucket/${bucketId}`,
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+      payload: {},
+    })
+    expect(response.statusCode).toBe(400)
+  })
 })
 
 describe('testing count objects in bucket', () => {
   const { tenantId } = getConfig()
+  const testObjectCount = 27
+  const testOwnerId = randomUUID()
   let db: StorageKnexDB
+  let testBucketId: string
+  let testObjectNames: string[]
 
   beforeAll(async () => {
-    const superUser = await getServiceKeyUser(tenantId)
+    const serviceKeyUser = await getServiceKeyUser(tenantId)
     const pg = await getPostgresConnection({
-      superUser,
-      user: superUser,
-      tenantId: tenantId,
+      superUser: serviceKeyUser,
+      user: serviceKeyUser,
+      tenantId,
       host: 'localhost',
     })
 
@@ -462,16 +561,50 @@ describe('testing count objects in bucket', () => {
       host: 'localhost',
       tenantId,
     })
+
+    testBucketId = `count-objects-${randomUUID()}`
+    testObjectNames = Array.from({ length: testObjectCount }, (_, idx) => {
+      return `fixtures/count-object-${idx}`
+    })
+
+    await db.createBucket({
+      id: testBucketId,
+      name: testBucketId,
+      public: false,
+      owner: testOwnerId,
+      file_size_limit: null,
+      allowed_mime_types: null,
+      type: 'STANDARD',
+    })
+
+    await Promise.all(
+      testObjectNames.map((name) => {
+        return db.createObject({
+          name,
+          owner: testOwnerId,
+          bucket_id: testBucketId,
+          metadata: { size: 1 },
+          user_metadata: null,
+          version: undefined,
+        })
+      })
+    )
+  })
+
+  afterAll(async () => {
+    await db.deleteObjects(testBucketId, testObjectNames, 'name')
+    await db.deleteBucket(testBucketId)
+    await db.destroyConnection()
   })
 
   it('should return correct object count', async () => {
-    await expect(db.countObjectsInBucket('bucket2')).resolves.toBe(27)
+    await expect(db.countObjectsInBucket(testBucketId)).resolves.toBe(testObjectCount)
   })
   it('should return limited object count', async () => {
-    await expect(db.countObjectsInBucket('bucket2', 22)).resolves.toBe(22)
+    await expect(db.countObjectsInBucket(testBucketId, 22)).resolves.toBe(22)
   })
   it('should return full object count if limit is greater than total', async () => {
-    await expect(db.countObjectsInBucket('bucket2', 999)).resolves.toBe(27)
+    await expect(db.countObjectsInBucket(testBucketId, 999)).resolves.toBe(testObjectCount)
   })
   it('should return 0 object count if there are no objects with provided bucket id', async () => {
     await expect(db.countObjectsInBucket('this-is-not-a-bucket-at-all', 999)).resolves.toBe(0)
@@ -480,17 +613,28 @@ describe('testing count objects in bucket', () => {
 
 describe('testing DELETE bucket', () => {
   test('user is able to delete a bucket', async () => {
-    const bucketId = 'bucket4'
-    const response = await appInstance.inject({
-      method: 'DELETE',
-      url: `/bucket/${bucketId}`,
-      headers: {
-        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
-      },
-    })
-    expect(response.statusCode).toBe(200)
-    const responseJSON = JSON.parse(response.body)
-    expect(responseJSON.message).toBe('Successfully deleted')
+    const bucketId = `delete-bucket-${randomUUID()}`
+    let deleted = false
+
+    try {
+      await createBucket(bucketId)
+
+      const response = await appInstance.inject({
+        method: 'DELETE',
+        url: `/bucket/${bucketId}`,
+        headers: {
+          authorization: `Bearer ${authenticatedKey}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json()
+      expect(responseJSON.message).toBe('Successfully deleted')
+      deleted = true
+    } finally {
+      if (!deleted) {
+        await cleanupBucket(bucketId)
+      }
+    }
   })
 
   test('checking RLS: anon user is not able to delete a bucket', async () => {
@@ -515,15 +659,24 @@ describe('testing DELETE bucket', () => {
   })
 
   test('user is not able to delete bucket a non empty bucket', async () => {
-    const bucketId = 'bucket2'
-    const response = await appInstance.inject({
-      method: 'DELETE',
-      url: `/bucket/${bucketId}`,
-      headers: {
-        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
-      },
-    })
-    expect(response.statusCode).toBe(400)
+    const bucketId = `delete-non-empty-${randomUUID()}`
+    const objectNames = [`fixtures/${randomUUID()}`]
+
+    try {
+      await createBucket(bucketId)
+      await seedObjects(bucketId, objectNames)
+
+      const response = await appInstance.inject({
+        method: 'DELETE',
+        url: `/bucket/${bucketId}`,
+        headers: {
+          authorization: `Bearer ${authenticatedKey}`,
+        },
+      })
+      expect(response.statusCode).toBe(400)
+    } finally {
+      await cleanupBucket(bucketId, objectNames)
+    }
   })
 
   test('user is not able to delete a non-existent bucket', async () => {
@@ -537,91 +690,264 @@ describe('testing DELETE bucket', () => {
     })
     expect(response.statusCode).toBe(400)
   })
+
+  test('user is not able to delete a non-existent bucket with an empty json body', async () => {
+    const bucketId = `delete-empty-json-${randomUUID()}`
+
+    const response = await appInstance.inject({
+      method: 'DELETE',
+      url: `/bucket/${bucketId}`,
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        'content-type': 'application/json',
+      },
+      payload: '',
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'Bucket not found',
+      message: 'Bucket not found',
+    })
+  })
+
+  test('user is able to delete a bucket with an empty json body', async () => {
+    const bucketId = `delete-empty-json-success-${randomUUID()}`
+    let created = false
+    let deleted = false
+
+    try {
+      const createResponse = await appInstance.inject({
+        method: 'POST',
+        url: '/bucket',
+        headers: {
+          authorization: `Bearer ${serviceKey}`,
+        },
+        payload: {
+          name: bucketId,
+        },
+      })
+
+      expect(createResponse.statusCode).toBe(200)
+      expect(createResponse.json()).toEqual({
+        name: bucketId,
+      })
+      created = true
+
+      const response = await appInstance.inject({
+        method: 'DELETE',
+        url: `/bucket/${bucketId}`,
+        headers: {
+          authorization: `Bearer ${serviceKey}`,
+          'content-type': 'application/json',
+        },
+        payload: '',
+      })
+
+      expect(response.statusCode).toBe(200)
+      deleted = true
+      expect(response.json()).toEqual({
+        message: 'Successfully deleted',
+      })
+    } finally {
+      if (created && !deleted) {
+        await appInstance.inject({
+          method: 'DELETE',
+          url: `/bucket/${bucketId}`,
+          headers: {
+            authorization: `Bearer ${serviceKey}`,
+          },
+        })
+      }
+    }
+  })
 })
 
 describe('testing EMPTY bucket', () => {
-  test('user is able to empty a bucket', async () => {
-    const bucketId = 'bucket3'
+  test('user is not able to empty a non existent bucket with an empty json body', async () => {
+    const bucketId = `empty-empty-json-${randomUUID()}`
+
     const response = await appInstance.inject({
       method: 'POST',
       url: `/bucket/${bucketId}/empty`,
       headers: {
         authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        'content-type': 'application/json',
       },
+      payload: '',
     })
-    expect(response.statusCode).toBe(200)
-    const responseJSON = JSON.parse(response.body)
-    expect(responseJSON.message).toBe(
-      'Empty bucket has been queued. Completion may take up to an hour.'
-    )
+
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'Bucket not found',
+      message: 'Bucket not found',
+    })
+  })
+
+  test('user is able to empty a bucket with an empty json body', async () => {
+    const bucketId = `empty-empty-json-success-${randomUUID()}`
+    let created = false
+
+    try {
+      const createResponse = await appInstance.inject({
+        method: 'POST',
+        url: '/bucket',
+        headers: {
+          authorization: `Bearer ${serviceKey}`,
+        },
+        payload: {
+          name: bucketId,
+        },
+      })
+
+      expect(createResponse.statusCode).toBe(200)
+      expect(createResponse.json()).toEqual({
+        name: bucketId,
+      })
+      created = true
+
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/bucket/${bucketId}/empty`,
+        headers: {
+          authorization: `Bearer ${serviceKey}`,
+          'content-type': 'application/json',
+        },
+        payload: '',
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(response.json()).toEqual({
+        message: 'Empty bucket has been queued. Completion may take up to an hour.',
+      })
+    } finally {
+      if (created) {
+        await appInstance.inject({
+          method: 'DELETE',
+          url: `/bucket/${bucketId}`,
+          headers: {
+            authorization: `Bearer ${serviceKey}`,
+          },
+        })
+      }
+    }
+  })
+
+  test('user is able to empty a bucket', async () => {
+    const bucketId = `empty-bucket-${randomUUID()}`
+    const objectNames = [`fixtures/${randomUUID()}`]
+
+    try {
+      await createBucket(bucketId)
+      await seedObjects(bucketId, objectNames)
+
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/bucket/${bucketId}/empty`,
+        headers: {
+          authorization: `Bearer ${authenticatedKey}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json()
+      expect(responseJSON.message).toBe(
+        'Empty bucket has been queued. Completion may take up to an hour.'
+      )
+    } finally {
+      await cleanupBucket(bucketId, objectNames)
+    }
   })
 
   test('user is able to empty a bucket with a service key', async () => {
-    const bucketId = 'bucket3a'
+    const bucketId = `empty-bucket-service-${randomUUID()}`
+    const objectNames = [`service-empty-a-${randomUUID()}`, `service-empty-b-${randomUUID()}`]
 
-    // confirm there are items in the bucket before empty
-    const responseList = await appInstance.inject({
-      method: 'POST',
-      url: '/object/list/' + bucketId,
-      headers: {
-        authorization: `Bearer ${process.env.SERVICE_KEY}`,
-      },
-      payload: {
-        prefix: '',
-        limit: 10,
-        offset: 0,
-      },
-    })
-    expect(responseList.statusCode).toBe(200)
-    expect(responseList.json()).toHaveLength(2)
+    try {
+      await createBucket(bucketId, serviceKey)
+      await seedObjects(bucketId, objectNames)
 
-    const response = await appInstance.inject({
-      method: 'POST',
-      url: `/bucket/${bucketId}/empty`,
-      headers: {
-        authorization: `Bearer ${process.env.SERVICE_KEY}`,
-      },
-    })
-    expect(response.statusCode).toBe(200)
-    const responseJSON = JSON.parse(response.body)
-    expect(responseJSON.message).toBe(
-      'Empty bucket has been queued. Completion may take up to an hour.'
-    )
+      // confirm there are items in the bucket before empty
+      const responseList = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/' + bucketId,
+        headers: {
+          authorization: `Bearer ${serviceKey}`,
+        },
+        payload: {
+          prefix: '',
+          limit: 10,
+          offset: 0,
+        },
+      })
+      expect(responseList.statusCode).toBe(200)
+      expect(responseList.json()).toHaveLength(2)
 
-    // confirm the bucket is actually empty after
-    const responseList2 = await appInstance.inject({
-      method: 'POST',
-      url: '/object/list/' + bucketId,
-      headers: {
-        authorization: `Bearer ${process.env.SERVICE_KEY}`,
-      },
-      payload: {
-        prefix: '',
-      },
-    })
-    expect(responseList2.statusCode).toBe(200)
-    expect(responseList2.json()).toHaveLength(0)
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/bucket/${bucketId}/empty`,
+        headers: {
+          authorization: `Bearer ${serviceKey}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json()
+      expect(responseJSON.message).toBe(
+        'Empty bucket has been queued. Completion may take up to an hour.'
+      )
+
+      // confirm the bucket is actually empty after
+      const responseList2 = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/' + bucketId,
+        headers: {
+          authorization: `Bearer ${serviceKey}`,
+        },
+        payload: {
+          prefix: '',
+        },
+      })
+      expect(responseList2.statusCode).toBe(200)
+      expect(responseList2.json()).toHaveLength(0)
+    } finally {
+      await cleanupBucket(bucketId, objectNames)
+    }
   })
 
-  test('user is able to delete a bucket', async () => {
-    const bucketId = 'bucket3'
-    const response = await appInstance.inject({
-      method: 'POST',
-      url: `/bucket/${bucketId}/empty`,
-      headers: {
-        authorization: `Bearer ${anonKey}`,
-      },
-    })
-    expect(response.statusCode).toBe(400)
+  test('anon user is not able to empty a bucket', async () => {
+    const bucketId = `empty-bucket-anon-${randomUUID()}`
+
+    try {
+      await createBucket(bucketId)
+
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/bucket/${bucketId}/empty`,
+        headers: {
+          authorization: `Bearer ${anonKey}`,
+        },
+      })
+      expect(response.statusCode).toBe(400)
+    } finally {
+      await cleanupBucket(bucketId)
+    }
   })
 
   test('user is not able to empty a bucket without Auth Header', async () => {
-    const bucketId = 'bucket3'
-    const response = await appInstance.inject({
-      method: 'POST',
-      url: `/bucket/${bucketId}/empty`,
-    })
-    expect(response.statusCode).toBe(400)
+    const bucketId = `empty-bucket-no-auth-${randomUUID()}`
+
+    try {
+      await createBucket(bucketId)
+
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/bucket/${bucketId}/empty`,
+      })
+      expect(response.statusCode).toBe(400)
+    } finally {
+      await cleanupBucket(bucketId)
+    }
   })
 
   test('user is not able to empty a non existent bucket', async () => {
@@ -637,14 +963,21 @@ describe('testing EMPTY bucket', () => {
   })
 
   test('user is able to empty an already empty bucket', async () => {
-    const bucketId = 'bucket5'
-    const response = await appInstance.inject({
-      method: 'POST',
-      url: `/bucket/${bucketId}/empty`,
-      headers: {
-        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
-      },
-    })
-    expect(response.statusCode).toBe(200)
+    const bucketId = `empty-bucket-already-empty-${randomUUID()}`
+
+    try {
+      await createBucket(bucketId)
+
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/bucket/${bucketId}/empty`,
+        headers: {
+          authorization: `Bearer ${authenticatedKey}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+    } finally {
+      await cleanupBucket(bucketId)
+    }
   })
 })

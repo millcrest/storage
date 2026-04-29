@@ -1,5 +1,5 @@
-import dotenv from 'dotenv'
 import type { DBMigration } from '@internal/database/migrations'
+import dotenv from 'dotenv'
 import { SignJWT } from 'jose'
 
 export type StorageBackendType = 'file' | 's3'
@@ -53,6 +53,7 @@ export interface JwksConfig {
 type StorageConfigType = {
   isProduction: boolean
   version: string
+  numWorkers: number
   exposeDocs: boolean
   keepAliveTimeout: number
   headersTimeout: number
@@ -63,19 +64,24 @@ type StorageConfigType = {
   uploadFileSizeLimitStandard?: number
   storageFilePath?: string
   storageFileEtagAlgorithm: 'mtime' | 'md5'
+  storageS3InternalTracesEnabled?: boolean
   storageS3MaxSockets: number
+  storageS3DisableChecksum: boolean
+  storageS3UploadQueueSize: number
   storageS3Bucket: string
   storageS3Endpoint?: string
   storageS3ForcePathStyle?: boolean
   storageS3Region: string
   storageS3ClientTimeout: number
-  storageS3DeleteConcurrency: number
   isMultitenant: boolean
   jwtSecret: string
   jwtAlgorithm: string
   jwtCachingEnabled: boolean
   jwtJWKS?: JwksConfig
   multitenantDatabaseUrl?: string
+  multitenantDatabasePoolUrl?: string
+  multitenantMaxConnections: number
+  multitenantDatabaseQueryTimeout: number
   dbAnonRole: string
   dbAuthenticatedRole: string
   dbServiceRole: string
@@ -93,6 +99,10 @@ type StorageConfigType = {
   databaseMaxConnections: number
   databaseFreePoolAfterInactivity: number
   databaseConnectionTimeout: number
+  databaseEnableQueryCancellation: boolean
+  databaseStatementTimeout: number
+  databaseApplicationName: string
+  pgQueueApplicationName: string
   region: string
   requestTraceHeader?: string
   requestEtagHeaders: string[]
@@ -105,6 +115,7 @@ type StorageConfigType = {
   requestUrlLengthLimit: number
   requestXForwardedHostRegExp?: string
   requestAllowXForwardedPrefix?: boolean
+  storagePublicUrl?: string
   logLevel?: string
   logflareEnabled?: boolean
   logflareApiKey?: string
@@ -159,7 +170,6 @@ type StorageConfigType = {
   tusUseFileVersionSeparator: boolean
   tusAllowS3Tags: boolean
   tusLockType: 'postgres' | 's3'
-  defaultMetricsEnabled: boolean
   s3ProtocolEnabled: boolean
   s3ProtocolPrefix: string
   s3ProtocolAllowForwardedHeader: boolean
@@ -167,7 +177,7 @@ type StorageConfigType = {
   s3ProtocolAccessKeyId?: string
   s3ProtocolAccessKeySecret?: string
   s3ProtocolNonCanonicalHostHeader?: string
-  s3Port?: number
+  s3OmitPrefixFromCanonicalUri?: string
   tracingEnabled?: boolean
   tracingMode?: string
   tracingTimeMinDuration: number
@@ -175,10 +185,19 @@ type StorageConfigType = {
   tracingFeatures?: {
     upload: boolean
   }
+  prometheusMetricsEnabled: boolean
+  prometheusMetricsIncludeTenantId: boolean
+  tenantPoolCacheHitLogSampleRate: number
+  tenantPoolCacheMissLogSampleRate: number
+  otelMetricsEnabled: boolean
+  otelMetricsTemporality: 'DELTA' | 'CUMULATIVE'
+  otelMetricsExportIntervalMs: number
   cdnPurgeEndpointURL?: string
   cdnPurgeEndpointKey?: string
 
+  icebergEnabled: boolean
   icebergWarehouse: string
+  icebergShards: string[]
   icebergCatalogUrl: string
   icebergCatalogAuthType: IcebergCatalogAuthType
   icebergCatalogToken?: string
@@ -188,6 +207,12 @@ type StorageConfigType = {
   icebergBucketDetectionSuffix: string
   icebergBucketDetectionMode: 'BUCKET' | 'FULL_PATH'
   icebergS3DeleteEnabled: boolean
+
+  vectorEnabled: boolean
+  vectorS3Buckets: string[]
+  vectorBucketRegion?: string
+  vectorMaxBucketsCount: number
+  vectorMaxIndexesCount: number
 }
 
 function getOptionalConfigFromEnv(key: string, fallback?: string): string | undefined {
@@ -238,6 +263,7 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
   const isMultitenant = getOptionalConfigFromEnv('MULTI_TENANT', 'IS_MULTITENANT') === 'true'
 
   config = {
+    numWorkers: envNumber(getOptionalConfigFromEnv('WORKERS_NUM'), 1),
     isProduction: process.env.NODE_ENV === 'production',
     exposeDocs: getOptionalConfigFromEnv('EXPOSE_DOCS') !== 'false',
     isMultitenant,
@@ -264,6 +290,7 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     ),
     requestAllowXForwardedPrefix:
       getOptionalConfigFromEnv('REQUEST_ALLOW_X_FORWARDED_PATH') === 'true',
+    storagePublicUrl: getOptionalConfigFromEnv('STORAGE_PUBLIC_URL'),
     requestUrlLengthLimit:
       Number(getOptionalConfigFromEnv('REQUEST_URL_LENGTH_LIMIT', 'URL_LENGTH_LIMIT')) || 7_500,
     requestTraceHeader: getOptionalConfigFromEnv('REQUEST_TRACE_HEADER', 'REQUEST_ID_HEADER'),
@@ -328,7 +355,8 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     s3ProtocolNonCanonicalHostHeader: getOptionalConfigFromEnv(
       'S3_PROTOCOL_NON_CANONICAL_HOST_HEADER'
     ),
-    s3Port: Number(getOptionalConfigFromEnv('S3_PORT')),
+    s3OmitPrefixFromCanonicalUri:
+      getOptionalConfigFromEnv('S3_OMIT_PREFIX_FROM_CANONICAL_URI') === 'true' ? "/s3" : undefined,
     // Storage
     storageBackendType: getOptionalConfigFromEnv('STORAGE_BACKEND') as StorageBackendType,
     emptyBucketMax: parseInt(getOptionalConfigFromEnv('STORAGE_EMPTY_BUCKET_MAX') || '200000', 10),
@@ -345,6 +373,11 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       getOptionalConfigFromEnv('STORAGE_S3_MAX_SOCKETS', 'GLOBAL_S3_MAX_SOCKETS') || '200',
       10
     ),
+    storageS3DisableChecksum: getOptionalConfigFromEnv('STORAGE_S3_DISABLE_CHECKSUM') === 'true',
+    storageS3UploadQueueSize:
+      envNumber(getOptionalConfigFromEnv('STORAGE_S3_UPLOAD_QUEUE_SIZE')) ?? 2,
+    storageS3InternalTracesEnabled:
+      getOptionalConfigFromEnv('STORAGE_S3_ENABLED_METRICS') === 'true',
     storageS3Bucket: getOptionalConfigFromEnv('STORAGE_S3_BUCKET', 'GLOBAL_S3_BUCKET'),
     storageS3Endpoint: getOptionalConfigFromEnv('STORAGE_S3_ENDPOINT', 'GLOBAL_S3_ENDPOINT'),
     storageS3ForcePathStyle:
@@ -352,10 +385,6 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       'true',
     storageS3Region: getOptionalConfigFromEnv('STORAGE_S3_REGION', 'REGION') as string,
     storageS3ClientTimeout: Number(getOptionalConfigFromEnv('STORAGE_S3_CLIENT_TIMEOUT') || `0`),
-    storageS3DeleteConcurrency: parseInt(
-      getOptionalConfigFromEnv('STORAGE_S3_DELETE_CONCURRENCY') || '8',
-      10
-    ),
 
     // DB - Migrations
     dbAnonRole: getOptionalConfigFromEnv('DB_ANON_ROLE') || 'anon',
@@ -378,6 +407,21 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       'DATABASE_MULTITENANT_URL',
       'MULTITENANT_DATABASE_URL'
     ),
+    multitenantDatabasePoolUrl: getOptionalConfigFromEnv(
+      'DATABASE_MULTITENANT_POOL_URL',
+      'MULTITENANT_DATABASE_POOL_URL'
+    ),
+    multitenantMaxConnections: envNumber(
+      getOptionalConfigFromEnv(
+        'DATABASE_MULTITENANT_MAX_CONNECTIONS',
+        'MULTITENANT_DATABASE_MAX_CONNECTIONS'
+      ),
+      10
+    ),
+    multitenantDatabaseQueryTimeout: envNumber(
+      getOptionalConfigFromEnv('DATABASE_MULTITENANT_QUERY_TIMEOUT'),
+      10_000
+    ),
     databaseSSLRootCert: getOptionalConfigFromEnv('DATABASE_SSL_ROOT_CERT'),
     databaseURL: getOptionalIfMultitenantConfigFromEnv('DATABASE_URL') || '',
     databasePoolURL: getOptionalConfigFromEnv('DATABASE_POOL_URL') || '',
@@ -394,6 +438,18 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       getOptionalConfigFromEnv('DATABASE_CONNECTION_TIMEOUT') || '3000',
       10
     ),
+    databaseEnableQueryCancellation:
+      getOptionalConfigFromEnv('DATABASE_ENABLE_QUERY_CANCELLATION') === 'true',
+    databaseStatementTimeout: parseInt(
+      getOptionalConfigFromEnv('DATABASE_STATEMENT_TIMEOUT') || '30000',
+      10
+    ),
+    databaseApplicationName:
+      getOptionalConfigFromEnv('DATABASE_APPLICATION_NAME') ||
+      `Supabase Storage API ${getOptionalConfigFromEnv('VERSION') || '0.0.0'}`,
+    pgQueueApplicationName:
+      getOptionalConfigFromEnv('PG_QUEUE_APPLICATION_NAME') ||
+      `Supabase Storage PgBoss ${getOptionalConfigFromEnv('VERSION') || '0.0.0'}`,
 
     // CDN
     cdnPurgeEndpointURL: getOptionalConfigFromEnv('CDN_PURGE_ENDPOINT_URL'),
@@ -405,8 +461,13 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     logflareApiKey: getOptionalConfigFromEnv('LOGFLARE_API_KEY'),
     logflareSourceToken: getOptionalConfigFromEnv('LOGFLARE_SOURCE_TOKEN'),
     logflareBatchSize: parseInt(getOptionalConfigFromEnv('LOGFLARE_BATCH_SIZE') || '200', 10),
-    defaultMetricsEnabled: !(
-      getOptionalConfigFromEnv('DEFAULT_METRICS_ENABLED', 'ENABLE_DEFAULT_METRICS') === 'false'
+    tenantPoolCacheHitLogSampleRate: envSampleRate(
+      getOptionalConfigFromEnv('TENANT_POOL_CACHE_HIT_LOG_SAMPLE_RATE'),
+      0
+    ),
+    tenantPoolCacheMissLogSampleRate: envSampleRate(
+      getOptionalConfigFromEnv('TENANT_POOL_CACHE_MISS_LOG_SAMPLE_RATE'),
+      0
     ),
     tracingEnabled: getOptionalConfigFromEnv('TRACING_ENABLED') === 'true',
     tracingMode: getOptionalConfigFromEnv('TRACING_MODE') ?? 'basic',
@@ -419,10 +480,22 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       upload: getOptionalConfigFromEnv('TRACING_FEATURE_UPLOAD') === 'true',
     },
 
+    // OpenTelemetry Metrics
+    prometheusMetricsEnabled: getOptionalConfigFromEnv('PROMETHEUS_METRICS_ENABLED') === 'true',
+    prometheusMetricsIncludeTenantId:
+      getOptionalConfigFromEnv('PROMETHEUS_METRICS_INCLUDE_TENANT') === 'true',
+    otelMetricsEnabled: getOptionalConfigFromEnv('OTEL_METRICS_ENABLED') === 'true',
+    otelMetricsTemporality: getOptionalConfigFromEnv('OTEL_METRICS_TEMPORALITY') || 'CUMULATIVE',
+    otelMetricsExportIntervalMs: parseInt(
+      getOptionalConfigFromEnv('OTEL_METRICS_EXPORT_INTERVAL_MS') || '60000',
+      10
+    ),
+
     // Queue
     pgQueueEnable: getOptionalConfigFromEnv('PG_QUEUE_ENABLE', 'ENABLE_QUEUE_EVENTS') === 'true',
     pgQueueEnableWorkers: getOptionalConfigFromEnv('PG_QUEUE_WORKERS_ENABLE') !== 'false',
-    pgQueueReadWriteTimeout: Number(getOptionalConfigFromEnv('PG_QUEUE_READ_WRITE_TIMEOUT')) || 0,
+    pgQueueReadWriteTimeout:
+      envNumber(getOptionalConfigFromEnv('PG_QUEUE_READ_WRITE_TIMEOUT')) ?? 5000,
     pgQueueMaxConnections: Number(getOptionalConfigFromEnv('PG_QUEUE_MAX_CONNECTIONS')) || 4,
     pgQueueConnectionURL: getOptionalConfigFromEnv('PG_QUEUE_CONNECTION_URL'),
     pgQueueDeleteAfterDays: parseInt(
@@ -430,7 +503,7 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       10
     ),
     pgQueueDeleteAfterHours:
-      Number(getOptionalConfigFromEnv('PG_QUEUE_DELETE_AFTER_HOURS')) || undefined,
+      envNumber(getOptionalConfigFromEnv('PG_QUEUE_DELETE_AFTER_HOURS')) || undefined,
     pgQueueArchiveCompletedAfterSeconds: parseInt(
       getOptionalConfigFromEnv('PG_QUEUE_ARCHIVE_COMPLETED_AFTER_SECONDS') || '7200',
       10
@@ -513,7 +586,9 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       10
     ),
 
+    icebergEnabled: getOptionalConfigFromEnv('ICEBERG_ENABLED') === 'true',
     icebergWarehouse: getOptionalConfigFromEnv('ICEBERG_WAREHOUSE') || '',
+    icebergShards: getOptionalConfigFromEnv('ICEBERG_SHARDS')?.trim().split(',') || [],
     icebergCatalogUrl:
       getOptionalConfigFromEnv('ICEBERG_CATALOG_URL') ||
       `https://s3tables.ap-southeast-1.amazonaws.com/iceberg/v1`,
@@ -531,6 +606,12 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     ),
     icebergMaxTableCount: parseInt(getOptionalConfigFromEnv('ICEBERG_MAX_TABLES') || '10', 10),
     icebergS3DeleteEnabled: getOptionalConfigFromEnv('ICEBERG_S3_DELETE_ENABLED') === 'true',
+
+    vectorEnabled: getOptionalConfigFromEnv('VECTOR_ENABLED') === 'true',
+    vectorS3Buckets: getOptionalConfigFromEnv('VECTOR_S3_BUCKETS')?.trim()?.split(',') || [],
+    vectorBucketRegion: getOptionalConfigFromEnv('VECTOR_BUCKET_REGION') || undefined,
+    vectorMaxBucketsCount: parseInt(getOptionalConfigFromEnv('VECTOR_MAX_BUCKETS') || '10', 10),
+    vectorMaxIndexesCount: parseInt(getOptionalConfigFromEnv('VECTOR_MAX_INDEXES') || '20', 10),
   } as StorageConfigType
 
   const serviceKey = getOptionalConfigFromEnv('SERVICE_KEY') || ''
@@ -566,4 +647,28 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
   }
 
   return config
+}
+
+function envNumber(value: string | undefined, defaultValue?: number): number | undefined {
+  if (!value) {
+    return defaultValue
+  }
+  const parsed = parseInt(value, 10)
+  if (isNaN(parsed)) {
+    return defaultValue
+  }
+  return parsed
+}
+
+function envSampleRate(value: string | undefined, defaultValue: number): number {
+  if (!value) {
+    return defaultValue
+  }
+
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) {
+    return defaultValue
+  }
+
+  return Math.min(Math.max(parsed, 0), 1)
 }

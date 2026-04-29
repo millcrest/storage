@@ -1,67 +1,91 @@
-import { Knex } from 'knex'
 import { ERRORS } from '@internal/errors'
-import { IcebergCatalog } from '@storage/schemas'
+import { hashStringToInt } from '@internal/hashing'
 import { DBError } from '@storage/database'
-import { DropTableRequest } from '@storage/protocols/iceberg/catalog'
+import { IcebergCatalog } from '@storage/schemas'
+import { Knex } from 'knex'
 
-export interface AssignInterfaceParams {
+export interface CreateNamespaceParams {
   name: string
+  bucketName: string
   bucketId: string
   tenantId?: string
+  metadata: Record<string, string | number>
 }
 
 export interface ListNamespaceParams {
   tenantId?: string
-  bucketId: string
+  catalogId: string
 }
 
 export interface NamespaceIndex {
   id: string
   name: string
-  bucket_id: string
+  catalog_id: string
+  bucket_name: string
   tenant_id?: string
+  metadata?: Record<string, string | number>
 }
 
 export interface Catalog {
   id: string
+  name: string
   tenant_id?: string
 }
 
 export interface TableIndex {
   id: string
   name: string
-  bucket_id: string
+  catalog_id: string
+  bucket_name: string
   namespace_id: string
   location: string
   tenant_id?: string
+  shard_key?: string
+  shard_id?: string
+  remote_table_id?: string
 }
 
 export interface DropNamespaceParams {
   namespace: string
-  bucketId: string
+  catalogId: string
   tenantId?: string
 }
 
 export interface CreateTableParams {
   name: string
   bucketId: string
+  bucketName: string
   namespaceId: string
   tenantId?: string
+  shardKey?: string
+  shardId?: string
   location: string
+  remoteTableId?: string
 }
 
-export interface Metastore {
-  assignNamespace(params: AssignInterfaceParams): Promise<NamespaceIndex>
+export interface Metastore<Tnx = unknown> {
+  createNamespace(params: CreateNamespaceParams): Promise<NamespaceIndex>
   listNamespaces(params: ListNamespaceParams): Promise<NamespaceIndex[]>
   dropNamespace(params: DropNamespaceParams): Promise<void>
+  dropCatalog(params: { tenantId?: string; bucketId: string }): Promise<boolean>
+
   createTable(params: CreateTableParams): Promise<TableIndex>
-  dropTable(params: DropTableRequest): Promise<void>
+  dropTable(params: {
+    name: string
+    namespaceId: string
+    catalogId: string
+    tenantId: string
+  }): Promise<void>
   findTableByLocation(params: { tenantId?: string; location: string }): Promise<TableIndex>
   findTableById(params: { tenantId?: string; namespaceId: string; id: string }): Promise<TableIndex>
-  findTableByName(params: { tenantId?: string; name: string }): Promise<TableIndex>
+  findTableByName(params: {
+    tenantId?: string
+    name: string
+    namespaceId: string
+  }): Promise<TableIndex>
   findNamespaceByName(params: {
     tenantId: string
-    bucketId: string
+    catalogId: string
     name: string
   }): Promise<NamespaceIndex>
   transaction<T>(
@@ -69,7 +93,7 @@ export interface Metastore {
     opts?: { isolationLevel?: Knex.IsolationLevels }
   ): Promise<T>
 
-  assignCatalog(param: { bucketId: string; tenantId: string }): Promise<any>
+  assignCatalog(param: { bucketName: string; tenantId: string }): Promise<any>
   countCatalogs(params: { tenantId: string; limit: number }): Promise<number>
   countNamespaces(param: { tenantId: string; limit: number }): Promise<number>
   countTables(params: { namespaceId: string; tenantId?: string; limit: number }): Promise<number>
@@ -77,20 +101,87 @@ export interface Metastore {
     tenantId?: string
     limit: number
   }): Promise<{ namespaces: number; tables: number }>
-  findCatalogById(param: { tenantId: string; id: string }): Promise<IcebergCatalog>
+  findCatalogByName(param: {
+    tenantId: string
+    name: string
+    deleted?: boolean
+  }): Promise<IcebergCatalog>
+
+  findCatalogById(param: {
+    tenantId: string
+    id: string
+    deleted?: boolean
+  }): Promise<IcebergCatalog>
 
   listTables(param: {
     tenantId: string
     pageSize: number | undefined
     namespaceId: string
   }): Promise<TableIndex[]>
+
+  lockResource(resourceType: string, resourceId: string): Promise<void>
+
+  getTnx(): Tnx
 }
 
-export class KnexMetastore implements Metastore {
+export class KnexMetastore implements Metastore<Knex.Transaction> {
   constructor(
     private readonly db: Knex | Knex.Transaction,
     private readonly ops: { schema: string; multiTenant?: boolean }
   ) {}
+
+  lockResource(resourceType: string, resourceId: string): Promise<void> {
+    const lockId = hashStringToInt(`${resourceType}:${resourceId}`)
+    return this.db.raw('SELECT pg_advisory_xact_lock(?::bigint)', [lockId]).then(() => {})
+  }
+
+  getTnx() {
+    if (this.db.isTransaction) {
+      return this.db as Knex.Transaction
+    }
+
+    throw new Error('Not in a transaction')
+  }
+
+  async dropCatalog(params: {
+    tenantId?: string | undefined
+    bucketId: string
+    soft?: boolean
+  }): Promise<boolean> {
+    const table = this.ops.multiTenant ? 'iceberg_catalogs' : 'buckets_analytics'
+
+    if (params.soft) {
+      const query = this.db
+        .withSchema(this.ops.schema)
+        .table(table)
+        .andWhere('id', params.bucketId)
+        .update({
+          deleted_at: new Date(),
+        })
+
+      if (this.ops.multiTenant) {
+        query.andWhere('tenant_id', params.tenantId)
+      }
+
+      const n = await query
+
+      return n > 0
+    }
+
+    const query = this.db
+      .withSchema(this.ops.schema)
+      .table(table)
+      .andWhere('id', params.bucketId)
+      .del()
+
+    if (this.ops.multiTenant) {
+      query.andWhere('tenant_id', params.tenantId)
+    }
+
+    const del = await query
+
+    return del > 0
+  }
 
   listTables(param: {
     tenantId: string
@@ -100,7 +191,7 @@ export class KnexMetastore implements Metastore {
     const query = this.db
       .withSchema(this.ops.schema)
       .table('iceberg_tables')
-      .select<TableIndex[]>('id', 'name', 'namespace_id')
+      .select<TableIndex[]>('id', 'name', 'namespace_id', 'shard_id', 'shard_key')
       .where('namespace_id', param.namespaceId)
 
     if (this.ops.multiTenant) {
@@ -123,25 +214,23 @@ export class KnexMetastore implements Metastore {
     const countNamespaces = this.db
       .withSchema(this.ops.schema)
       .table('iceberg_namespaces')
-      .where('bucket_id', params.bucketId)
+      .where('bucket_name', params.bucketId)
       .limit(params.limit)
       .count<{ count: string }>('id as n_count')
 
     if (this.ops.multiTenant) {
       countNamespaces.andWhere('tenant_id', params.tenantId)
-      countNamespaces.select('tenant_id')
     }
 
     const countTables = this.db
       .withSchema(this.ops.schema)
       .table('iceberg_tables')
-      .where('bucket_id', params.bucketId)
+      .where('bucket_name', params.bucketId)
       .limit(params.limit)
       .count<{ count: string }>('id as t_count')
 
     if (this.ops.multiTenant) {
       countTables.andWhere('tenant_id', params.tenantId)
-      countTables.select('tenant_id')
     }
 
     const resultQuery = this.db
@@ -179,13 +268,18 @@ export class KnexMetastore implements Metastore {
     return query.first<TableIndex>()
   }
 
-  async dropTable(params: DropTableRequest): Promise<void> {
+  async dropTable(params: {
+    name: string
+    namespaceId: string
+    catalogId: string
+    tenantId: string
+  }): Promise<void> {
     const query = this.db
       .withSchema(this.ops.schema)
       .table('iceberg_tables')
-      .where('name', params.table)
-      .andWhere('namespace_id', params.namespace)
-      .andWhere('bucket_id', params.warehouse)
+      .where('name', params.name)
+      .andWhere('namespace_id', params.namespaceId)
+      .andWhere('catalog_id', params.catalogId)
 
     if (this.ops.multiTenant) {
       query.andWhere('tenant_id', params.tenantId)
@@ -194,22 +288,33 @@ export class KnexMetastore implements Metastore {
     return query.del()
   }
 
-  async findCatalogById(param: { tenantId: string; id: string }): Promise<IcebergCatalog> {
+  async findCatalogByName(param: {
+    tenantId: string
+    name: string
+    deleted?: boolean
+  }): Promise<IcebergCatalog> {
     const table = this.ops.multiTenant ? 'iceberg_catalogs' : 'buckets_analytics'
 
-    const query = this.db.withSchema(this.ops.schema).table(table).select<IcebergCatalog[]>('id')
+    const query = this.db
+      .withSchema(this.ops.schema)
+      .table(table)
+      .select<IcebergCatalog[]>('id', 'name')
+
+    if (!param.deleted) {
+      query.andWhere('deleted_at', null)
+    }
 
     if (this.ops.multiTenant) {
       query.select('tenant_id')
       query.andWhere('tenant_id', param.tenantId)
     }
 
-    query.andWhere('id', param.id)
+    query.andWhere('name', param.name)
 
     const result = await query.first<IcebergCatalog>()
 
     if (!result) {
-      throw ERRORS.NoSuchCatalog(param.id)
+      throw ERRORS.NoSuchCatalog(param.name)
     }
     return result
   }
@@ -229,12 +334,17 @@ export class KnexMetastore implements Metastore {
     return parseInt(result?.count || '0', 10)
   }
 
-  async assignCatalog(params: { bucketId: string; tenantId: string }): Promise<Catalog> {
+  async assignCatalog(params: {
+    bucketName: string
+    bucketId: string
+    tenantId: string
+  }): Promise<Catalog> {
     const catalog: Catalog = {
       id: params.bucketId,
+      name: params.bucketName,
     }
 
-    const conflictColumns = ['id']
+    const conflictColumns = ['name']
     if (this.ops.multiTenant) {
       catalog['tenant_id'] = params.tenantId
       conflictColumns.push('tenant_id')
@@ -243,14 +353,14 @@ export class KnexMetastore implements Metastore {
       .withSchema(this.ops.schema)
       .table('iceberg_catalogs')
       .insert(catalog)
-      .onConflict(conflictColumns)
+      .onConflict(this.db.raw(`(${conflictColumns.join(', ')}) WHERE deleted_at IS NULL`))
       .merge({
         updated_at: new Date(),
       })
       .returning<Catalog[]>('*')
 
     if (result.length === 0) {
-      throw ERRORS.NoSuchKey(params.bucketId)
+      throw ERRORS.NoSuchKey(params.bucketName)
     }
 
     return {
@@ -282,12 +392,12 @@ export class KnexMetastore implements Metastore {
   async findNamespaceByName(params: {
     tenantId: string
     name: string
-    bucketId: string
+    catalogId: string
   }): Promise<NamespaceIndex> {
     const query = this.db
       .withSchema(this.ops.schema)
       .table('iceberg_namespaces')
-      .select<NamespaceIndex[]>('id', 'name', 'bucket_id')
+      .select<NamespaceIndex[]>('id', 'name', 'bucket_name', 'metadata')
 
     if (this.ops.multiTenant) {
       query.select('tenant_id')
@@ -295,7 +405,7 @@ export class KnexMetastore implements Metastore {
     }
 
     query.andWhere('name', params.name)
-    query.andWhere('bucket_id', params.bucketId)
+    query.andWhere('catalog_id', params.catalogId)
 
     const result = await query.first<NamespaceIndex>()
 
@@ -305,27 +415,39 @@ export class KnexMetastore implements Metastore {
     return result
   }
 
-  dropNamespace(params: DropNamespaceParams): Promise<void> {
+  async dropNamespace(params: DropNamespaceParams): Promise<void> {
     const query = this.db
       .withSchema(this.ops.schema)
       .table('iceberg_namespaces')
       .where('name', params.namespace)
-      .andWhere('bucket_id', params.bucketId)
+      .andWhere('catalog_id', params.catalogId)
 
     if (this.ops.multiTenant) {
       query.andWhere('tenant_id', params.tenantId)
     }
 
-    return query.del()
+    try {
+      await query.del()
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (error.message.includes('RESTRICT') || error.message.includes('foreign key constraint'))
+      ) {
+        throw ERRORS.IcebergResourceNotEmpty('namespace', params.namespace)
+      }
+      throw DBError.fromError(error)
+    }
   }
 
-  async assignNamespace(params: AssignInterfaceParams) {
+  async createNamespace(params: CreateNamespaceParams) {
     const namespaceIndex: Omit<NamespaceIndex, 'id'> = {
       name: params.name,
-      bucket_id: params.bucketId,
+      catalog_id: params.bucketId,
+      bucket_name: params.bucketName,
+      metadata: params.metadata,
     }
 
-    const conflictColumns = ['bucket_id', 'name']
+    const conflictColumns = ['catalog_id', 'name']
     if (this.ops.multiTenant) {
       namespaceIndex['tenant_id'] = params.tenantId
       conflictColumns.unshift('tenant_id')
@@ -354,14 +476,14 @@ export class KnexMetastore implements Metastore {
     const query = this.db
       .withSchema(this.ops.schema)
       .table('iceberg_namespaces')
-      .select<NamespaceIndex[]>('name', 'bucket_id')
+      .select<NamespaceIndex[]>('id', 'name', 'bucket_name')
 
     if (this.ops.multiTenant) {
       query.select('tenant_id')
       query.andWhere('tenant_id', params.tenantId)
     }
 
-    query.andWhere('bucket_id', params.bucketId)
+    query.andWhere('catalog_id', params.catalogId)
 
     return query
   }
@@ -369,12 +491,16 @@ export class KnexMetastore implements Metastore {
   async createTable(params: CreateTableParams) {
     const tableIndex: Omit<TableIndex, 'id'> = {
       name: params.name,
-      bucket_id: params.bucketId,
+      catalog_id: params.bucketId,
+      bucket_name: params.bucketName,
       namespace_id: params.namespaceId,
       location: params.location,
+      shard_key: params.shardKey,
+      shard_id: params.shardId,
+      remote_table_id: params.remoteTableId,
     }
 
-    const conflictColumns = ['name', 'namespace_id']
+    const conflictColumns = ['catalog_id', 'name', 'namespace_id']
     if (this.ops.multiTenant) {
       tableIndex['tenant_id'] = params.tenantId
       conflictColumns.unshift('tenant_id')
@@ -402,7 +528,7 @@ export class KnexMetastore implements Metastore {
     const query = this.db
       .withSchema(this.ops.schema)
       .table('iceberg_tables')
-      .select<TableIndex[]>('id', 'name', 'namespace_id', 'location')
+      .select<TableIndex[]>('id', 'name', 'namespace_id', 'location', 'shard_key', 'shard_id')
       .where('namespace_id', params.namespaceId)
 
     if (this.ops.multiTenant) {
@@ -421,11 +547,11 @@ export class KnexMetastore implements Metastore {
     return result
   }
 
-  async findTableByName(params: { tenantId: string; name: string }) {
+  async findTableByName(params: { tenantId: string; name: string; namespaceId: string }) {
     const query = this.db
       .withSchema(this.ops.schema)
       .table('iceberg_tables')
-      .select<TableIndex[]>('id', 'name', 'namespace_id', 'location')
+      .select<TableIndex[]>('id', 'name', 'namespace_id', 'location', 'shard_key', 'shard_id')
 
     if (this.ops.multiTenant) {
       query.select('tenant_id')
@@ -433,6 +559,7 @@ export class KnexMetastore implements Metastore {
     }
 
     query.andWhere('name', params.name)
+    query.andWhere('namespace_id', params.namespaceId)
 
     const result = await query.first<TableIndex>()
 
@@ -472,5 +599,36 @@ export class KnexMetastore implements Metastore {
 
     const result = await query.first<{ count: string }>()
     return parseInt(result?.count || '0', 10)
+  }
+
+  async findCatalogById(param: {
+    id: string
+    tenantId: string
+    deleted?: boolean
+  }): Promise<IcebergCatalog> {
+    const table = this.ops.multiTenant ? 'iceberg_catalogs' : 'buckets_analytics'
+
+    const query = this.db
+      .withSchema(this.ops.schema)
+      .table(table)
+      .select<IcebergCatalog[]>('id', 'name')
+
+    if (this.ops.multiTenant) {
+      query.select('tenant_id')
+      query.andWhere('tenant_id', param.tenantId)
+    }
+
+    query.andWhere('id', param.id)
+
+    if (!param.deleted) {
+      query.andWhere('deleted_at', null)
+    }
+
+    const catalog = await query.first<IcebergCatalog>()
+
+    if (!catalog) {
+      throw ERRORS.NoSuchCatalog(param.id)
+    }
+    return catalog
   }
 }

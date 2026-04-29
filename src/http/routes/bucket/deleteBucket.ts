@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
+import { registerJsonParserAllowingEmptyBody } from '../../plugins/empty-json-body'
 import { createDefaultSchema, createResponse } from '../../routes-helper'
 import { AuthenticatedRequest } from '../../types'
 import { ROUTE_OPERATIONS } from '../operations'
@@ -12,18 +13,6 @@ const deleteBucketParamsSchema = {
   required: ['bucketId'],
 } as const
 
-const deleteBucketQuerySchema = {
-  type: 'object',
-  properties: {
-    type: {
-      type: 'string',
-      enum: ['ANALYTICS', 'STANDARD'],
-      default: 'STANDARD',
-    },
-  },
-  required: [],
-} as const
-
 const successResponseSchema = {
   type: 'object',
   properties: {
@@ -32,7 +21,6 @@ const successResponseSchema = {
 }
 interface deleteBucketRequestInterface extends AuthenticatedRequest {
   Params: FromSchema<typeof deleteBucketParamsSchema>
-  Querystring: FromSchema<typeof deleteBucketQuerySchema>
 }
 
 export default async function routes(fastify: FastifyInstance) {
@@ -42,19 +30,24 @@ export default async function routes(fastify: FastifyInstance) {
     summary,
     tags: ['bucket'],
   })
-  fastify.delete<deleteBucketRequestInterface>(
-    '/:bucketId',
-    {
-      schema,
-      config: {
-        operation: { type: ROUTE_OPERATIONS.DELETE_BUCKET },
-      },
-    },
-    async (request, response) => {
-      const { bucketId } = request.params
-      await request.storage.deleteBucket(bucketId, request.query.type)
 
-      return response.status(200).send(createResponse('Successfully deleted'))
-    }
-  )
+  fastify.register(async (f) => {
+    registerJsonParserAllowingEmptyBody(f)
+
+    f.delete<deleteBucketRequestInterface>(
+      '/:bucketId',
+      {
+        schema,
+        config: {
+          operation: { type: ROUTE_OPERATIONS.DELETE_BUCKET },
+        },
+      },
+      async (request, response) => {
+        const { bucketId } = request.params
+        await request.storage.deleteBucket(bucketId)
+
+        return response.status(200).send(createResponse('Successfully deleted'))
+      }
+    )
+  })
 }

@@ -1,11 +1,9 @@
-import { FromSchema } from 'json-schema-to-ts'
-import { FastifyInstance } from 'fastify'
-
 import { SignedToken, verifyJWT } from '@internal/auth'
 import { getJwtSecret, getTenantConfig } from '@internal/database'
 import { ERRORS } from '@internal/errors'
-
 import { ImageRenderer } from '@storage/renderer'
+import { FastifyInstance } from 'fastify'
+import { FromSchema } from 'json-schema-to-ts'
 import { getConfig } from '../../../config'
 import { ROUTE_OPERATIONS } from '../operations'
 
@@ -83,7 +81,7 @@ export default async function routes(fastify: FastifyInstance) {
       const obj = await request.storage
         .asSuperUser()
         .from(bucketName)
-        .findObject(objParts.join('/'), 'id,version')
+        .findObject(objParts.join('/'), 'id,version,metadata')
 
       const renderer = request.storage.renderer('image') as ImageRenderer
 
@@ -102,6 +100,7 @@ export default async function routes(fastify: FastifyInstance) {
           version: obj.version,
           download,
           expires: new Date(exp * 1000).toUTCString(),
+          xRobotsTag: obj.metadata?.['xRobotsTag'] as string | undefined,
           signal: request.signals.disconnect.signal,
         })
     }
