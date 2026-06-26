@@ -80,6 +80,22 @@ async function loadPoolModule(
   return import('./pool')
 }
 
+async function loadPoolModuleWithConfig(
+  configOverrides: Record<string, unknown> = {}
+): Promise<PoolModule> {
+  vi.resetModules()
+  vi.doUnmock('@internal/cache')
+
+  const configModule = await import('../../config')
+  configModule.getConfig({ reload: true })
+  configModule.mergeConfig({
+    isMultitenant: true,
+    ...configOverrides,
+  } as Parameters<typeof configModule.mergeConfig>[0])
+
+  return import('./pool')
+}
+
 describe('PoolManager cache lifecycle', () => {
   beforeAll(() => {
     vi.useFakeTimers()
@@ -137,6 +153,35 @@ describe('PoolManager cache lifecycle', () => {
     await poolManager.destroyAll()
   })
 
+  test('uses the configured tenant pool cache ttl', async () => {
+    const poolModule = await loadPoolModuleWithConfig({
+      tenantPoolCacheTtlMs: 20,
+    })
+
+    class TestPoolManager extends poolModule.PoolManager {
+      created: TestPool[] = []
+
+      protected newPool(_settings: TenantConnectionOptions): PoolStrategy {
+        const pool = createTestPool()
+        this.created.push(pool)
+        return pool
+      }
+    }
+
+    const poolManager = new TestPoolManager()
+    const settings = createPoolSettings('tenant-configured-cache-ttl')
+
+    const first = poolManager.getPool(settings)
+
+    await vi.advanceTimersByTimeAsync(40)
+
+    expect(poolManager.created[0].destroy).toHaveBeenCalledTimes(1)
+    expect(poolManager.getPool(settings)).not.toBe(first)
+    expect(poolManager.created).toHaveLength(2)
+
+    await poolManager.destroyAll()
+  })
+
   test('refreshes pool ttl when an existing pool is reused', async () => {
     const poolModule = await loadPoolModule(25)
 
@@ -181,7 +226,7 @@ describe('PoolManager cache lifecycle', () => {
   test('records logical pool cache misses and hits', async () => {
     const poolModule = await loadPoolModule(10_000)
     const metricsModule = await import('@internal/monitoring/metrics')
-    const addSpy = vi.spyOn(metricsModule.cacheRequestsTotal, 'add')
+    const recordSpy = vi.spyOn(metricsModule, 'recordCacheRequest')
 
     class TestPoolManager extends poolModule.PoolManager {
       created: TestPool[] = []
@@ -201,14 +246,41 @@ describe('PoolManager cache lifecycle', () => {
 
     expect(second).toBe(first)
     expect(poolManager.created).toHaveLength(1)
-    expect(addSpy.mock.calls).toEqual(
+    expect(recordSpy.mock.calls).toEqual(
       expect.arrayContaining([
-        [1, { cache: TENANT_POOL_CACHE_NAME, outcome: 'miss' }],
-        [1, { cache: TENANT_POOL_CACHE_NAME, outcome: 'hit' }],
+        [TENANT_POOL_CACHE_NAME, 'miss'],
+        [TENANT_POOL_CACHE_NAME, 'hit'],
       ])
     )
 
     await poolManager.destroyAll()
+  })
+
+  test('shares cached tenant pools across manager instances', async () => {
+    const poolModule = await loadPoolModule(10_000)
+
+    class TestPoolManager extends poolModule.PoolManager {
+      created: TestPool[] = []
+
+      protected newPool(_settings: TenantConnectionOptions): PoolStrategy {
+        const pool = createTestPool()
+        this.created.push(pool)
+        return pool
+      }
+    }
+
+    const firstManager = new TestPoolManager()
+    const secondManager = new TestPoolManager()
+    const settings = createPoolSettings('tenant-shared-manager-cache')
+
+    const first = firstManager.getPool(settings)
+    const second = secondManager.getPool(settings)
+
+    expect(second).toBe(first)
+    expect(firstManager.created).toHaveLength(1)
+    expect(secondManager.created).toHaveLength(0)
+
+    await secondManager.destroyAll()
   })
 
   test('logs sampled tenant pool cache misses and hits', async () => {
@@ -244,9 +316,7 @@ describe('PoolManager cache lifecycle', () => {
       outcome: 'miss',
       sampleRate: 1,
       sampleWeight: 1,
-      isCacheable: true,
       isExternalPool: false,
-      isSingleUse: false,
     })
     const expectedHitLog = expect.objectContaining({
       type: poolModule.TENANT_POOL_CACHE_LOOKUP_LOG_TYPE,
@@ -256,9 +326,7 @@ describe('PoolManager cache lifecycle', () => {
       outcome: 'hit',
       sampleRate: 1,
       sampleWeight: 1,
-      isCacheable: true,
       isExternalPool: false,
-      isSingleUse: false,
     })
 
     expect(second).toBe(first)
@@ -342,8 +410,10 @@ describe('PoolManager cache lifecycle', () => {
     await poolManager.destroyAll()
   })
 
-  test('does not log single-use external pool lookups without a cached pool', async () => {
-    const poolModule = await loadPoolModule(10_000)
+  test('logs sampled external pool cache misses', async () => {
+    const poolModule = await loadPoolModule(10_000, undefined, {
+      tenantPoolCacheMissLogSampleRate: 1,
+    })
     const loggerModule = await import('@internal/monitoring/logger')
     const infoSpy = vi.spyOn(loggerModule.logger, 'info').mockImplementation(() => undefined)
 
@@ -358,9 +428,18 @@ describe('PoolManager cache lifecycle', () => {
     }
 
     const poolManager = new TestPoolManager()
-    const pool = poolManager.getPool({
-      ...createPoolSettings('tenant-single-use-external-log'),
-      isSingleUse: true,
+    const expectedMissLog = expect.objectContaining({
+      type: poolModule.TENANT_POOL_CACHE_LOOKUP_LOG_TYPE,
+      cache: TENANT_POOL_CACHE_NAME,
+      tenantId: 'tenant-external-pool-log',
+      project: 'tenant-external-pool-log',
+      outcome: 'miss',
+      sampleRate: 1,
+      sampleWeight: 1,
+      isExternalPool: true,
+    })
+    poolManager.getPool({
+      ...createPoolSettings('tenant-external-pool-log'),
       isExternalPool: true,
     })
 
@@ -368,16 +447,15 @@ describe('PoolManager cache lifecycle', () => {
       infoSpy.mock.calls.filter(
         isTenantPoolCacheLookupCall(poolModule.TENANT_POOL_CACHE_LOOKUP_LOG_MESSAGE)
       )
-    ).toEqual([])
+    ).toEqual([[expectedMissLog, poolModule.TENANT_POOL_CACHE_LOOKUP_LOG_MESSAGE]])
 
-    await pool.destroy()
     await poolManager.destroyAll()
   })
 
   test('records pool cache evictions when inactivity ttl removes cached pools', async () => {
     const poolModule = await loadPoolModule(20)
     const metricsModule = await import('@internal/monitoring/metrics')
-    const evictionSpy = vi.spyOn(metricsModule.cacheEvictionsTotal, 'add')
+    const evictionSpy = vi.spyOn(metricsModule, 'recordCacheEviction')
 
     class TestPoolManager extends poolModule.PoolManager {
       created: TestPool[] = []
@@ -394,9 +472,7 @@ describe('PoolManager cache lifecycle', () => {
 
     await vi.advanceTimersByTimeAsync(40)
 
-    expect(evictionSpy).toHaveBeenCalledWith(1, {
-      cache: TENANT_POOL_CACHE_NAME,
-    })
+    expect(evictionSpy).toHaveBeenCalledWith(TENANT_POOL_CACHE_NAME)
     expect(poolManager.created[0].destroy).toHaveBeenCalledTimes(1)
 
     await poolManager.destroyAll()
@@ -405,7 +481,7 @@ describe('PoolManager cache lifecycle', () => {
   test('records pool cache evictions when capacity removes cached pools', async () => {
     const poolModule = await loadPoolModule(10_000, 1)
     const metricsModule = await import('@internal/monitoring/metrics')
-    const evictionSpy = vi.spyOn(metricsModule.cacheEvictionsTotal, 'add')
+    const evictionSpy = vi.spyOn(metricsModule, 'recordCacheEviction')
 
     class TestPoolManager extends poolModule.PoolManager {
       created: TestPool[] = []
@@ -421,9 +497,7 @@ describe('PoolManager cache lifecycle', () => {
     poolManager.getPool(createPoolSettings('tenant-cache-capacity-eviction-a'))
     poolManager.getPool(createPoolSettings('tenant-cache-capacity-eviction-b'))
 
-    expect(evictionSpy).toHaveBeenCalledWith(1, {
-      cache: TENANT_POOL_CACHE_NAME,
-    })
+    expect(evictionSpy).toHaveBeenCalledWith(TENANT_POOL_CACHE_NAME)
     expect(poolManager.created[0].destroy).toHaveBeenCalledTimes(1)
 
     await poolManager.destroyAll()
@@ -432,7 +506,7 @@ describe('PoolManager cache lifecycle', () => {
   test('does not record pool cache evictions for explicit destroys', async () => {
     const poolModule = await loadPoolModule(10_000)
     const metricsModule = await import('@internal/monitoring/metrics')
-    const evictionSpy = vi.spyOn(metricsModule.cacheEvictionsTotal, 'add')
+    const evictionSpy = vi.spyOn(metricsModule, 'recordCacheEviction')
 
     class TestPoolManager extends poolModule.PoolManager {
       created: TestPool[] = []
@@ -451,20 +525,15 @@ describe('PoolManager cache lifecycle', () => {
     await poolManager.destroy('tenant-cache-explicit-destroy-a')
     await poolManager.destroyAll()
 
-    expect(evictionSpy.mock.calls).not.toContainEqual([
-      1,
-      {
-        cache: TENANT_POOL_CACHE_NAME,
-      },
-    ])
+    expect(evictionSpy).not.toHaveBeenCalledWith(TENANT_POOL_CACHE_NAME)
     expect(poolManager.created[0].destroy).toHaveBeenCalledTimes(1)
     expect(poolManager.created[1].destroy).toHaveBeenCalledTimes(1)
   })
 
-  test('does not record pool cache misses for single-use external pools without cached pools', async () => {
+  test('caches external pools across lookups and records miss then hit', async () => {
     const poolModule = await loadPoolModule(10_000)
     const metricsModule = await import('@internal/monitoring/metrics')
-    const addSpy = vi.spyOn(metricsModule.cacheRequestsTotal, 'add')
+    const recordSpy = vi.spyOn(metricsModule, 'recordCacheRequest')
 
     class TestPoolManager extends poolModule.PoolManager {
       created: TestPool[] = []
@@ -478,55 +547,19 @@ describe('PoolManager cache lifecycle', () => {
 
     const poolManager = new TestPoolManager()
     const settings = {
-      ...createPoolSettings('tenant-single-use-external'),
-      isSingleUse: true,
+      ...createPoolSettings('tenant-external-pool-cache'),
       isExternalPool: true,
     }
 
     const first = poolManager.getPool(settings)
     const second = poolManager.getPool(settings)
 
-    expect(second).not.toBe(first)
-    expect(poolManager.created).toHaveLength(2)
-    expect(
-      addSpy.mock.calls.filter(([, attrs]) => {
-        return attrs && typeof attrs === 'object' && attrs.cache === TENANT_POOL_CACHE_NAME
-      })
-    ).toEqual([])
-
-    await Promise.all([first.destroy(), second.destroy()])
-    await poolManager.destroyAll()
-  })
-
-  test('reuses cached pools for single-use external requests and records a hit', async () => {
-    const poolModule = await loadPoolModule(10_000)
-    const metricsModule = await import('@internal/monitoring/metrics')
-    const addSpy = vi.spyOn(metricsModule.cacheRequestsTotal, 'add')
-
-    class TestPoolManager extends poolModule.PoolManager {
-      created: TestPool[] = []
-
-      protected newPool(_settings: TenantConnectionOptions): PoolStrategy {
-        const pool = createTestPool()
-        this.created.push(pool)
-        return pool
-      }
-    }
-
-    const poolManager = new TestPoolManager()
-    const tenantId = 'tenant-single-use-external-reuses-cache'
-    const cachedPool = poolManager.getPool(createPoolSettings(tenantId))
-    addSpy.mockClear()
-
-    const reusedPool = poolManager.getPool({
-      ...createPoolSettings(tenantId),
-      isSingleUse: true,
-      isExternalPool: true,
-    })
-
-    expect(reusedPool).toBe(cachedPool)
+    expect(second).toBe(first)
     expect(poolManager.created).toHaveLength(1)
-    expect(addSpy.mock.calls).toEqual([[1, { cache: TENANT_POOL_CACHE_NAME, outcome: 'hit' }]])
+    expect(recordSpy.mock.calls.filter(([cache]) => cache === TENANT_POOL_CACHE_NAME)).toEqual([
+      [TENANT_POOL_CACHE_NAME, 'miss'],
+      [TENANT_POOL_CACHE_NAME, 'hit'],
+    ])
 
     await poolManager.destroyAll()
   })
@@ -613,6 +646,35 @@ describe('PoolManager cache lifecycle', () => {
     const recreated = poolManager.getPool(createPoolSettings('tenant-c'))
 
     expect(recreated).not.toBe(first)
+  })
+
+  test('passes all tenant rebalance options to the cached pool', async () => {
+    const poolModule = await loadPoolModule(10_000)
+
+    class TestPoolManager extends poolModule.PoolManager {
+      created: Record<string, TestPool> = {}
+
+      protected newPool(settings: TenantConnectionOptions): PoolStrategy {
+        const pool = createTestPool()
+        this.created[settings.tenantId] = pool
+        return pool
+      }
+    }
+
+    const poolManager = new TestPoolManager()
+    const pool = poolManager.getPool(createPoolSettings('tenant-rebalance-options'))
+
+    poolManager.rebalance('tenant-rebalance-options', {
+      clusterSize: 3,
+      maxConnections: 14,
+    })
+
+    expect(pool.rebalance).toHaveBeenCalledWith({
+      clusterSize: 3,
+      maxConnections: 14,
+    })
+
+    await poolManager.destroyAll()
   })
 
   test('propagates explicit destroy failures without double-destroying pools', async () => {

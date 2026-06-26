@@ -16,7 +16,11 @@ import { DBMigration } from '@internal/database/migrations'
 import { randomUUID } from 'crypto'
 import type { FastifyInstance } from 'fastify'
 import { mergeConfig } from '../config'
-import { multitenantKnex } from '../internal/database/multitenant-db'
+import {
+  closeMultitenantPg,
+  MIGRATION_ADMIN_JOB_LIMIT,
+  multitenantPgExecutor,
+} from '../internal/database'
 import { PG_BOSS_SCHEMA, Queue } from '../internal/queue/queue'
 import { RunMigrationsOnTenants } from '../storage/events/migrations/run-migrations'
 import { createAdminApp } from './common'
@@ -43,6 +47,98 @@ function trackJobId(jobId: string) {
 
 let adminApp: FastifyInstance
 
+type JobRow = {
+  id: string
+  name: string
+  state: string
+  created_on?: Date
+  data: object
+}
+
+async function insertJobs(jobs: JobRow | JobRow[]) {
+  const rows = Array.isArray(jobs) ? jobs : [jobs]
+
+  if (rows.length === 0) {
+    return
+  }
+
+  await multitenantPgExecutor.query({
+    text: `
+      INSERT INTO ${pgBossJobTable} (id, name, state, created_on, data)
+      SELECT id, name, state, COALESCE(created_on, now()), data
+      FROM unnest(
+        $1::uuid[],
+        $2::text[],
+        $3::text[],
+        $4::timestamptz[],
+        $5::jsonb[]
+      ) AS input(id, name, state, created_on, data)
+    `,
+    values: [
+      rows.map((job) => job.id),
+      rows.map((job) => job.name),
+      rows.map((job) => job.state),
+      rows.map((job) => job.created_on || null),
+      rows.map((job) => JSON.stringify(job.data)),
+    ],
+  })
+}
+
+async function deleteJobs(jobIds: string[]) {
+  await multitenantPgExecutor.query({
+    text: `DELETE FROM ${pgBossJobTable} WHERE id = ANY($1::uuid[])`,
+    values: [jobIds],
+  })
+}
+
+async function getJobs<T extends { id: string } = { id: string }>(
+  columns: string,
+  jobIds: string[]
+): Promise<T[]> {
+  const result = await multitenantPgExecutor.query<T>({
+    text: `
+      SELECT ${columns}
+      FROM ${pgBossJobTable}
+      WHERE id = ANY($1::uuid[])
+    `,
+    values: [jobIds],
+  })
+
+  return result.rows
+}
+
+async function updateTenant(
+  currentTenantId: string,
+  fields: Partial<{ migrations_version: string | null; migrations_status: string | null }>
+) {
+  const entries = Object.entries(fields)
+  await multitenantPgExecutor.query({
+    text: `
+      UPDATE tenants
+      SET ${entries.map(([column], index) => `${column} = $${index + 2}`).join(', ')}
+      WHERE id = $1
+    `,
+    values: [currentTenantId, ...entries.map(([, value]) => value)],
+  })
+}
+
+async function getTenantMigrationState(currentTenantId: string) {
+  const result = await multitenantPgExecutor.query<{
+    migrations_version: string | null
+    migrations_status: string | null
+  }>({
+    text: `
+      SELECT migrations_version, migrations_status
+      FROM tenants
+      WHERE id = $1
+      LIMIT 1
+    `,
+    values: [currentTenantId],
+  })
+
+  return result.rows[0]
+}
+
 async function createTenant(currentTenantId: string) {
   createdTenantIds.add(currentTenantId)
   const response = await adminApp.inject({
@@ -61,8 +157,8 @@ describe('Admin migrations routes', () => {
       pgQueueEnable: true,
     })
     await migrations.runMultitenantMigrations()
-    await multitenantKnex.raw(`CREATE SCHEMA IF NOT EXISTS ${PG_BOSS_SCHEMA}`)
-    await multitenantKnex.raw(`
+    await multitenantPgExecutor.query(`CREATE SCHEMA IF NOT EXISTS ${PG_BOSS_SCHEMA}`)
+    await multitenantPgExecutor.query(`
       CREATE TABLE IF NOT EXISTS ${pgBossJobTable} (
         id uuid PRIMARY KEY,
         name text NOT NULL,
@@ -79,7 +175,7 @@ describe('Admin migrations routes', () => {
     vi.clearAllMocks()
 
     if (createdJobIds.size > 0) {
-      await multitenantKnex(pgBossJobTable).whereIn('id', Array.from(createdJobIds)).delete()
+      await deleteJobs(Array.from(createdJobIds))
       createdJobIds.clear()
     }
 
@@ -97,7 +193,7 @@ describe('Admin migrations routes', () => {
 
   afterAll(async () => {
     await adminApp?.close()
-    await multitenantKnex.destroy()
+    await closeMultitenantPg()
   })
 
   test('rejects invalid markCompletedTillMigration for fleet reset', async () => {
@@ -147,7 +243,10 @@ describe('Admin migrations routes', () => {
       payload: {
         untilMigration: 'create-migrations-table' satisfies keyof typeof DBMigration,
       },
-      headers,
+      headers: {
+        ...headers,
+        'sb-request-id': 'sb-req-123',
+      },
     })
 
     expect(response.statusCode).toBe(200)
@@ -156,6 +255,27 @@ describe('Admin migrations routes', () => {
       till: 'create-migrations-table',
       markCompletedTillMigration: undefined,
       signal: expect.any(AbortSignal),
+      sbReqId: 'sb-req-123',
+    })
+  })
+
+  test('passes sbReqId to fleet migrate scheduling', async () => {
+    const runSpy = vi.mocked(migrations.runMigrationsOnAllTenants).mockResolvedValue(undefined)
+
+    const response = await adminApp.inject({
+      method: 'POST',
+      url: '/migrations/migrate/fleet',
+      headers: {
+        ...headers,
+        'sb-request-id': 'sb-req-123',
+      },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(JSON.parse(response.body)).toEqual({ message: 'Migrations scheduled' })
+    expect(runSpy).toHaveBeenCalledWith({
+      signal: expect.any(AbortSignal),
+      sbReqId: 'sb-req-123',
     })
   })
 
@@ -165,7 +285,7 @@ describe('Admin migrations routes', () => {
 
     await createTenant(migrationTenantId)
 
-    await multitenantKnex('tenants').where({ id: migrationTenantId }).update({
+    await updateTenant(migrationTenantId, {
       migrations_version: null,
       migrations_status: null,
     })
@@ -192,12 +312,7 @@ describe('Admin migrations routes', () => {
       migrationsStatus: 'COMPLETED',
     })
 
-    await expect(
-      multitenantKnex('tenants')
-        .select('migrations_version', 'migrations_status')
-        .where({ id: migrationTenantId })
-        .first()
-    ).resolves.toEqual({
+    await expect(getTenantMigrationState(migrationTenantId)).resolves.toEqual({
       migrations_version: latestMigration,
       migrations_status: 'COMPLETED',
     })
@@ -207,11 +322,11 @@ describe('Admin migrations routes', () => {
     const migrationTenantId = `admin-migrations-freeze-${randomUUID().slice(0, 8)}`
     const frozenMigration = 'create-migrations-table' satisfies keyof typeof DBMigration
     let isolatedAdminApp: FastifyInstance | undefined
-    let isolatedMultitenantKnex: typeof multitenantKnex | undefined
+    let isolatedCloseMultitenantPg: (() => Promise<void>) | undefined
 
     await createTenant(migrationTenantId)
 
-    await multitenantKnex('tenants').where({ id: migrationTenantId }).update({
+    await updateTenant(migrationTenantId, {
       migrations_version: null,
       migrations_status: null,
     })
@@ -229,8 +344,7 @@ describe('Admin migrations routes', () => {
       const isolatedMigrations = await import('@internal/database/migrations')
       vi.mocked(isolatedMigrations.runMigrationsOnTenant).mockResolvedValue(undefined)
 
-      const multitenantDb = await import('../internal/database/multitenant-db')
-      isolatedMultitenantKnex = multitenantDb.multitenantKnex
+      isolatedCloseMultitenantPg = (await import('../internal/database')).closeMultitenantPg
 
       const adminAppModule = await import('../admin-app')
       isolatedAdminApp = adminAppModule.default({})
@@ -261,20 +375,13 @@ describe('Admin migrations routes', () => {
         migrationsStatus: 'COMPLETED',
       })
 
-      await expect(
-        multitenantKnex('tenants')
-          .select('migrations_version', 'migrations_status')
-          .where({ id: migrationTenantId })
-          .first()
-      ).resolves.toEqual({
+      await expect(getTenantMigrationState(migrationTenantId)).resolves.toEqual({
         migrations_version: frozenMigration,
         migrations_status: 'COMPLETED',
       })
     } finally {
       await isolatedAdminApp?.close()
-      if (isolatedMultitenantKnex && isolatedMultitenantKnex !== multitenantKnex) {
-        await isolatedMultitenantKnex.destroy()
-      }
+      await isolatedCloseMultitenantPg?.()
       vi.resetModules()
     }
   })
@@ -287,30 +394,32 @@ describe('Admin migrations routes', () => {
 
     await createTenant(fleetTenantId)
 
-    await multitenantKnex(pgBossJobTable).insert({
-      id: jobId,
-      name: RunMigrationsOnTenants.getQueueName(),
-      state: 'active',
-      data: {
-        tenantId: fleetTenantId,
+    await insertJobs([
+      {
+        id: jobId,
+        name: RunMigrationsOnTenants.getQueueName(),
+        state: 'active',
+        data: {
+          tenantId: fleetTenantId,
+        },
       },
-    })
-    await multitenantKnex(pgBossJobTable).insert({
-      id: wrongQueueJobId,
-      name: 'another-queue',
-      state: 'active',
-      data: {
-        tenantId: fleetTenantId,
+      {
+        id: wrongQueueJobId,
+        name: 'another-queue',
+        state: 'active',
+        data: {
+          tenantId: fleetTenantId,
+        },
       },
-    })
-    await multitenantKnex(pgBossJobTable).insert({
-      id: wrongStateJobId,
-      name: RunMigrationsOnTenants.getQueueName(),
-      state: 'created',
-      data: {
-        tenantId: fleetTenantId,
+      {
+        id: wrongStateJobId,
+        name: RunMigrationsOnTenants.getQueueName(),
+        state: 'created',
+        data: {
+          tenantId: fleetTenantId,
+        },
       },
-    })
+    ])
 
     const response = await adminApp.inject({
       method: 'GET',
@@ -335,58 +444,73 @@ describe('Admin migrations routes', () => {
     const otherTenantId = `admin-migrations-other-${randomUUID().slice(0, 8)}`
     const olderJobId = trackJobId(randomUUID())
     const newerJobId = trackJobId(randomUUID())
+    const extraTenantJobIds = Array.from({ length: 99 }, () => trackJobId(randomUUID()))
     const otherTenantJobId = trackJobId(randomUUID())
     const wrongQueueJobId = trackJobId(randomUUID())
 
     await createTenant(jobTenantId)
     await createTenant(otherTenantId)
 
-    await multitenantKnex(pgBossJobTable).insert({
-      id: olderJobId,
-      name: RunMigrationsOnTenants.getQueueName(),
-      state: 'active',
-      created_on: new Date('2026-03-25T10:00:00.000Z'),
-      data: {
-        tenant: {
-          ref: jobTenantId,
+    await insertJobs([
+      {
+        id: olderJobId,
+        name: RunMigrationsOnTenants.getQueueName(),
+        state: 'active',
+        created_on: new Date('2026-03-25T10:00:00.000Z'),
+        data: {
+          tenant: {
+            ref: jobTenantId,
+          },
+          tenantId: jobTenantId,
         },
-        tenantId: jobTenantId,
       },
-    })
-    await multitenantKnex(pgBossJobTable).insert({
-      id: newerJobId,
-      name: RunMigrationsOnTenants.getQueueName(),
-      state: 'active',
-      created_on: new Date('2026-03-25T11:00:00.000Z'),
-      data: {
-        tenant: {
-          ref: jobTenantId,
+      {
+        id: newerJobId,
+        name: RunMigrationsOnTenants.getQueueName(),
+        state: 'active',
+        created_on: new Date('2026-03-25T11:00:00.000Z'),
+        data: {
+          tenant: {
+            ref: jobTenantId,
+          },
+          tenantId: jobTenantId,
         },
-        tenantId: jobTenantId,
       },
-    })
-    await multitenantKnex(pgBossJobTable).insert({
-      id: otherTenantJobId,
-      name: RunMigrationsOnTenants.getQueueName(),
-      state: 'active',
-      data: {
-        tenant: {
-          ref: otherTenantId,
+      ...extraTenantJobIds.map((id) => ({
+        id,
+        name: RunMigrationsOnTenants.getQueueName(),
+        state: 'active',
+        created_on: new Date('2026-03-25T09:00:00.000Z'),
+        data: {
+          tenant: {
+            ref: jobTenantId,
+          },
+          tenantId: jobTenantId,
         },
-        tenantId: otherTenantId,
-      },
-    })
-    await multitenantKnex(pgBossJobTable).insert({
-      id: wrongQueueJobId,
-      name: 'another-queue',
-      state: 'active',
-      data: {
-        tenant: {
-          ref: jobTenantId,
+      })),
+      {
+        id: otherTenantJobId,
+        name: RunMigrationsOnTenants.getQueueName(),
+        state: 'active',
+        data: {
+          tenant: {
+            ref: otherTenantId,
+          },
+          tenantId: otherTenantId,
         },
-        tenantId: jobTenantId,
       },
-    })
+      {
+        id: wrongQueueJobId,
+        name: 'another-queue',
+        state: 'active',
+        data: {
+          tenant: {
+            ref: jobTenantId,
+          },
+          tenantId: jobTenantId,
+        },
+      },
+    ])
 
     const response = await adminApp.inject({
       method: 'GET',
@@ -396,8 +520,8 @@ describe('Admin migrations routes', () => {
 
     expect(response.statusCode).toBe(200)
     const body = JSON.parse(response.body)
-    expect(body).toHaveLength(2)
-    expect(body).toEqual([
+    expect(body).toHaveLength(2 + extraTenantJobIds.length)
+    expect(body.slice(0, 2)).toEqual([
       expect.objectContaining({
         id: newerJobId,
         name: RunMigrationsOnTenants.getQueueName(),
@@ -435,13 +559,13 @@ describe('Admin migrations routes', () => {
     await createTenant(secondFailedTenantId)
     await createTenant(healthyTenantId)
 
-    await multitenantKnex('tenants').where({ id: firstFailedTenantId }).update({
+    await updateTenant(firstFailedTenantId, {
       migrations_status: 'FAILED',
     })
-    await multitenantKnex('tenants').where({ id: secondFailedTenantId }).update({
+    await updateTenant(secondFailedTenantId, {
       migrations_status: 'FAILED',
     })
-    await multitenantKnex('tenants').where({ id: healthyTenantId }).update({
+    await updateTenant(healthyTenantId, {
       migrations_status: 'COMPLETED',
     })
 
@@ -477,12 +601,26 @@ describe('Admin migrations routes', () => {
     })
   })
 
+  test.each([
+    '/migrations/failed?cursor=cursor-NaN',
+    '/migrations/failed?cursor=-1',
+  ])('rejects invalid failed-migrations cursor for %s', async (url) => {
+    const response = await adminApp.inject({
+      method: 'GET',
+      url,
+      headers,
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(JSON.parse(response.body)).toEqual({ message: 'Invalid cursor' })
+  })
+
   test('marks only active fleet migration jobs from the current queue as completed', async () => {
     const matchingJobId = trackJobId(randomUUID())
     const wrongQueueJobId = trackJobId(randomUUID())
     const wrongStateJobId = trackJobId(randomUUID())
 
-    await multitenantKnex(pgBossJobTable).insert([
+    await insertJobs([
       {
         id: matchingJobId,
         name: RunMigrationsOnTenants.getQueueName(),
@@ -512,9 +650,11 @@ describe('Admin migrations routes', () => {
     expect(response.statusCode).toBe(200)
     expect(JSON.parse(response.body)).toBe(1)
 
-    const rows = await multitenantKnex(pgBossJobTable)
-      .select('id', 'state')
-      .whereIn('id', [matchingJobId, wrongQueueJobId, wrongStateJobId])
+    const rows = await getJobs<{ id: string; state: string }>('id, state', [
+      matchingJobId,
+      wrongQueueJobId,
+      wrongStateJobId,
+    ])
     const statesById = Object.fromEntries(rows.map((row) => [row.id, row.state]))
 
     expect(statesById).toEqual({
@@ -527,16 +667,18 @@ describe('Admin migrations routes', () => {
   test('deletes only tenant migration jobs from the current queue', async () => {
     const tenantWithJobsId = `admin-migrations-delete-${randomUUID().slice(0, 8)}`
     const otherTenantId = `admin-migrations-delete-other-${randomUUID().slice(0, 8)}`
-    const matchingJobId = trackJobId(randomUUID())
+    const matchingJobIds = Array.from({ length: MIGRATION_ADMIN_JOB_LIMIT + 1 }, () =>
+      trackJobId(randomUUID())
+    )
     const otherTenantJobId = trackJobId(randomUUID())
     const wrongQueueJobId = trackJobId(randomUUID())
 
     await createTenant(tenantWithJobsId)
     await createTenant(otherTenantId)
 
-    await multitenantKnex(pgBossJobTable).insert([
-      {
-        id: matchingJobId,
+    await insertJobs([
+      ...matchingJobIds.map((id) => ({
+        id,
         name: RunMigrationsOnTenants.getQueueName(),
         state: 'active',
         data: {
@@ -545,7 +687,7 @@ describe('Admin migrations routes', () => {
           },
           tenantId: tenantWithJobsId,
         },
-      },
+      })),
       {
         id: otherTenantJobId,
         name: RunMigrationsOnTenants.getQueueName(),
@@ -577,11 +719,22 @@ describe('Admin migrations routes', () => {
     })
 
     expect(response.statusCode).toBe(200)
-    expect(JSON.parse(response.body)).toBe(1)
+    expect(JSON.parse(response.body)).toBe(MIGRATION_ADMIN_JOB_LIMIT)
 
-    const rows = await multitenantKnex(pgBossJobTable)
-      .select('id', 'name')
-      .whereIn('id', [matchingJobId, otherTenantJobId, wrongQueueJobId])
+    const secondResponse = await adminApp.inject({
+      method: 'DELETE',
+      url: `/tenants/${tenantWithJobsId}/migrations/jobs`,
+      headers,
+    })
+
+    expect(secondResponse.statusCode).toBe(200)
+    expect(JSON.parse(secondResponse.body)).toBe(1)
+
+    const rows = await getJobs<{ id: string; name: string }>('id, name', [
+      ...matchingJobIds,
+      otherTenantJobId,
+      wrongQueueJobId,
+    ])
     const namesById = Object.fromEntries(rows.map((row) => [row.id, row.name]))
 
     expect(namesById).toEqual({

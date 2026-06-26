@@ -1,10 +1,22 @@
-import { HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import {
+  DeleteObjectsCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  S3Client,
+} from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { ErrorCode, isStorageError } from '@internal/errors'
+import { MAX_KEYS_PER_S3_DELETE } from '@storage/limits'
 import { Readable } from 'stream'
 import { type Mock, vi } from 'vitest'
 import { getConfig } from '../../../config'
+import { withOptionalVersion } from '../adapter'
 import { MAX_PUT_OBJECT_SIZE, S3Backend } from './adapter'
+
+const DEFAULT_S3_UPLOAD_PART_SIZE = 16 * 1024 * 1024
 
 vi.mock('@aws-sdk/client-s3', async () => {
   const originalModule =
@@ -28,7 +40,12 @@ vi.mock('@aws-sdk/lib-storage', async () => {
   }
 })
 
+vi.mock('@aws-sdk/s3-request-presigner', () => ({
+  getSignedUrl: vi.fn().mockResolvedValue('http://signed.example.com/test-bucket/test-key'),
+}))
+
 type UploadOptionsShape = {
+  partSize?: number
   queueSize?: number
 }
 
@@ -103,6 +120,50 @@ describe('S3Backend', () => {
     })
   }
 
+  describe('client config', () => {
+    test('passes split checksum settings independently to the AWS client', async () => {
+      const originalRequestChecksum = process.env.STORAGE_S3_REQUEST_CHECKSUM_CALCULATION
+      const originalResponseChecksum = process.env.STORAGE_S3_RESPONSE_CHECKSUM_VALIDATION
+
+      try {
+        delete process.env.STORAGE_S3_REQUEST_CHECKSUM_CALCULATION
+        process.env.STORAGE_S3_RESPONSE_CHECKSUM_VALIDATION = 'WHEN_REQUIRED'
+
+        vi.resetModules()
+        const { S3Backend: ReloadedS3Backend } = await import('./adapter')
+        const s3ClientMock = S3Client as unknown as Mock
+
+        s3ClientMock.mockClear()
+
+        new ReloadedS3Backend({
+          region: 'us-east-1',
+          endpoint: 'http://localhost:9000',
+        })
+
+        expect(s3ClientMock.mock.calls[0][0]).toMatchObject({
+          region: 'us-east-1',
+          endpoint: 'http://localhost:9000',
+          responseChecksumValidation: 'WHEN_REQUIRED',
+        })
+        expect(s3ClientMock.mock.calls[0][0].requestChecksumCalculation).toBeUndefined()
+      } finally {
+        if (originalRequestChecksum === undefined) {
+          delete process.env.STORAGE_S3_REQUEST_CHECKSUM_CALCULATION
+        } else {
+          process.env.STORAGE_S3_REQUEST_CHECKSUM_CALCULATION = originalRequestChecksum
+        }
+
+        if (originalResponseChecksum === undefined) {
+          delete process.env.STORAGE_S3_RESPONSE_CHECKSUM_VALIDATION
+        } else {
+          process.env.STORAGE_S3_RESPONSE_CHECKSUM_VALIDATION = originalResponseChecksum
+        }
+
+        vi.resetModules()
+      }
+    })
+  })
+
   describe('getObject', () => {
     test('should return correct default MIME type when S3 returns no ContentType', async () => {
       mockSend.mockResolvedValue({
@@ -144,6 +205,162 @@ describe('S3Backend', () => {
       const result = await backend.getObject('test-bucket', 'test-key', undefined)
 
       expect(result.metadata.mimetype).toBe('image/png')
+    })
+  })
+
+  describe('list', () => {
+    test('filters listed keys by cutoff date and strips the requested prefix', async () => {
+      mockSend.mockResolvedValue({
+        Contents: [
+          {
+            Key: 'tenant/bucket/old.txt',
+            LastModified: new Date('2024-01-01T00:00:00.000Z'),
+            Size: 12,
+          },
+          {
+            Key: 'tenant/bucket/new.txt',
+            LastModified: new Date('2024-01-03T00:00:00.000Z'),
+            Size: 34,
+          },
+          {
+            Key: 'tenant/bucket/no-date.txt',
+            Size: 56,
+          },
+          {
+            LastModified: new Date('2024-01-01T00:00:00.000Z'),
+            Size: 78,
+          },
+        ],
+        NextContinuationToken: 'next-page',
+      })
+
+      const backend = createBackend()
+
+      await expect(
+        backend.list('test-bucket', {
+          prefix: 'tenant/bucket',
+          beforeDate: new Date('2024-01-02T00:00:00.000Z'),
+        })
+      ).resolves.toEqual({
+        keys: [{ name: 'old.txt', size: 12 }],
+        nextToken: 'next-page',
+      })
+
+      expect(mockSend).toHaveBeenCalledTimes(1)
+      expect(mockSend.mock.calls[0][0]).toBeInstanceOf(ListObjectsV2Command)
+      expect(mockSend.mock.calls[0][0].input).toMatchObject({
+        Bucket: 'test-bucket',
+        Prefix: 'tenant/bucket',
+      })
+    })
+  })
+
+  describe('deleteObjects', () => {
+    test('chunks DeleteObjectsCommand payloads to the S3 key limit', async () => {
+      mockSend.mockResolvedValue({
+        $metadata: {
+          httpStatusCode: 200,
+        },
+      })
+
+      const backend = createBackend()
+      const keys = [...Array(MAX_KEYS_PER_S3_DELETE + 1).keys()].map((i) => `object-${i}`)
+
+      await backend.deleteObjects('test-bucket', keys)
+
+      expect(mockSend).toHaveBeenCalledTimes(2)
+      expect(mockSend.mock.calls[0][0]).toBeInstanceOf(DeleteObjectsCommand)
+      expect(mockSend.mock.calls[0][0].input).toMatchObject({
+        Bucket: 'test-bucket',
+        Delete: {
+          Objects: keys.slice(0, MAX_KEYS_PER_S3_DELETE).map((Key) => ({ Key })),
+        },
+      })
+      expect(mockSend.mock.calls[1][0]).toBeInstanceOf(DeleteObjectsCommand)
+      expect(mockSend.mock.calls[1][0].input).toMatchObject({
+        Bucket: 'test-bucket',
+        Delete: {
+          Objects: [{ Key: `object-${MAX_KEYS_PER_S3_DELETE}` }],
+        },
+      })
+    })
+
+    test('sends DeleteObjectsCommand chunks concurrently', async () => {
+      const firstDelete = Promise.withResolvers<{ $metadata: { httpStatusCode: number } }>()
+      const secondDelete = Promise.withResolvers<{ $metadata: { httpStatusCode: number } }>()
+      mockSend.mockImplementationOnce(() => firstDelete.promise)
+      mockSend.mockImplementationOnce(() => secondDelete.promise)
+
+      const backend = createBackend()
+      const keys = [...Array(MAX_KEYS_PER_S3_DELETE + 1).keys()].map((i) => `object-${i}`)
+
+      const deletePromise = backend.deleteObjects('test-bucket', keys)
+
+      expect(mockSend).toHaveBeenCalledTimes(2)
+
+      firstDelete.resolve({
+        $metadata: {
+          httpStatusCode: 200,
+        },
+      })
+      secondDelete.resolve({
+        $metadata: {
+          httpStatusCode: 200,
+        },
+      })
+
+      await expect(deletePromise).resolves.toBeUndefined()
+    })
+  })
+
+  describe('privateAssetUrl', () => {
+    test('uses the primary S3 client when no private asset endpoint is configured', async () => {
+      const backend = createBackend()
+
+      await expect(backend.privateAssetUrl('test-bucket', 'test-key', undefined)).resolves.toBe(
+        'http://signed.example.com/test-bucket/test-key'
+      )
+
+      const s3ClientMock = S3Client as unknown as Mock
+      const defaultClient = s3ClientMock.mock.results[0].value
+      expect(s3ClientMock).toHaveBeenCalledTimes(1)
+      expect(getSignedUrl).toHaveBeenCalledWith(defaultClient, expect.any(GetObjectCommand), {
+        expiresIn: 600,
+      })
+    })
+
+    test('uses the private asset endpoint when signing private asset URLs', async () => {
+      const backend = new S3Backend({
+        region: 'us-east-1',
+        endpoint: 'http://127.0.0.1:9000',
+        privateAssetEndpoint: 'http://minio:9000',
+        forcePathStyle: true,
+      })
+
+      await backend.privateAssetUrl('test-bucket', 'test-key', 'version-id')
+
+      const s3ClientMock = S3Client as unknown as Mock
+      expect(s3ClientMock).toHaveBeenCalledTimes(2)
+      expect(s3ClientMock.mock.calls[0][0]).toMatchObject({
+        endpoint: 'http://127.0.0.1:9000',
+        forcePathStyle: true,
+        region: 'us-east-1',
+      })
+      expect(s3ClientMock.mock.calls[1][0]).toMatchObject({
+        endpoint: 'http://minio:9000',
+        forcePathStyle: true,
+        region: 'us-east-1',
+      })
+
+      const privateAssetClient = s3ClientMock.mock.results[1].value
+      const privateAssetCommand = (getSignedUrl as Mock).mock.calls[0][1] as GetObjectCommand
+      expect(privateAssetCommand.input).toMatchObject({
+        Bucket: 'test-bucket',
+        Key: withOptionalVersion('test-key', 'version-id'),
+      })
+      expect(getSignedUrl).toHaveBeenCalledWith(privateAssetClient, privateAssetCommand, {
+        expiresIn: 600,
+      })
     })
   })
 
@@ -265,6 +482,8 @@ describe('S3Backend', () => {
       )
 
       expect(Upload).toHaveBeenCalledTimes(1)
+      expect(getConfig().storageS3UploadPartSize).toBe(DEFAULT_S3_UPLOAD_PART_SIZE)
+      expect(uploadInstances[0].options.partSize).toBe(getConfig().storageS3UploadPartSize)
       expect(uploadInstances[0].options.queueSize).toBe(getConfig().storageS3UploadQueueSize)
       expect(mockSend).toHaveBeenCalledTimes(1)
       expect(mockSend.mock.calls[0][0]).toBeInstanceOf(HeadObjectCommand)
@@ -291,6 +510,8 @@ describe('S3Backend', () => {
       )
 
       expect(Upload).toHaveBeenCalledTimes(1)
+      expect(getConfig().storageS3UploadPartSize).toBe(DEFAULT_S3_UPLOAD_PART_SIZE)
+      expect(uploadInstances[0].options.partSize).toBe(getConfig().storageS3UploadPartSize)
       expect(uploadInstances[0].options.queueSize).toBe(getConfig().storageS3UploadQueueSize)
       expect(mockSend).not.toHaveBeenCalled()
       expect(result).toMatchObject({
