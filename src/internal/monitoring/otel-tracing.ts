@@ -149,7 +149,11 @@ if (tracingEnabled && traceExporter && spanProcessors.length > 0) {
           // Skip OTEL instrumentation for S3 Tables requests to avoid injecting
           // unsupported headers (baggage, traceparent, tracestate)
           const host = req.hostname || req.host || ''
-          return host.includes('.s3tables.') || host.includes('--table-s3')
+          return (
+            host.includes('.s3tables.') ||
+            host.includes('--table-s3') ||
+            (!!req.hostname && req.hostname === process.env.KUBERNETES_SERVICE_HOST) 
+          )
         },
         startIncomingSpanHook: (req) => {
           let tenantId = ''
