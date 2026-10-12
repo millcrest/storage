@@ -25,10 +25,14 @@ export class InfoRenderer extends HeadRenderer {
         size: headAsset.metadata.size ?? null,
         content_type: headAsset.metadata.mimetype ?? null,
         cache_control: headAsset.metadata.cacheControl ?? null,
+        content_encoding: headAsset.metadata.contentEncoding ?? null,
         etag: headAsset.metadata.eTag ?? null,
         metadata: obj.user_metadata,
         last_modified: obj.updated_at,
         created_at: obj.created_at,
+        archived_at: obj.archived_at,
+        is_delete_marker: obj.is_delete_marker,
+        is_versioned: obj.is_versioned,
       },
     }
   }

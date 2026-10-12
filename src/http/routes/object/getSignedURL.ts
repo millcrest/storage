@@ -21,13 +21,12 @@ const getSignedURLBodySchema = {
   properties: {
     expiresIn: {
       type: 'integer',
+      finite: true,
       minimum: 1,
       examples: [60000],
     },
-    transform: {
-      type: 'object',
-      properties: transformationOptionsSchema,
-    },
+    transform: transformationOptionsSchema,
+    versionId: { type: 'string', examples: ['eaa8bdb5-2e00-4767-b5a9-d2502efe2196'] },
   },
   required: ['expiresIn'],
 } as const
@@ -64,13 +63,13 @@ export default async function routes(fastify: FastifyInstance) {
     {
       schema,
       config: {
-        operation: { type: ROUTE_OPERATIONS.SIGN_OBJECT_URL },
+        operation: ROUTE_OPERATIONS.SIGN_OBJECT_URL,
       },
     },
     async (request, response) => {
       const { bucketName } = request.params
       const objectName = request.params['*']
-      const { expiresIn } = request.body
+      const { expiresIn, versionId } = request.body
       assertValidNumericJWTExpiration(expiresIn)
 
       const urlPath = request.url.split('?').shift()
@@ -88,7 +87,7 @@ export default async function routes(fastify: FastifyInstance) {
 
       const signedURL = await request.storage
         .from(bucketName)
-        .signObjectUrl(objectName, urlPath as string, expiresIn, transformationOptions)
+        .signObjectUrl(objectName, urlPath as string, expiresIn, transformationOptions, versionId)
 
       return response.status(200).send({ signedURL })
     }

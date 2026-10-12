@@ -1,10 +1,13 @@
 const acceptanceProfiles = ['smoke', 'core', 'full', 'wire'] as const
+const vectorBucketProviders = ['s3', 'pgvector'] as const
 
 export type AcceptanceProfile = (typeof acceptanceProfiles)[number]
+export type AcceptanceVectorBucketProvider = (typeof vectorBucketProviders)[number]
 
 export type AcceptanceCapability =
   | 'admin'
   | 'cdn'
+  | 'cdnEdge'
   | 'iceberg'
   | 'render'
   | 'rlsSetup'
@@ -15,6 +18,8 @@ export type AcceptanceCapability =
 export interface AcceptanceConfig {
   adminApiKey?: string
   adminUrl?: string
+  adminReturnSensitiveData: boolean
+  adminDatabaseUrlOverride?: string
   allowDestructive: boolean
   anonKey?: string
   authenticatedKey?: string
@@ -39,6 +44,7 @@ export interface AcceptanceConfig {
   tenantId?: string
   tlsRejectUnauthorized: boolean
   tusEndpoint: string
+  vectorBucketProvider: AcceptanceVectorBucketProvider
 }
 
 export interface AcceptanceSelection {
@@ -78,10 +84,11 @@ export function shouldRunAcceptance(selection: AcceptanceSelection): boolean {
 export function describeAcceptance(
   name: string,
   selection: AcceptanceSelection,
-  factory: () => void
+  factory: () => void,
+  timeout?: number
 ) {
   const runner = shouldRunAcceptance(selection) ? describe : describe.skip
-  runner(name, factory)
+  runner(name, factory, timeout)
 }
 
 export function requireConfigValue(value: string | undefined, name: string): string {
@@ -128,6 +135,10 @@ function buildAcceptanceConfig(): AcceptanceConfig {
     'enable-admin',
     envOption('ACCEPTANCE_ENABLE_ADMIN')
   )
+  const adminReturnSensitiveData = boolOptionDefaultTrue(
+    'enable-admin-sensitive-data',
+    envOption('ACCEPTANCE_ADMIN_RETURN_TENANT_SENSITIVE_DATA')
+  )
   const runId = sanitizeRunId(
     readOption('run-id') ??
       envOption('ACCEPTANCE_RUN_ID') ??
@@ -144,17 +155,22 @@ function buildAcceptanceConfig(): AcceptanceConfig {
   const adminCapabilityEnabled =
     adminCapabilityOption !== false && (adminCapabilityOption === true || hasAdminConfig)
   const storageBackend = optionalLower(envOption('STORAGE_BACKEND'))
+  const vectorBucketProvider = normalizeVectorBucketProvider(envOption('VECTOR_BUCKET_PROVIDER'))
+  const cdnEnabled = boolOption('enable-cdn', process.env.ACCEPTANCE_ENABLE_CDN)
 
   const config: AcceptanceConfig = {
     adminApiKey,
     adminUrl,
+    adminReturnSensitiveData,
+    adminDatabaseUrlOverride: envOption('ACCEPTANCE_ADMIN_DATABASE_URL_OVERRIDE'),
     allowDestructive: boolOption('allow-destructive', envOption('ACCEPTANCE_ALLOW_DESTRUCTIVE')),
     anonKey: envOption('ACCEPTANCE_ANON_KEY'),
     authenticatedKey: envOption('ACCEPTANCE_AUTHENTICATED_KEY'),
     baseUrl,
     capabilities: {
       admin: adminCapabilityEnabled && hasAdminConfig,
-      cdn: boolOption('enable-cdn', process.env.ACCEPTANCE_ENABLE_CDN),
+      cdn: cdnEnabled,
+      cdnEdge: cdnEnabled && target === 'remote',
       iceberg: boolOption('enable-iceberg', process.env.ACCEPTANCE_ENABLE_ICEBERG),
       render: boolOption('enable-render', process.env.ACCEPTANCE_ENABLE_RENDER),
       rlsSetup: boolOption('enable-rls-setup', process.env.ACCEPTANCE_ENABLE_RLS_SETUP),
@@ -195,6 +211,7 @@ function buildAcceptanceConfig(): AcceptanceConfig {
       envOption('ACCEPTANCE_TLS_REJECT_UNAUTHORIZED')
     ),
     tusEndpoint,
+    vectorBucketProvider,
   }
 
   if (config.target === 'remote' && config.allowDestructive && !config.resourcePrefix) {
@@ -234,6 +251,15 @@ function isAcceptanceProfile(value: string | undefined): value is AcceptanceProf
 
 function normalizeTarget(value: string | undefined): AcceptanceConfig['target'] {
   return value === 'remote' ? 'remote' : 'local'
+}
+
+function normalizeVectorBucketProvider(value: string | undefined): AcceptanceVectorBucketProvider {
+  const normalized = optionalLower(value) ?? 's3'
+  if (vectorBucketProviders.includes(normalized as AcceptanceVectorBucketProvider)) {
+    return normalized as AcceptanceVectorBucketProvider
+  }
+
+  throw new Error(`Unsupported VECTOR_BUCKET_PROVIDER: ${value}`)
 }
 
 function boolOption(cliName: string, envValue: string | undefined): boolean {

@@ -1,4 +1,5 @@
-import { objectSchema } from '@storage/schemas'
+import { ERRORS } from '@internal/errors'
+import { OBJECT_LISTING_FILTER_MODES, objectListEntrySchema } from '@storage/schemas'
 import { FastifyInstance } from 'fastify'
 import { FastifyRequest } from 'fastify/types/request'
 import { FromSchema } from 'json-schema-to-ts'
@@ -17,8 +18,9 @@ const searchRequestBodySchema = {
   type: 'object',
   properties: {
     prefix: { type: 'string', examples: ['folder/subfolder'] },
-    limit: { type: 'integer', minimum: 1, examples: [10] },
-    offset: { type: 'integer', minimum: 0, examples: [0] },
+    exactMatch: { type: 'boolean' },
+    limit: { type: 'integer', finite: true, minimum: 1, examples: [10] },
+    offset: { type: 'integer', finite: true, minimum: 0, examples: [0] },
     sortBy: {
       type: 'object',
       properties: {
@@ -30,12 +32,14 @@ const searchRequestBodySchema = {
     search: {
       type: 'string',
     },
+    noncurrentVersions: { type: 'string', enum: OBJECT_LISTING_FILTER_MODES },
+    deleteMarkers: { type: 'string', enum: OBJECT_LISTING_FILTER_MODES },
   },
   required: ['prefix'],
 } as const
 const successResponseSchema = {
   type: 'array',
-  items: objectSchema,
+  items: objectListEntrySchema,
 }
 interface searchRequestInterface extends AuthenticatedRequest {
   Body: FromSchema<typeof searchRequestBodySchema>
@@ -56,7 +60,7 @@ export default async function routes(fastify: FastifyInstance) {
     {
       schema,
       config: {
-        operation: { type: ROUTE_OPERATIONS.LIST_OBJECTS },
+        operation: ROUTE_OPERATIONS.LIST_OBJECTS,
         logMetadata: (req: FastifyRequest<searchRequestInterface>) => ({
           prefix: req.body.prefix,
           limit: req.body.limit,
@@ -67,7 +71,24 @@ export default async function routes(fastify: FastifyInstance) {
     },
     async (request, response) => {
       const { bucketName } = request.params
-      const { limit, offset, sortBy, search, prefix } = request.body
+      const {
+        limit,
+        offset,
+        sortBy,
+        search,
+        prefix,
+        noncurrentVersions,
+        deleteMarkers,
+        exactMatch,
+      } = request.body
+
+      if (
+        ((noncurrentVersions !== undefined && noncurrentVersions !== 'exclude') ||
+          (deleteMarkers !== undefined && deleteMarkers !== 'exclude')) &&
+        !(await request.storage.db.hasMigration('list-objects-with-versions'))
+      ) {
+        throw ERRORS.FeatureNotEnabled(bucketName, 'object versioning schema')
+      }
 
       const results = await request.storage.from(bucketName).searchObjects(prefix, {
         limit,
@@ -77,6 +98,9 @@ export default async function routes(fastify: FastifyInstance) {
           column: sortBy?.column,
           order: sortBy?.order,
         },
+        noncurrentVersions,
+        deleteMarkers,
+        exactMatch,
       })
 
       return response.status(200).send(results)

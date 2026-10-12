@@ -1,3 +1,7 @@
+vi.hoisted(() => {
+  process.env.AUTH_URL_SIGNING_JWK_TYPE = 'HS512'
+})
+
 import { encrypt, signJWT } from '@internal/auth'
 import { TENANT_CONFIG_CACHE_NAME } from '@internal/cache'
 import {
@@ -5,9 +9,10 @@ import {
   getDeleteObjectsLimit,
   jwksManager,
   multitenantPgExecutor,
-  PgTenantConnection,
+  TenantMigrationStatus,
 } from '@internal/database'
 import { DBMigration } from '@internal/database/migrations'
+import * as tenantModule from '@internal/database/tenant'
 import {
   deleteTenantConfig,
   getFeatures,
@@ -16,11 +21,13 @@ import {
   getTenantConfig,
   onTenantConfigChange,
 } from '@internal/database/tenant'
+import { logSchema } from '@internal/monitoring'
 import * as metrics from '@internal/monitoring/metrics'
+import { RunMigrationsOnTenants } from '@storage/events'
 import dotenv from 'dotenv'
 import * as migrate from '../internal/database/migrations/migrate'
 import { adminApp } from './common'
-import { assertLogicalLookupMetrics } from './utils/cache-metrics'
+import { assertLogicalLookupMetrics, getCacheRequestCalls } from './utils/cache-metrics'
 import { mockCreateLruCache } from './utils/cache-mock'
 
 dotenv.config({ path: '.env.test' })
@@ -43,9 +50,11 @@ const payload = {
   migrationStatus: 'COMPLETED',
   migrationVersion,
   tracingMode: 'basic',
+  subscriptionTier: 'tier_pro',
   capabilities: {
     list_V2: true,
     iceberg_catalog: true,
+    object_versioning: true,
   },
   features: {
     imageTransformation: {
@@ -68,6 +77,9 @@ const payload = {
       enabled: true,
       maxBuckets: 2,
       maxIndexes: 10,
+    },
+    objectVersioning: {
+      enabled: false,
     },
   },
   disableEvents: null,
@@ -86,9 +98,11 @@ const payload2 = {
   migrationStatus: 'COMPLETED',
   migrationVersion,
   tracingMode: 'basic',
+  subscriptionTier: 'tier_free',
   capabilities: {
     list_V2: true,
     iceberg_catalog: true,
+    object_versioning: true,
   },
   features: {
     imageTransformation: {
@@ -112,18 +126,59 @@ const payload2 = {
       maxBuckets: 2,
       maxIndexes: 10,
     },
+    objectVersioning: {
+      enabled: false,
+    },
   },
   disableEvents: null,
+}
+
+function createEncryptedTenantRow(
+  tenantId: string,
+  tenantPayload: typeof payload | typeof payload2 = payload
+) {
+  return {
+    id: tenantId,
+    anon_key: encrypt(tenantPayload.anonKey),
+    database_url: encrypt(tenantPayload.databaseUrl),
+    database_pool_url: tenantPayload.databasePoolUrl
+      ? encrypt(tenantPayload.databasePoolUrl)
+      : tenantPayload.databasePoolUrl,
+    max_connections: tenantPayload.maxConnections,
+    file_size_limit: tenantPayload.fileSizeLimit,
+    delete_objects_limit: tenantPayload.deleteObjectsLimit,
+    jwt_secret: encrypt(tenantPayload.jwtSecret),
+    jwks: tenantPayload.jwks,
+    service_key: encrypt(tenantPayload.serviceKey),
+    feature_purge_cache: tenantPayload.features.purgeCache.enabled,
+    feature_image_transformation: tenantPayload.features.imageTransformation.enabled,
+    feature_s3_protocol: tenantPayload.features.s3Protocol.enabled,
+    feature_iceberg_catalog: tenantPayload.features.icebergCatalog.enabled,
+    feature_iceberg_catalog_max_catalogs: tenantPayload.features.icebergCatalog.maxCatalogs,
+    feature_iceberg_catalog_max_namespaces: tenantPayload.features.icebergCatalog.maxNamespaces,
+    feature_iceberg_catalog_max_tables: tenantPayload.features.icebergCatalog.maxTables,
+    feature_vector_buckets: tenantPayload.features.vectorBuckets.enabled,
+    feature_vector_buckets_max_buckets: tenantPayload.features.vectorBuckets.maxBuckets,
+    feature_vector_buckets_max_indexes: tenantPayload.features.vectorBuckets.maxIndexes,
+    feature_object_versioning: tenantPayload.features.objectVersioning.enabled,
+    image_transformation_max_resolution: tenantPayload.features.imageTransformation.maxResolution,
+    migrations_version: tenantPayload.migrationVersion,
+    migrations_status: tenantPayload.migrationStatus,
+    tracing_mode: tenantPayload.tracingMode,
+    disable_events: tenantPayload.disableEvents,
+    subscription_tier: tenantPayload.subscriptionTier,
+  }
 }
 
 type TenantModule = typeof import('../internal/database/tenant')
 type MultitenantPgModule = typeof import('../internal/database/multitenant-pg')
 
 async function loadTenantModule(
-  maxItems: number
+  maxItems: number,
+  cacheOverrides: Record<string, unknown> = {}
 ): Promise<{ tenantModule: TenantModule; multitenantPgModule: MultitenantPgModule }> {
   vi.resetModules()
-  mockCreateLruCache({ max: maxItems })
+  mockCreateLruCache({ max: maxItems, ...cacheOverrides })
 
   return {
     tenantModule: await import('../internal/database/tenant'),
@@ -140,7 +195,6 @@ function mockTenantQueryResult(row: object) {
 
 beforeAll(async () => {
   await migrate.runMultitenantMigrations()
-  vi.spyOn(migrate, 'runMigrationsOnTenant').mockResolvedValue()
   payload.serviceKey = await signJWT(serviceKeyPayload, payload.jwtSecret, 100)
 })
 
@@ -157,6 +211,7 @@ async function cleanupTestTenants() {
 }
 
 beforeEach(async () => {
+  vi.spyOn(migrate, 'runMigrationsOnTenant').mockResolvedValue()
   await cleanupTestTenants()
 })
 
@@ -198,6 +253,30 @@ describe('Tenant configs', () => {
     ])
   })
 
+  test.each([
+    0, -1,
+  ])('Get all tenant configs omits non-positive delete objects limit %i', async (deleteObjectsLimit) => {
+    const tenantId = `list-delete-objects-limit-${deleteObjectsLimit}`
+    const encryptedTenant = {
+      ...createEncryptedTenantRow(tenantId),
+      delete_objects_limit: deleteObjectsLimit,
+    }
+    vi.spyOn(multitenantPgExecutor, 'query').mockResolvedValueOnce(
+      mockTenantQueryResult(encryptedTenant)
+    )
+
+    const response = await adminApp.inject({
+      method: 'GET',
+      url: `/tenants`,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(JSON.parse(response.body)[0].deleteObjectsLimit).toBeUndefined()
+  })
+
   test('Get nonexistent tenant config', async () => {
     const response = await adminApp.inject({
       method: 'GET',
@@ -235,32 +314,7 @@ describe('Tenant configs', () => {
     await expect(getFeatures('abc')).resolves.toEqual(payload.features)
   })
 
-  test('Ignores legacy database pool mode fields on tenant writes', async () => {
-    const response = await adminApp.inject({
-      method: 'POST',
-      url: `/tenants/abc`,
-      payload: {
-        ...payload,
-        databasePoolMode: 'single_use',
-      },
-      headers: {
-        apikey: process.env.ADMIN_API_KEYS,
-      },
-    })
-    expect(response.statusCode).toBe(201)
-
-    const getResponse = await adminApp.inject({
-      method: 'GET',
-      url: `/tenants/abc`,
-      headers: {
-        apikey: process.env.ADMIN_API_KEYS,
-      },
-    })
-    expect(getResponse.statusCode).toBe(200)
-    expect(JSON.parse(getResponse.body)).toEqual(payload)
-  })
-
-  test('PATCH refreshes local tenant config changes before the notify cache path', async () => {
+  test('PATCH invalidates the local tenant config', async () => {
     const createResponse = await adminApp.inject({
       method: 'POST',
       url: `/tenants/abc`,
@@ -272,29 +326,21 @@ describe('Tenant configs', () => {
     expect(createResponse.statusCode).toBe(201)
 
     await getTenantConfig('abc')
-    const destroySpy = vi
-      .spyOn(PgTenantConnection.poolManager, 'destroy')
-      .mockResolvedValue(undefined)
+    const response = await adminApp.inject({
+      method: 'PATCH',
+      url: `/tenants/abc`,
+      payload: {
+        databasePoolUrl: 'postgres://pool.example.test/postgres',
+      },
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+    expect(response.statusCode).toBe(204)
 
-    try {
-      const response = await adminApp.inject({
-        method: 'PATCH',
-        url: `/tenants/abc`,
-        payload: {
-          databasePoolUrl: 'postgres://pool.example.test/postgres',
-        },
-        headers: {
-          apikey: process.env.ADMIN_API_KEYS,
-        },
-      })
-      expect(response.statusCode).toBe(204)
-
-      await vi.waitFor(() => {
-        expect(destroySpy).toHaveBeenCalledWith('abc')
-      })
-    } finally {
-      destroySpy.mockRestore()
-    }
+    await expect(getTenantConfig('abc')).resolves.toMatchObject({
+      databasePoolUrl: 'postgres://pool.example.test/postgres',
+    })
   })
 
   test('Get tenant config omits sensitive data when ADMIN_RETURN_TENANT_SENSITIVE_DATA is false', async () => {
@@ -307,8 +353,7 @@ describe('Tenant configs', () => {
       },
     })
 
-    const previousValue = process.env.ADMIN_RETURN_TENANT_SENSITIVE_DATA
-    process.env.ADMIN_RETURN_TENANT_SENSITIVE_DATA = 'false'
+    vi.stubEnv('ADMIN_RETURN_TENANT_SENSITIVE_DATA', 'false')
     let isolatedApp: typeof adminApp | undefined
 
     try {
@@ -338,6 +383,7 @@ describe('Tenant configs', () => {
       expect(singleJSON.maxConnections).toBe(payload.maxConnections)
       expect(singleJSON.features).toEqual(payload.features)
       expect(singleJSON.tracingMode).toBe(payload.tracingMode)
+      expect(singleJSON.subscriptionTier).toBe(payload.subscriptionTier)
 
       const listResponse = await isolatedApp!.inject({
         method: 'GET',
@@ -359,12 +405,6 @@ describe('Tenant configs', () => {
       expect(listJSON[0].fileSizeLimit).toBe(payload.fileSizeLimit)
     } finally {
       await isolatedApp?.close()
-
-      if (previousValue === undefined) {
-        delete process.env.ADMIN_RETURN_TENANT_SENSITIVE_DATA
-      } else {
-        process.env.ADMIN_RETURN_TENANT_SENSITIVE_DATA = previousValue
-      }
     }
   })
 
@@ -440,36 +480,31 @@ describe('Tenant configs', () => {
       .spyOn(jwksManager, 'generateUrlSigningJwk')
       .mockRejectedValueOnce(new Error('jwk insert failed'))
     const runMigrationsOnTenantMock = vi.mocked(migrate.runMigrationsOnTenant)
-    runMigrationsOnTenantMock.mockClear()
 
-    try {
-      const response = await adminApp.inject({
-        method: 'POST',
-        url: `/tenants/abc`,
-        payload,
-        headers: {
-          apikey: process.env.ADMIN_API_KEYS,
-        },
-      })
+    const response = await adminApp.inject({
+      method: 'POST',
+      url: `/tenants/abc`,
+      payload,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
 
-      expect(response.statusCode).toBe(500)
-      expect(generateUrlSigningJwkSpy).toHaveBeenCalledWith('abc', expect.anything())
-      expect(runMigrationsOnTenantMock).not.toHaveBeenCalled()
+    expect(response.statusCode).toBe(500)
+    expect(generateUrlSigningJwkSpy).toHaveBeenCalledWith('abc', 'HS512', expect.anything())
+    expect(runMigrationsOnTenantMock).not.toHaveBeenCalled()
 
-      const tenant = await multitenantPgExecutor.query({
-        text: 'SELECT id FROM tenants WHERE id = $1 LIMIT 1',
-        values: ['abc'],
-      })
-      const jwks = await multitenantPgExecutor.query({
-        text: 'SELECT id FROM tenants_jwks WHERE tenant_id = $1',
-        values: ['abc'],
-      })
+    const tenant = await multitenantPgExecutor.query({
+      text: 'SELECT id FROM tenants WHERE id = $1 LIMIT 1',
+      values: ['abc'],
+    })
+    const jwks = await multitenantPgExecutor.query({
+      text: 'SELECT id FROM tenants_jwks WHERE tenant_id = $1',
+      values: ['abc'],
+    })
 
-      expect(tenant.rows[0]).toBeUndefined()
-      expect(jwks.rows).toEqual([])
-    } finally {
-      generateUrlSigningJwkSpy.mockRestore()
-    }
+    expect(tenant.rows[0]).toBeUndefined()
+    expect(jwks.rows).toEqual([])
   })
 
   test('Update tenant config', async () => {
@@ -501,7 +536,92 @@ describe('Tenant configs', () => {
     expect(getResponseJSON).toEqual(payload2)
   })
 
-  test('Update tenant config keeps changes when tenant migrations fail', async () => {
+  test.each([
+    'PUT',
+    'PATCH',
+  ] as const)('Update tenant config keeps changes when tenant migrations fail (%s)', async (method) => {
+    await adminApp.inject({
+      method: 'POST',
+      url: `/tenants/abc`,
+      payload,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+
+    const runMigrationsOnTenantMock = vi.mocked(migrate.runMigrationsOnTenant)
+    const updateTenantMigrationsStateSpy = vi.spyOn(migrate, 'updateTenantMigrationsState')
+    const onChangeSpy = vi.spyOn(tenantModule, 'onTenantConfigChange')
+    const addTenantSpy = vi
+      .spyOn(migrate.progressiveMigrations, 'addTenant')
+      .mockImplementation(() => undefined)
+
+    runMigrationsOnTenantMock.mockClear()
+    runMigrationsOnTenantMock.mockRejectedValueOnce(new Error('migration failed'))
+
+    const response = await adminApp.inject({
+      method,
+      url: `/tenants/abc`,
+      payload: payload2,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+
+    expect(response.statusCode).toBe(204)
+    expect(runMigrationsOnTenantMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        databaseUrl: payload2.databaseUrl,
+        tenantId: 'abc',
+      })
+    )
+    expect(updateTenantMigrationsStateSpy).toHaveBeenCalledWith('abc', {
+      state: TenantMigrationStatus.FAILED,
+    })
+    expect(addTenantSpy).toHaveBeenCalledWith('abc')
+    expect(onChangeSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      addTenantSpy.mock.invocationCallOrder[0]
+    )
+    expect(await migrate.areMigrationsUpToDate('abc')).toBeFalsy()
+
+    const getResponse = await adminApp.inject({
+      method: 'GET',
+      url: `/tenants/abc`,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+
+    expect(getResponse.statusCode).toBe(200)
+    expect(JSON.parse(getResponse.body)).toEqual({
+      ...payload2,
+      migrationStatus: TenantMigrationStatus.FAILED,
+    })
+
+    await RunMigrationsOnTenants.handle({
+      data: { tenant: { ref: 'abc', host: '' }, tenantId: 'abc' },
+    } as never)
+
+    expect(runMigrationsOnTenantMock).toHaveBeenCalledTimes(2)
+
+    const migrationsResponse = await adminApp.inject({
+      method: 'GET',
+      url: `/tenants/abc/migrations`,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+
+    expect(JSON.parse(migrationsResponse.body)).toMatchObject({
+      migrationsStatus: 'COMPLETED',
+      isLatest: true,
+    })
+  })
+
+  test.each([
+    'PUT',
+    'PATCH',
+  ] as const)('%s returns 500 and skips fallback scheduling when persisting FAILED state fails', async (method) => {
     await adminApp.inject({
       method: 'POST',
       url: `/tenants/abc`,
@@ -516,46 +636,23 @@ describe('Tenant configs', () => {
     const addTenantSpy = vi
       .spyOn(migrate.progressiveMigrations, 'addTenant')
       .mockImplementation(() => undefined)
+    const onChangeSpy = vi.spyOn(tenantModule, 'onTenantConfigChange')
 
-    runMigrationsOnTenantMock.mockClear()
-    updateTenantMigrationsStateSpy.mockClear()
+    runMigrationsOnTenantMock.mockRejectedValueOnce(new Error('migration failed'))
+    updateTenantMigrationsStateSpy.mockRejectedValueOnce(new Error('control database unavailable'))
 
-    try {
-      runMigrationsOnTenantMock.mockRejectedValueOnce(new Error('migration failed'))
+    const response = await adminApp.inject({
+      method,
+      url: `/tenants/abc`,
+      payload: payload2,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
 
-      const patchResponse = await adminApp.inject({
-        method: 'PATCH',
-        url: `/tenants/abc`,
-        payload: payload2,
-        headers: {
-          apikey: process.env.ADMIN_API_KEYS,
-        },
-      })
-
-      expect(patchResponse.statusCode).toBe(204)
-      expect(runMigrationsOnTenantMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          databaseUrl: payload2.databaseUrl,
-          tenantId: 'abc',
-        })
-      )
-      expect(updateTenantMigrationsStateSpy).not.toHaveBeenCalled()
-      expect(addTenantSpy).toHaveBeenCalledWith('abc')
-
-      const getResponse = await adminApp.inject({
-        method: 'GET',
-        url: `/tenants/abc`,
-        headers: {
-          apikey: process.env.ADMIN_API_KEYS,
-        },
-      })
-
-      expect(getResponse.statusCode).toBe(200)
-      expect(JSON.parse(getResponse.body)).toEqual(payload2)
-    } finally {
-      addTenantSpy.mockRestore()
-      updateTenantMigrationsStateSpy.mockRestore()
-    }
+    expect(response.statusCode).toBe(500)
+    expect(addTenantSpy).not.toHaveBeenCalled()
+    expect(onChangeSpy).toHaveBeenCalledWith('abc')
   })
 
   test('Update tenant config partially', async () => {
@@ -689,32 +786,11 @@ describe('Tenant configs', () => {
     })
   })
 
-  test('Tenant config maxConnections nullish transitions do not destroy cached pg pool', async () => {
-    const tenantId = 'pool-max-connections-nullish-change'
+  test('Tenant config change invalidates without eagerly reloading', async () => {
+    const tenantId = 'tenant-config-change'
     const encryptedTenant = {
-      anon_key: encrypt('anon'),
-      database_url: encrypt('postgres://tenant'),
-      file_size_limit: 1,
-      jwt_secret: encrypt('jwt-secret'),
-      jwks: null,
-      service_key: encrypt('service-key'),
-      feature_purge_cache: false,
-      feature_image_transformation: false,
-      feature_s3_protocol: false,
-      feature_iceberg_catalog: false,
-      feature_iceberg_catalog_max_catalogs: 0,
-      feature_iceberg_catalog_max_namespaces: 0,
-      feature_iceberg_catalog_max_tables: 0,
-      feature_vector_buckets: false,
-      feature_vector_buckets_max_buckets: 0,
-      feature_vector_buckets_max_indexes: 0,
-      image_transformation_max_resolution: null,
-      database_pool_url: null,
-      max_connections: null,
-      migrations_version: migrationVersion,
-      migrations_status: 'COMPLETED',
-      tracing_mode: null,
-      disable_events: null,
+      ...createEncryptedTenantRow(tenantId),
+      max_connections: 20,
     }
     const querySpy = vi
       .spyOn(multitenantPgExecutor, 'query')
@@ -722,23 +798,20 @@ describe('Tenant configs', () => {
       .mockResolvedValueOnce(
         mockTenantQueryResult({
           ...encryptedTenant,
-          max_connections: undefined,
+          max_connections: 40,
         })
       )
-    const destroySpy = vi.spyOn(PgTenantConnection.poolManager, 'destroy').mockResolvedValue()
 
     try {
-      const cachedConfig = await getTenantConfig(tenantId)
-      ;(cachedConfig as { maxConnections?: number | null }).maxConnections = null
+      await expect(getTenantConfig(tenantId)).resolves.toMatchObject({ maxConnections: 20 })
 
-      await onTenantConfigChange(tenantId)
+      onTenantConfigChange(tenantId)
+      expect(querySpy).toHaveBeenCalledTimes(1)
 
-      expect(destroySpy).not.toHaveBeenCalled()
+      await expect(getTenantConfig(tenantId)).resolves.toMatchObject({ maxConnections: 40 })
       expect(querySpy).toHaveBeenCalledTimes(2)
     } finally {
       deleteTenantConfig(tenantId)
-      querySpy.mockRestore()
-      destroySpy.mockRestore()
     }
   })
 
@@ -774,6 +847,37 @@ describe('Tenant configs', () => {
     const getResponseJSON = JSON.parse(getResponse.body)
     expect(getResponseJSON).toEqual({ ...payload, databasePoolUrl: null })
     expect(getResponseJSON.databasePoolUrl).toBeNull()
+  })
+
+  test('PUT clears tenant databasePoolUrl when set to null', async () => {
+    await adminApp.inject({
+      method: 'POST',
+      url: `/tenants/abc`,
+      payload,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+
+    const putResponse = await adminApp.inject({
+      method: 'PUT',
+      url: `/tenants/abc`,
+      payload: { ...payload, databasePoolUrl: null },
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+    expect(putResponse.statusCode).toBe(204)
+
+    const getResponse = await adminApp.inject({
+      method: 'GET',
+      url: `/tenants/abc`,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+    expect(getResponse.statusCode).toBe(200)
+    expect(JSON.parse(getResponse.body).databasePoolUrl).toBeNull()
   })
 
   test('Upsert tenant config updates iceberg/vector limits when enabled is omitted', async () => {
@@ -977,6 +1081,25 @@ describe('Tenant configs', () => {
     await expect(getTenantConfig('zzz')).rejects.toThrow('Missing tenant config for tenant zzz')
   })
 
+  test.each([
+    0, -1,
+  ])('Get delete objects limit returns undefined for non-positive stored value %i', async (deleteObjectsLimit) => {
+    const tenantId = `delete-objects-limit-${deleteObjectsLimit}`
+    const encryptedTenant = {
+      ...createEncryptedTenantRow(tenantId),
+      delete_objects_limit: deleteObjectsLimit,
+    }
+    vi.spyOn(multitenantPgExecutor, 'query').mockResolvedValueOnce(
+      mockTenantQueryResult(encryptedTenant)
+    )
+
+    try {
+      await expect(getDeleteObjectsLimit(tenantId)).resolves.toBeUndefined()
+    } finally {
+      deleteTenantConfig(tenantId)
+    }
+  })
+
   test('Get tenant config always retrieves concurrent requests from cache', async () => {
     const tenantId = 'cache-test-abc'
     await adminApp.inject({
@@ -989,57 +1112,29 @@ describe('Tenant configs', () => {
     })
 
     const querySpy = vi.spyOn(multitenantPgExecutor, 'query')
-    try {
-      await getTenantConfig(tenantId)
-      expect(querySpy).toHaveBeenCalledTimes(1)
+    await getTenantConfig(tenantId)
+    expect(querySpy).toHaveBeenCalledTimes(1)
 
-      const results = await Promise.all([
-        getTenantConfig(tenantId),
-        getTenantConfig(tenantId),
-        getTenantConfig(tenantId),
-      ])
-      expect(querySpy).toHaveBeenCalledTimes(1)
-      results.forEach((result, i) => expect(result).toEqual(results[i === 0 ? 1 : 0]))
+    const results = await Promise.all([
+      getTenantConfig(tenantId),
+      getTenantConfig(tenantId),
+      getTenantConfig(tenantId),
+    ])
+    expect(querySpy).toHaveBeenCalledTimes(1)
+    results.forEach((result, i) => expect(result).toEqual(results[i === 0 ? 1 : 0]))
 
-      await adminApp.inject({
-        method: 'DELETE',
-        url: `/tenants/${tenantId}`,
-        headers: {
-          apikey: process.env.ADMIN_API_KEYS,
-        },
-      })
-    } finally {
-      querySpy.mockRestore()
-    }
+    await adminApp.inject({
+      method: 'DELETE',
+      url: `/tenants/${tenantId}`,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
   })
 
   test('Get tenant config evicts cold tenants from cache', async () => {
     const tenantIds = ['cache-eviction-1', 'cache-eviction-2', 'cache-eviction-3']
-    const encryptedTenant = {
-      anon_key: encrypt('anon'),
-      database_url: encrypt('postgres://tenant'),
-      file_size_limit: 1,
-      jwt_secret: encrypt('jwt-secret'),
-      jwks: null,
-      service_key: encrypt('service-key'),
-      feature_purge_cache: false,
-      feature_image_transformation: false,
-      feature_s3_protocol: false,
-      feature_iceberg_catalog: false,
-      feature_iceberg_catalog_max_catalogs: 0,
-      feature_iceberg_catalog_max_namespaces: 0,
-      feature_iceberg_catalog_max_tables: 0,
-      feature_vector_buckets: false,
-      feature_vector_buckets_max_buckets: 0,
-      feature_vector_buckets_max_indexes: 0,
-      image_transformation_max_resolution: null,
-      database_pool_url: null,
-      max_connections: null,
-      migrations_version: migrationVersion,
-      migrations_status: 'COMPLETED',
-      tracing_mode: null,
-      disable_events: null,
-    }
+    const encryptedTenant = createEncryptedTenantRow(tenantIds[0])
 
     const { tenantModule, multitenantPgModule } = await loadTenantModule(2)
     const querySpy = vi
@@ -1062,220 +1157,114 @@ describe('Tenant configs', () => {
       })
       vi.doUnmock('@internal/cache')
       vi.resetModules()
-      querySpy.mockRestore()
     }
   })
 
-  test('Tenant config maxConnections change rebalances cached pg pool without destroying it', async () => {
-    const tenantId = 'pool-max-connections-change'
-    const encryptedTenant = {
-      anon_key: encrypt('anon'),
-      database_url: encrypt('postgres://tenant'),
-      file_size_limit: 1,
-      jwt_secret: encrypt('jwt-secret'),
-      jwks: null,
-      service_key: encrypt('service-key'),
-      feature_purge_cache: false,
-      feature_image_transformation: false,
-      feature_s3_protocol: false,
-      feature_iceberg_catalog: false,
-      feature_iceberg_catalog_max_catalogs: 0,
-      feature_iceberg_catalog_max_namespaces: 0,
-      feature_iceberg_catalog_max_tables: 0,
-      feature_vector_buckets: false,
-      feature_vector_buckets_max_buckets: 0,
-      feature_vector_buckets_max_indexes: 0,
-      image_transformation_max_resolution: null,
-      database_pool_url: null,
-      max_connections: 20,
-      migrations_version: migrationVersion,
-      migrations_status: 'COMPLETED',
-      tracing_mode: null,
-      disable_events: null,
-    }
+  test('Get tenant config hot reads do not renew the absolute ttl', async () => {
+    const tenantId = 'cache-absolute-ttl'
+    const encryptedTenant = createEncryptedTenantRow(tenantId)
+    let now = 1
+
+    const { tenantModule, multitenantPgModule } = await loadTenantModule(2, {
+      ttl: 10,
+      ttlJitterRatio: 0,
+      ttlResolution: 0,
+      perf: { now: () => now },
+    })
     const querySpy = vi
-      .spyOn(multitenantPgExecutor, 'query')
-      .mockResolvedValueOnce(mockTenantQueryResult(encryptedTenant))
-      .mockResolvedValueOnce(
-        mockTenantQueryResult({
-          ...encryptedTenant,
-          max_connections: 40,
-        })
-      )
-    const destroySpy = vi.spyOn(PgTenantConnection.poolManager, 'destroy').mockResolvedValue()
-    const rebalanceSpy = vi.spyOn(PgTenantConnection.poolManager, 'rebalance')
+      .spyOn(multitenantPgModule.multitenantPgExecutor, 'query')
+      .mockResolvedValue(mockTenantQueryResult(encryptedTenant))
 
     try {
-      await getTenantConfig(tenantId)
-      await onTenantConfigChange(tenantId)
+      await tenantModule.getTenantConfig(tenantId)
 
-      expect(rebalanceSpy).toHaveBeenCalledWith(tenantId, { maxConnections: 40 })
-      expect(destroySpy).not.toHaveBeenCalled()
+      now = 5
+      await tenantModule.getTenantConfig(tenantId)
+      expect(querySpy).toHaveBeenCalledTimes(1)
+
+      now = 12
+      await tenantModule.getTenantConfig(tenantId)
+      expect(querySpy).toHaveBeenCalledTimes(2)
     } finally {
-      deleteTenantConfig(tenantId)
-      querySpy.mockRestore()
-      destroySpy.mockRestore()
-      rebalanceSpy.mockRestore()
+      tenantModule.deleteTenantConfig(tenantId)
+      vi.doUnmock('@internal/cache')
+      vi.resetModules()
     }
   })
 
-  test('Tenant config databaseUrl change destroys the cached pg pool', async () => {
-    const tenantId = 'pool-dburl-change'
-    const encryptedTenant = {
-      anon_key: encrypt('anon'),
+  test('An invalidated config load retries through the current generation', async () => {
+    const tenantId = 'tenant-config-invalidation-race'
+    const oldTenant = {
+      ...createEncryptedTenantRow(tenantId),
       database_url: encrypt('postgres://old-host'),
-      file_size_limit: 1,
-      jwt_secret: encrypt('jwt-secret'),
-      jwks: null,
-      service_key: encrypt('service-key'),
-      feature_purge_cache: false,
-      feature_image_transformation: false,
-      feature_s3_protocol: false,
-      feature_iceberg_catalog: false,
-      feature_iceberg_catalog_max_catalogs: 0,
-      feature_iceberg_catalog_max_namespaces: 0,
-      feature_iceberg_catalog_max_tables: 0,
-      feature_vector_buckets: false,
-      feature_vector_buckets_max_buckets: 0,
-      feature_vector_buckets_max_indexes: 0,
-      image_transformation_max_resolution: null,
-      database_pool_url: null,
-      max_connections: 20,
-      migrations_version: migrationVersion,
-      migrations_status: 'COMPLETED',
-      tracing_mode: null,
-      disable_events: null,
     }
+    const newTenant = {
+      ...oldTenant,
+      database_url: encrypt('postgres://new-host'),
+    }
+    const oldQuery = Promise.withResolvers<ReturnType<typeof mockTenantQueryResult>>()
     const querySpy = vi
       .spyOn(multitenantPgExecutor, 'query')
-      .mockResolvedValueOnce(mockTenantQueryResult(encryptedTenant))
-      .mockResolvedValueOnce(
-        mockTenantQueryResult({
-          ...encryptedTenant,
-          database_url: encrypt('postgres://new-host'),
-        })
-      )
-    const destroySpy = vi.spyOn(PgTenantConnection.poolManager, 'destroy').mockResolvedValue()
-    const rebalanceSpy = vi.spyOn(PgTenantConnection.poolManager, 'rebalance')
+      .mockReturnValueOnce(oldQuery.promise)
+      .mockResolvedValueOnce(mockTenantQueryResult(newTenant))
+    const recordSpy = vi.spyOn(metrics, 'recordCacheRequest')
 
     try {
-      await getTenantConfig(tenantId)
-      await onTenantConfigChange(tenantId)
+      const staleLookup = getTenantConfig(tenantId)
+      await vi.waitFor(() => expect(querySpy).toHaveBeenCalledTimes(1))
 
-      expect(destroySpy).toHaveBeenCalledWith(tenantId)
-      expect(rebalanceSpy).not.toHaveBeenCalled()
+      onTenantConfigChange(tenantId)
+
+      await expect(staleLookup).resolves.toMatchObject({
+        databaseUrl: 'postgres://new-host',
+      })
+      expect(querySpy).toHaveBeenCalledTimes(2)
+      expect(getCacheRequestCalls(recordSpy, TENANT_CONFIG_CACHE_NAME)).toEqual([
+        [TENANT_CONFIG_CACHE_NAME, 'miss'],
+      ])
+
+      oldQuery.resolve(mockTenantQueryResult(oldTenant))
+      await new Promise<void>((resolve) => setImmediate(resolve))
+
+      await expect(getTenantConfig(tenantId)).resolves.toMatchObject({
+        databaseUrl: 'postgres://new-host',
+      })
+      expect(getCacheRequestCalls(recordSpy, TENANT_CONFIG_CACHE_NAME)).toEqual([
+        [TENANT_CONFIG_CACHE_NAME, 'miss'],
+        [TENANT_CONFIG_CACHE_NAME, 'hit'],
+      ])
     } finally {
       deleteTenantConfig(tenantId)
-      querySpy.mockRestore()
-      destroySpy.mockRestore()
-      rebalanceSpy.mockRestore()
     }
   })
 
-  test('Tenant config databasePoolUrl change destroys the cached pg pool', async () => {
-    const tenantId = 'pool-dbpoolurl-change'
-    const encryptedTenant = {
-      anon_key: encrypt('anon'),
-      database_url: encrypt('postgres://tenant'),
-      file_size_limit: 1,
-      jwt_secret: encrypt('jwt-secret'),
-      jwks: null,
-      service_key: encrypt('service-key'),
-      feature_purge_cache: false,
-      feature_image_transformation: false,
-      feature_s3_protocol: false,
-      feature_iceberg_catalog: false,
-      feature_iceberg_catalog_max_catalogs: 0,
-      feature_iceberg_catalog_max_namespaces: 0,
-      feature_iceberg_catalog_max_tables: 0,
-      feature_vector_buckets: false,
-      feature_vector_buckets_max_buckets: 0,
-      feature_vector_buckets_max_indexes: 0,
-      image_transformation_max_resolution: null,
-      database_pool_url: encrypt('postgres://old-pooler'),
-      max_connections: 20,
-      migrations_version: migrationVersion,
-      migrations_status: 'COMPLETED',
-      tracing_mode: null,
-      disable_events: null,
+  test('An invalidated config load that fails retries through the current generation', async () => {
+    const tenantId = 'tenant-config-invalidation-error'
+    const freshTenant = {
+      ...createEncryptedTenantRow(tenantId),
+      database_url: encrypt('postgres://fresh-host-after-error'),
     }
+    const staleQuery = Promise.withResolvers<never>()
     const querySpy = vi
       .spyOn(multitenantPgExecutor, 'query')
-      .mockResolvedValueOnce(mockTenantQueryResult(encryptedTenant))
-      .mockResolvedValueOnce(
-        mockTenantQueryResult({
-          ...encryptedTenant,
-          database_pool_url: encrypt('postgres://new-pooler'),
-        })
-      )
-    const destroySpy = vi.spyOn(PgTenantConnection.poolManager, 'destroy').mockResolvedValue()
-    const rebalanceSpy = vi.spyOn(PgTenantConnection.poolManager, 'rebalance')
+      .mockReturnValueOnce(staleQuery.promise)
+      .mockResolvedValueOnce(mockTenantQueryResult(freshTenant))
 
     try {
-      await getTenantConfig(tenantId)
-      await onTenantConfigChange(tenantId)
+      const staleLookup = getTenantConfig(tenantId)
+      await vi.waitFor(() => expect(querySpy).toHaveBeenCalledTimes(1))
 
-      expect(destroySpy).toHaveBeenCalledWith(tenantId)
-      expect(rebalanceSpy).not.toHaveBeenCalled()
+      onTenantConfigChange(tenantId)
+      const currentLookup = getTenantConfig(tenantId)
+      staleQuery.reject(new Error('detached tenant config load failed'))
+
+      await expect(Promise.all([staleLookup, currentLookup])).resolves.toEqual([
+        expect.objectContaining({ databaseUrl: 'postgres://fresh-host-after-error' }),
+        expect.objectContaining({ databaseUrl: 'postgres://fresh-host-after-error' }),
+      ])
+      expect(querySpy).toHaveBeenCalledTimes(2)
     } finally {
       deleteTenantConfig(tenantId)
-      querySpy.mockRestore()
-      destroySpy.mockRestore()
-      rebalanceSpy.mockRestore()
-    }
-  })
-
-  test('Tenant config dbUrl change with maxConnections change destroys instead of rebalancing', async () => {
-    const tenantId = 'pool-dburl-and-max-change'
-    const encryptedTenant = {
-      anon_key: encrypt('anon'),
-      database_url: encrypt('postgres://old-host'),
-      file_size_limit: 1,
-      jwt_secret: encrypt('jwt-secret'),
-      jwks: null,
-      service_key: encrypt('service-key'),
-      feature_purge_cache: false,
-      feature_image_transformation: false,
-      feature_s3_protocol: false,
-      feature_iceberg_catalog: false,
-      feature_iceberg_catalog_max_catalogs: 0,
-      feature_iceberg_catalog_max_namespaces: 0,
-      feature_iceberg_catalog_max_tables: 0,
-      feature_vector_buckets: false,
-      feature_vector_buckets_max_buckets: 0,
-      feature_vector_buckets_max_indexes: 0,
-      image_transformation_max_resolution: null,
-      database_pool_url: null,
-      max_connections: 20,
-      migrations_version: migrationVersion,
-      migrations_status: 'COMPLETED',
-      tracing_mode: null,
-      disable_events: null,
-    }
-    const querySpy = vi
-      .spyOn(multitenantPgExecutor, 'query')
-      .mockResolvedValueOnce(mockTenantQueryResult(encryptedTenant))
-      .mockResolvedValueOnce(
-        mockTenantQueryResult({
-          ...encryptedTenant,
-          database_url: encrypt('postgres://new-host'),
-          max_connections: 40,
-        })
-      )
-    const destroySpy = vi.spyOn(PgTenantConnection.poolManager, 'destroy').mockResolvedValue()
-    const rebalanceSpy = vi.spyOn(PgTenantConnection.poolManager, 'rebalance')
-
-    try {
-      await getTenantConfig(tenantId)
-      await onTenantConfigChange(tenantId)
-
-      expect(destroySpy).toHaveBeenCalledWith(tenantId)
-      expect(rebalanceSpy).not.toHaveBeenCalled()
-    } finally {
-      deleteTenantConfig(tenantId)
-      querySpy.mockRestore()
-      destroySpy.mockRestore()
-      rebalanceSpy.mockRestore()
     }
   })
 
@@ -1284,29 +1273,8 @@ describe('Tenant configs', () => {
     const recordSpy = vi.spyOn(metrics, 'recordCacheRequest')
     const tenantId = 'cache-metrics-lookup'
     const encryptedTenant = {
-      anon_key: encrypt('anon'),
+      ...createEncryptedTenantRow(tenantId),
       database_url: encrypt('postgres://tenant'),
-      file_size_limit: 1,
-      jwt_secret: encrypt('jwt-secret'),
-      jwks: null,
-      service_key: encrypt('service-key'),
-      feature_purge_cache: false,
-      feature_image_transformation: false,
-      feature_s3_protocol: false,
-      feature_iceberg_catalog: false,
-      feature_iceberg_catalog_max_catalogs: 0,
-      feature_iceberg_catalog_max_namespaces: 0,
-      feature_iceberg_catalog_max_tables: 0,
-      feature_vector_buckets: false,
-      feature_vector_buckets_max_buckets: 0,
-      feature_vector_buckets_max_indexes: 0,
-      image_transformation_max_resolution: null,
-      database_pool_url: null,
-      max_connections: null,
-      migrations_version: migrationVersion,
-      migrations_status: 'COMPLETED',
-      tracing_mode: null,
-      disable_events: null,
     }
 
     const tenantQuery = Promise.withResolvers<never>()
@@ -1331,8 +1299,233 @@ describe('Tenant configs', () => {
       })
     } finally {
       deleteTenantConfig(tenantId)
+    }
+  })
+})
+
+describe('Tenant migration version recorded by a newer release', () => {
+  const unrecognizedWarning = '[Migrations] Tenant migration unrecognized by this binary'
+
+  async function createTenantWithMigration(version: string | null) {
+    const response = await adminApp.inject({
+      method: 'POST',
+      url: `/tenants/abc`,
+      payload,
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+    expect(response.statusCode).toBe(201)
+    await setRecordedMigration(version, TenantMigrationStatus.COMPLETED)
+  }
+
+  async function setRecordedMigration(version: string | null, status: TenantMigrationStatus) {
+    await multitenantPgExecutor.query({
+      text: 'UPDATE tenants SET migrations_version = $2, migrations_status = $3 WHERE id = $1',
+      values: ['abc', version, status],
+    })
+    deleteTenantConfig('abc')
+  }
+
+  async function recordedMigration() {
+    const { rows } = await multitenantPgExecutor.query({
+      text: 'SELECT migrations_version, migrations_status FROM tenants WHERE id = $1',
+      values: ['abc'],
+    })
+    return rows[0]
+  }
+
+  test.each([
+    ['an unknown', 'future-migration', migrationVersion, true],
+    ['a known', 'storage-schema', 'storage-schema', false],
+    ['a null', null, null, false],
+    ['an empty', '', '', false],
+  ] as const)('reads %s stored version', async (_, stored, expected, ahead) => {
+    const warning = vi.spyOn(logSchema, 'warning').mockImplementation(() => undefined)
+    await createTenantWithMigration(stored)
+
+    const config = await getTenantConfig('abc')
+
+    expect(config.migrationVersion).toBe(expected)
+    expect(config.migrationVersionAhead).toBe(ahead)
+    const warnings = warning.mock.calls.filter(([, message]) => message === unrecognizedWarning)
+    expect(warnings).toHaveLength(ahead ? 1 : 0)
+    if (ahead) {
+      expect(warnings[0][2]).toMatchObject({
+        project: 'abc',
+        metadata: expect.stringContaining('future-migration'),
+      })
+    }
+  })
+
+  test('an older release cannot overwrite the stored version and reloads its config', async () => {
+    vi.spyOn(logSchema, 'warning').mockImplementation(() => undefined)
+    await createTenantWithMigration('future-migration')
+    await getTenantConfig('abc')
+
+    await expect(
+      migrate.updateTenantMigrationsState('abc', {
+        migration: 'storage-schema',
+        state: TenantMigrationStatus.COMPLETED,
+      })
+    ).resolves.toBe(0)
+    await expect(
+      migrate.updateTenantMigrationsState('abc', { state: TenantMigrationStatus.FAILED })
+    ).resolves.toBe(0)
+    await expect(recordedMigration()).resolves.toEqual({
+      migrations_version: 'future-migration',
+      migrations_status: TenantMigrationStatus.COMPLETED,
+    })
+
+    // The skipped write evicted the cached config, so the next read sees the row as it is now.
+    await multitenantPgExecutor.query({
+      text: 'UPDATE tenants SET migrations_status = $2 WHERE id = $1',
+      values: ['abc', TenantMigrationStatus.FAILED],
+    })
+    await expect(getTenantConfig('abc')).resolves.toMatchObject({
+      migrationVersion,
+      migrationVersionAhead: true,
+      migrationStatus: TenantMigrationStatus.FAILED,
+    })
+  })
+
+  test('a known stored version still accepts migration state writes', async () => {
+    await createTenantWithMigration('initialmigration')
+
+    await expect(
+      migrate.updateTenantMigrationsState('abc', {
+        migration: 'storage-schema',
+        state: TenantMigrationStatus.COMPLETED,
+      })
+    ).resolves.toBe(1)
+    await expect(
+      migrate.updateTenantMigrationsState('abc', { state: TenantMigrationStatus.FAILED })
+    ).resolves.toBe(1)
+    await expect(recordedMigration()).resolves.toEqual({
+      migrations_version: 'storage-schema',
+      migrations_status: TenantMigrationStatus.FAILED,
+    })
+  })
+})
+
+describe('Tenant capabilities', () => {
+  test.each([
+    {
+      description: 'the flag is disabled after the migration',
+      enabled: false,
+      appFlag: false,
+      migrationVersion: 'unlock-object-versioning',
+      expected: false,
+    },
+    {
+      description: 'the flag is enabled before the migration',
+      enabled: true,
+      appFlag: false,
+      migrationVersion: 'object-versioning-core',
+      expected: false,
+    },
+    {
+      description: 'the flag is enabled after the migration',
+      enabled: true,
+      appFlag: false,
+      migrationVersion: 'unlock-object-versioning',
+      expected: true,
+    },
+    {
+      description: 'the application flag overrides a disabled tenant flag',
+      enabled: false,
+      appFlag: true,
+      migrationVersion: 'unlock-object-versioning',
+      expected: true,
+    },
+    {
+      description: 'the application flag is set before the migration',
+      enabled: false,
+      appFlag: true,
+      migrationVersion: 'object-versioning-core',
+      expected: false,
+    },
+  ] as const)('reports object versioning when $description', async ({
+    enabled,
+    appFlag,
+    migrationVersion,
+    expected,
+  }) => {
+    const previousMultitenant = process.env.MULTI_TENANT
+    const previousObjectVersioning = process.env.STORAGE_VERSIONING_ENABLED
+    process.env.MULTI_TENANT = 'true'
+    process.env.STORAGE_VERSIONING_ENABLED = String(appFlag)
+
+    const tenantId = `capability-${enabled}-${appFlag}-${migrationVersion}`
+    const encryptedTenant = createEncryptedTenantRow(tenantId, {
+      ...payload,
+      migrationVersion,
+      features: {
+        ...payload.features,
+        objectVersioning: { enabled },
+      },
+    })
+    const { tenantModule, multitenantPgModule } = await loadTenantModule(2)
+    const querySpy = vi
+      .spyOn(multitenantPgModule.multitenantPgExecutor, 'query')
+      .mockResolvedValue(mockTenantQueryResult(encryptedTenant))
+
+    try {
+      await expect(tenantModule.getTenantCapabilities(tenantId)).resolves.toEqual({
+        list_V2: true,
+        iceberg_catalog: true,
+        object_versioning: expected,
+      })
+    } finally {
+      tenantModule.deleteTenantConfig(tenantId)
       querySpy.mockRestore()
-      recordSpy.mockRestore()
+      vi.doUnmock('@internal/cache')
+      vi.resetModules()
+
+      if (previousMultitenant === undefined) {
+        delete process.env.MULTI_TENANT
+      } else {
+        process.env.MULTI_TENANT = previousMultitenant
+      }
+
+      if (previousObjectVersioning === undefined) {
+        delete process.env.STORAGE_VERSIONING_ENABLED
+      } else {
+        process.env.STORAGE_VERSIONING_ENABLED = previousObjectVersioning
+      }
+    }
+  })
+
+  test.each([
+    false,
+    true,
+  ])('uses the single-tenant application object versioning flag when enabled is %s', async (enabled) => {
+    const previousMultitenant = process.env.MULTI_TENANT
+    const previousObjectVersioning = process.env.STORAGE_VERSIONING_ENABLED
+    process.env.MULTI_TENANT = 'false'
+    process.env.STORAGE_VERSIONING_ENABLED = String(enabled)
+
+    const { tenantModule } = await loadTenantModule(2)
+
+    try {
+      await expect(tenantModule.getTenantCapabilities('single-tenant')).resolves.toMatchObject({
+        object_versioning: enabled,
+      })
+    } finally {
+      vi.doUnmock('@internal/cache')
+      vi.resetModules()
+
+      if (previousMultitenant === undefined) {
+        delete process.env.MULTI_TENANT
+      } else {
+        process.env.MULTI_TENANT = previousMultitenant
+      }
+
+      if (previousObjectVersioning === undefined) {
+        delete process.env.STORAGE_VERSIONING_ENABLED
+      } else {
+        process.env.STORAGE_VERSIONING_ENABLED = previousObjectVersioning
+      }
     }
   })
 })

@@ -22,6 +22,7 @@ function setupLoggerMocks(configOverrides: Record<string, unknown> = {}) {
     vi.fn(() => loggerStub),
     {
       stdTimeFunctions: {
+        epochTime: vi.fn(),
         isoTime: vi.fn(),
       },
     }
@@ -70,7 +71,6 @@ describe('logger serializers', () => {
       vi.doUnmock(moduleId)
     }
 
-    vi.restoreAllMocks()
     vi.resetModules()
   })
 
@@ -177,11 +177,13 @@ describe('logger serializers', () => {
             req: (request: unknown) => unknown
             res: (reply: unknown) => unknown
           }
+          timestamp: () => string
         },
       ]
     >
     const pinoCall = pinoCalls.at(0)
     expect(pinoCall).toBeDefined()
+    expect(pinoCall![0].timestamp).toBe(pinoMock.stdTimeFunctions.epochTime)
     const serializers = pinoCall![0].serializers
     const serializedRequest = serializeRequestLog({
       id: 'trace-1',

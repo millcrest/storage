@@ -64,7 +64,7 @@ export class ObjectAdminDelete extends BaseEvent<ObjectDeleteEvent> {
       logger.error(
         {
           error: e,
-          jodId: job.id,
+          jobId: job.id,
           type: 'event',
           event: 'ObjectAdminDelete',
           payload: JSON.stringify(job.data),
@@ -80,18 +80,7 @@ export class ObjectAdminDelete extends BaseEvent<ObjectDeleteEvent> {
       throw e
     } finally {
       if (storage) {
-        const tenant = storage.db.tenant()
-        storage.db
-          .destroyConnection()
-          .then(() => {
-            // no-op
-          })
-          .catch((e) => {
-            logger.error(
-              { error: e, sbReqId: job.data.sbReqId },
-              `[Admin]: ObjectAdminDelete ${tenant.ref} - FAILED DISPOSING CONNECTION`
-            )
-          })
+        storage.db.destroyConnection()
       }
     }
   }

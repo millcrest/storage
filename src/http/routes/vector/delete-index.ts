@@ -1,6 +1,7 @@
 import { ERRORS } from '@internal/errors'
 import { FastifyInstance } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
+import { sharedErrorResponseSchemas } from '../../schemas/error'
 import { AuthenticatedRequest } from '../../types'
 import { ROUTE_OPERATIONS } from '../operations'
 import { compileNoCoercionValidator } from './validation'
@@ -37,10 +38,11 @@ export default async function routes(fastify: FastifyInstance) {
     {
       validatorCompiler: deleteVectorIndexValidator,
       config: {
-        operation: { type: ROUTE_OPERATIONS.DELETE_VECTOR_INDEX },
+        operation: ROUTE_OPERATIONS.DELETE_VECTOR_INDEX,
       },
       schema: {
         ...deleteVectorIndex,
+        response: sharedErrorResponseSchemas,
         tags: ['vector'],
       },
     },

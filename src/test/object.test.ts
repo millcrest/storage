@@ -11,8 +11,13 @@ import {
   signJWT,
   verifyJWT,
 } from '@internal/auth'
-import { getPostgresConnection, getServiceKeyUser, PgTransaction } from '@internal/database'
+import {
+  type DatabaseTransaction,
+  getPostgresConnection,
+  getServiceKeyUser,
+} from '@internal/database'
 import { ErrorCode, StorageBackendError } from '@internal/errors'
+import { StoragePgDB } from '@storage/database'
 import { MAX_OBJECTS_PER_REQUEST } from '@storage/limits'
 import { randomUUID } from 'crypto'
 import { FastifyInstance } from 'fastify'
@@ -20,7 +25,12 @@ import FormData from 'form-data'
 import fs from 'fs'
 import app from '../app'
 import { getConfig, JwksConfig, JwksConfigKeyOCT, mergeConfig } from '../config'
-import { backends, Obj } from '../storage'
+import {
+  backends,
+  OBJECT_LISTING_FILTER_MODES,
+  Obj,
+  type ObjectListingFilterMode,
+} from '../storage'
 import { ObjectAdminDelete } from '../storage/events'
 import { useMockObject, useMockQueue } from './common'
 import { useStorage, withDeleteEnabled } from './utils/storage'
@@ -36,7 +46,7 @@ type SignedUrlResult = {
   signedURL: string | null
 }
 
-let tnx: PgTransaction | undefined
+let tnx: DatabaseTransaction | undefined
 async function getSuperuserPostgrestClient() {
   const superUser = await getServiceKeyUser(tenantId)
 
@@ -52,7 +62,7 @@ async function getSuperuserPostgrestClient() {
 }
 
 async function findObject(
-  db: PgTransaction,
+  db: DatabaseTransaction,
   bucketId: string,
   name: string
 ): Promise<Obj | undefined> {
@@ -71,7 +81,7 @@ async function findObject(
 }
 
 async function insertObjects(
-  db: PgTransaction,
+  db: DatabaseTransaction,
   objects:
     | Array<Partial<Obj> & { bucket_id: string; name: string }>
     | (Partial<Obj> & { bucket_id: string; name: string })
@@ -90,7 +100,11 @@ async function insertObjects(
   }
 }
 
-async function deleteObjectsByName(db: PgTransaction, bucketId: string, names: string | string[]) {
+async function deleteObjectsByName(
+  db: DatabaseTransaction,
+  bucketId: string,
+  names: string | string[]
+) {
   await db.query({
     text: `
       DELETE FROM objects
@@ -101,7 +115,7 @@ async function deleteObjectsByName(db: PgTransaction, bucketId: string, names: s
   })
 }
 
-async function insertObjectNames(db: PgTransaction, bucketId: string, names: string[]) {
+async function insertObjectNames(db: DatabaseTransaction, bucketId: string, names: string[]) {
   const owner = '317eadce-631a-4429-a0bb-f19a7a517b4a'
   const versions = names.map((_, index) => `test-version-${randomUUID()}-${index}`)
 
@@ -116,7 +130,7 @@ async function insertObjectNames(db: PgTransaction, bucketId: string, names: str
 }
 
 async function insertBucket(
-  db: PgTransaction,
+  db: DatabaseTransaction,
   bucket: {
     id: string
     name: string
@@ -257,8 +271,168 @@ describe('testing GET object', () => {
       statusCode: '404',
       error: 'not_found',
       message: 'Object not found',
+      code: ErrorCode.NoSuchKey,
     })
     expect(S3Backend.prototype.headObject).not.toHaveBeenCalled()
+  })
+
+  test('can get an object by an existing version id', async () => {
+    const runId = randomUUID()
+    const objectName = `authenticated/get-by-version-${runId}.png`
+    const version = `get-by-version-${runId}`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version,
+      metadata: { mimetype: 'image/png', size: 1234 },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'GET',
+        url: `/object/authenticated/bucket2/${objectName}?versionId=${version}`,
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      expect(S3Backend.prototype.getObject).toHaveBeenCalled()
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [objectName])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('returns NoSuchKey when getting an object by a version id that does not exist', async () => {
+    const response = await appInstance.inject({
+      method: 'GET',
+      url: '/object/authenticated/bucket2/authenticated/casestudy.png?versionId=does-not-exist',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'not_found',
+      message: 'Object not found',
+      code: ErrorCode.NoSuchKey,
+    })
+  })
+
+  test('can get object info by an existing version id', async () => {
+    const runId = randomUUID()
+    const objectName = `authenticated/get-info-by-version-${runId}.png`
+    const version = `get-info-by-version-${runId}`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version,
+      metadata: { mimetype: 'image/png', size: 1234 },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'GET',
+        url: `/object/info/authenticated/bucket2/${objectName}?versionId=${version}`,
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [objectName])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('returns NoSuchKey when getting object info by a version id that does not exist', async () => {
+    const response = await appInstance.inject({
+      method: 'GET',
+      url: '/object/info/authenticated/bucket2/authenticated/casestudy.png?versionId=does-not-exist',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'not_found',
+      message: 'Object not found',
+      code: ErrorCode.NoSuchKey,
+    })
+  })
+
+  test('can get a public object by an existing version id', async () => {
+    const runId = randomUUID()
+    const bucketId = `public-get-by-version-${runId}`
+    const objectName = 'get-by-version.png'
+    const version = `public-get-by-version-${runId}`
+
+    const superUser = await getServiceKeyUser(tenantId)
+    const db = await getPostgresConnection({
+      superUser,
+      user: superUser,
+      tenantId,
+      host: 'localhost',
+    })
+    const setupTx = await db.transaction()
+    await insertBucket(setupTx, {
+      id: bucketId,
+      name: bucketId,
+      public: true,
+      file_size_limit: null,
+      allowed_mime_types: null,
+      type: 'STANDARD',
+    })
+    await insertObjects(setupTx, {
+      bucket_id: bucketId,
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version,
+      metadata: { mimetype: 'image/png', size: 1234 },
+    })
+    await setupTx.commit()
+    db.dispose()
+
+    const response = await appInstance.inject({
+      method: 'GET',
+      url: `/object/public/${bucketId}/${objectName}?versionId=${version}`,
+    })
+    expect(response.statusCode).toBe(200)
+    expect(S3Backend.prototype.getObject).toHaveBeenCalled()
+  })
+
+  test('returns NoSuchKey when getting a public object by a version id that does not exist', async () => {
+    const response = await appInstance.inject({
+      method: 'GET',
+      url: '/object/public/public-bucket-2/favicon.ico?versionId=does-not-exist',
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'not_found',
+      message: 'Object not found',
+      code: ErrorCode.NoSuchKey,
+    })
   })
 
   test('cannot get authenticated object info without the /authenticated prefix if no jwt is provided', async () => {
@@ -448,6 +622,7 @@ describe('testing POST object via multipart upload', () => {
         statusCode: '403',
         error: 'Unauthorized',
         message: 'new row violates row-level security policy',
+        code: ErrorCode.AccessDenied,
       })
     )
   })
@@ -537,6 +712,7 @@ describe('testing POST object via multipart upload', () => {
       error: 'Payload too large',
       message: 'The object exceeded the maximum allowed size',
       statusCode: '413',
+      code: ErrorCode.EntityTooLarge,
     })
     expect(S3Backend.prototype.uploadObject).toHaveBeenCalled()
   })
@@ -727,6 +903,7 @@ describe('testing POST object via multipart upload', () => {
       error: 'invalid_mime_type',
       message: `mime type image/png is not supported`,
       statusCode: '415',
+      code: ErrorCode.InvalidMimeType,
     })
     expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
   })
@@ -751,6 +928,7 @@ describe('testing POST object via multipart upload', () => {
       error: 'invalid_mime_type',
       message: `mime type image/png is not supported`,
       statusCode: '415',
+      code: ErrorCode.InvalidMimeType,
     })
     expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
   })
@@ -800,6 +978,7 @@ describe('testing POST object via multipart upload', () => {
         error: 'invalid_mime_type',
         message: `mime type image/png is not supported`,
         statusCode: '415',
+        code: ErrorCode.InvalidMimeType,
       })
       expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
     } finally {
@@ -837,6 +1016,7 @@ describe('testing POST object via multipart upload', () => {
       error: 'invalid_mime_type',
       message: 'Invalid Content-Type header',
       statusCode: '415',
+      code: ErrorCode.InvalidMimeType,
     })
     expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
   })
@@ -861,6 +1041,7 @@ describe('testing POST object via multipart upload', () => {
       error: 'invalid_mime_type',
       message: 'Invalid Content-Type header',
       statusCode: '415',
+      code: ErrorCode.InvalidMimeType,
     })
     expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
   })
@@ -906,6 +1087,7 @@ describe('testing POST object via multipart upload', () => {
         statusCode: '413',
         error: 'Payload too large',
         message: 'The object exceeded the maximum allowed size',
+        code: ErrorCode.EntityTooLarge,
       })
     )
   })
@@ -940,7 +1122,7 @@ describe('testing POST object via multipart upload', () => {
       })
     )
 
-    process.env.FILE_SIZE_LIMIT = '1'
+    vi.stubEnv('FILE_SIZE_LIMIT', '1')
     const form = new FormData()
     form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
     const headers = Object.assign({}, form.getHeaders(), {
@@ -1027,6 +1209,7 @@ describe('testing POST object via binary upload', () => {
         statusCode: '403',
         error: 'Unauthorized',
         message: 'new row violates row-level security policy',
+        code: ErrorCode.AccessDenied,
       })
     )
   })
@@ -1136,6 +1319,7 @@ describe('testing POST object via binary upload', () => {
         statusCode: '413',
         error: 'Payload too large',
         message: 'The object exceeded the maximum allowed size',
+        code: ErrorCode.EntityTooLarge,
       })
     )
   })
@@ -1163,7 +1347,7 @@ describe('testing POST object via binary upload', () => {
       type: 'STANDARD',
     })
     await setupTx.commit()
-    await db.dispose()
+    db.dispose()
 
     const path = './src/test/assets/sadcat.jpg'
     const { size } = fs.statSync(path)
@@ -1187,6 +1371,7 @@ describe('testing POST object via binary upload', () => {
         statusCode: '413',
         error: 'Payload too large',
         message: 'The object exceeded the maximum allowed size',
+        code: ErrorCode.EntityTooLarge,
       })
     )
     // Early size check in fileUploadFromRequest rejects before reaching the backend
@@ -1227,7 +1412,7 @@ describe('testing POST object via binary upload', () => {
       })
     )
 
-    process.env.FILE_SIZE_LIMIT = '1'
+    vi.stubEnv('FILE_SIZE_LIMIT', '1')
     const path = './src/test/assets/sadcat.jpg'
     const { size } = fs.statSync(path)
 
@@ -1531,6 +1716,119 @@ describe('testing PUT object via binary upload', () => {
  * POST /copy
  */
 describe('testing copy object', () => {
+  const storageTest = useStorage()
+
+  test('defaults omitted copyMetadata to preserving source metadata', async () => {
+    const runId = randomUUID()
+    const sourceKey = `authenticated/copy-default-source-${runId}.png`
+    const destinationKey = `authenticated/copy-default-destination-${runId}.png`
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: sourceKey,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version: `copy-default-source-version-${runId}`,
+      metadata: {
+        cacheControl: 'max-age=60',
+        eTag: `source-${runId}`,
+        mimetype: 'image/png',
+        size: 1234,
+      },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      await storageTest.storage.from('bucket2').copyObject({
+        sourceKey,
+        destinationBucket: 'bucket2',
+        destinationKey,
+        uploadType: 'standard',
+      })
+
+      expect(S3Backend.prototype.copyObject).toHaveBeenLastCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.any(String),
+        expect.any(String),
+        expect.any(String),
+        expect.objectContaining({
+          cacheControl: 'max-age=60',
+          mimetype: 'image/png',
+        }),
+        undefined,
+        { copyMetadata: true }
+      )
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [sourceKey, destinationKey])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('does not overwrite a destination created after copy authorization', async () => {
+    const runId = randomUUID()
+    const sourceKey = `authenticated/copy-race-source-${runId}.png`
+    const destinationKey = `authenticated/copy-race-destination-${runId}.png`
+    const sourceVersion = `copy-race-source-version-${runId}`
+    const destinationVersion = `copy-race-destination-version-${runId}`
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: sourceKey,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version: sourceVersion,
+      metadata: { mimetype: 'image/png', size: 1234 },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    vi.mocked(S3Backend.prototype.copyObject).mockImplementationOnce(async () => {
+      const concurrentTx = await getSuperuserPostgrestClient()
+      await insertObjects(concurrentTx, {
+        bucket_id: 'bucket2',
+        name: destinationKey,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: destinationVersion,
+        metadata: { mimetype: 'image/png', size: 1234 },
+      })
+      await concurrentTx.commit()
+      tnx = undefined
+      return {
+        httpStatusCode: 200,
+        lastModified: new Date('Thu, 12 Aug 2021 16:00:00 GMT'),
+        eTag: 'abc',
+      }
+    })
+
+    try {
+      await expect(
+        storageTest.storage.from('bucket2').copyObject({
+          sourceKey,
+          destinationBucket: 'bucket2',
+          destinationKey,
+          uploadType: 'standard',
+        })
+      ).rejects.toMatchObject({ code: ErrorCode.KeyAlreadyExists })
+
+      const verificationTx = await getSuperuserPostgrestClient()
+      const destination = await findObject(verificationTx, 'bucket2', destinationKey)
+      await verificationTx.commit()
+      tnx = undefined
+      expect(destination?.version).toBe(destinationVersion)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [sourceKey, destinationKey])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
   test('check if RLS policies are respected: authenticated user is able to copy authenticated resource', async () => {
     const response = await appInstance.inject({
       method: 'POST',
@@ -1588,6 +1886,18 @@ describe('testing copy object', () => {
     })
     expect(response.statusCode).toBe(200)
     expect(S3Backend.prototype.copyObject).toHaveBeenCalled()
+    expect(S3Backend.prototype.copyObject).toHaveBeenLastCalledWith(
+      expect.any(String),
+      expect.any(String),
+      null,
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({
+        cacheControl: 'no-cache',
+      }),
+      undefined,
+      { copyMetadata: true }
+    )
     const jsonResponse = response.json()
     expect(jsonResponse.Key).toBe(`bucket2/authenticated/${copiedKey}`)
 
@@ -1627,6 +1937,19 @@ describe('testing copy object', () => {
     })
     expect(response.statusCode).toBe(200)
     expect(S3Backend.prototype.copyObject).toHaveBeenCalled()
+    expect(S3Backend.prototype.copyObject).toHaveBeenLastCalledWith(
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({
+        cacheControl: 'max-age=999',
+        mimetype: 'image/gif',
+      }),
+      undefined,
+      { copyMetadata: false }
+    )
     const parsedBody = JSON.parse(response.body)
 
     expect(parsedBody.Key).toBe(`bucket2/authenticated/${copiedKey}`)
@@ -1679,6 +2002,85 @@ describe('testing copy object', () => {
 
     expect(object).not.toBeFalsy()
     expect(object!.user_metadata).toBeNull()
+  })
+
+  test('preserves omitted replaceable metadata fields for REST copies', async () => {
+    const runId = randomUUID()
+    const sourceKey = `authenticated/copy-replace-source-${runId}.png`
+    const destinationKey = `authenticated/copy-replace-destination-${runId}.png`
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: sourceKey,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version: `copy-replace-source-version-${runId}`,
+      metadata: {
+        cacheControl: 'max-age=60',
+        eTag: `source-${runId}`,
+        mimetype: 'image/png',
+        size: 1234,
+      },
+    })
+    await seedTx.commit()
+    tnx = undefined
+    let verificationTx: DatabaseTransaction | undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/copy',
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+        payload: {
+          bucketId: 'bucket2',
+          sourceKey,
+          destinationKey,
+          metadata: {
+            cacheControl: 'max-age=999',
+          },
+          copyMetadata: false,
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(S3Backend.prototype.copyObject).toHaveBeenLastCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.any(String),
+        expect.any(String),
+        expect.any(String),
+        expect.objectContaining({
+          cacheControl: 'max-age=999',
+          mimetype: 'image/png',
+        }),
+        undefined,
+        { copyMetadata: false }
+      )
+
+      verificationTx = await getSuperuserPostgrestClient()
+      const object = await findObject(verificationTx, 'bucket2', destinationKey)
+
+      expect(object).not.toBeFalsy()
+      expect(object!.metadata).toEqual(
+        expect.objectContaining({
+          cacheControl: 'max-age=999',
+          mimetype: 'image/png',
+        })
+      )
+    } finally {
+      if (verificationTx) {
+        await verificationTx.commit()
+        verificationTx = undefined
+        tnx = undefined
+      }
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [sourceKey, destinationKey])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
   })
 
   test('cannot copy objects across buckets when RLS dont allow it', async () => {
@@ -1762,6 +2164,74 @@ describe('testing copy object', () => {
     expect(response.statusCode).toBe(400)
     expect(S3Backend.prototype.copyObject).not.toHaveBeenCalled()
   })
+
+  test('can copy an object by an existing source version id', async () => {
+    const runId = randomUUID()
+    const sourceKey = `authenticated/copy-by-version-source-${runId}.png`
+    const destinationKey = `authenticated/copy-by-version-destination-${runId}.png`
+    const version = `copy-by-version-${runId}`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: sourceKey,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version,
+      metadata: { mimetype: 'image/png', size: 1234 },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/copy',
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+        payload: {
+          bucketId: 'bucket2',
+          sourceKey,
+          sourceVersionId: version,
+          destinationKey,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      expect(S3Backend.prototype.copyObject).toHaveBeenCalled()
+      const jsonResponse = response.json()
+      expect(jsonResponse.Key).toBe(`bucket2/${destinationKey}`)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [sourceKey, destinationKey])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('returns NoSuchKey when copying by a source version id that does not exist', async () => {
+    const response = await appInstance.inject({
+      method: 'POST',
+      url: '/object/copy',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+      payload: {
+        bucketId: 'bucket2',
+        sourceKey: 'authenticated/casestudy.png',
+        sourceVersionId: 'does-not-exist',
+        destinationKey: 'authenticated/copy-by-version-missing.png',
+      },
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'not_found',
+      message: 'Object not found',
+      code: ErrorCode.NoSuchKey,
+    })
+  })
 })
 
 /**
@@ -1823,6 +2293,62 @@ describe('testing delete object', () => {
     })
     expect(response.statusCode).toBe(400)
     expect(S3Backend.prototype.deleteObject).not.toHaveBeenCalled()
+  })
+
+  test('can delete an object by an existing version id', async () => {
+    const runId = randomUUID()
+    const objectName = `authenticated/delete-by-version-${runId}.png`
+    const version = `delete-by-version-${runId}`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version,
+      metadata: { mimetype: 'image/png', size: 1234 },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'DELETE',
+        url: `/object/bucket2/${objectName}?versionId=${version}`,
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      expect(S3Backend.prototype.deleteObject).toHaveBeenCalled()
+      expect(response.json()).toMatchObject({
+        message: 'Successfully deleted',
+      })
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [objectName])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('returns NoSuchKey when deleting an object by a version id that does not exist', async () => {
+    const response = await appInstance.inject({
+      method: 'DELETE',
+      url: '/object/bucket2/authenticated/casestudy.png?versionId=does-not-exist',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'not_found',
+      message: 'Object not found',
+      code: ErrorCode.NoSuchKey,
+    })
   })
 })
 
@@ -1968,6 +2494,85 @@ describe('testing deleting multiple objects', () => {
     expect(results).toHaveLength(1)
     expect(results[0].name).toBe('authenticated/delete-multiple7.png')
   })
+
+  test('bulk delete with a mix of plain paths and {path, versionId} entries', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const plainObjectName = `authenticated/bulk-delete-mixed-plain-${runId}.png`
+    const versionedObjectName = `authenticated/bulk-delete-mixed-versioned-${runId}.png`
+    const wrongVersionObjectName = `authenticated/bulk-delete-mixed-wrong-version-${runId}.png`
+    const allNames = [plainObjectName, versionedObjectName, wrongVersionObjectName]
+
+    const versionedObjectVersion = `current-${randomUUID()}`
+    const wrongVersionObjectVersion = `current-${randomUUID()}`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, [
+      {
+        bucket_id: bucketName,
+        name: plainObjectName,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: `plain-${randomUUID()}`,
+        metadata: { size: 1234 },
+      },
+      {
+        bucket_id: bucketName,
+        name: versionedObjectName,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: versionedObjectVersion,
+        metadata: { size: 1234 },
+      },
+      {
+        bucket_id: bucketName,
+        name: wrongVersionObjectName,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: wrongVersionObjectVersion,
+        metadata: { size: 1234 },
+      },
+    ])
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'DELETE',
+        url: `/object/${bucketName}`,
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+        payload: {
+          prefixes: [
+            plainObjectName,
+            { path: versionedObjectName, versionId: versionedObjectVersion },
+            { path: wrongVersionObjectName, versionId: randomUUID() },
+          ],
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(S3Backend.prototype.deleteObjects).toHaveBeenCalled()
+
+      const results = JSON.parse(response.body)
+      expect(results).toHaveLength(2)
+      expect(results.map((row: { name: string }) => row.name)).toEqual(
+        expect.arrayContaining([plainObjectName, versionedObjectName])
+      )
+
+      const verifyTx = await getSuperuserPostgrestClient()
+      const remaining = await findObject(verifyTx, bucketName, wrongVersionObjectName)
+      expect(remaining).toBeDefined()
+      expect(remaining?.version).toBe(wrongVersionObjectVersion)
+      await verifyTx.commit()
+      tnx = undefined
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, allNames)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
 })
 
 /**
@@ -2108,6 +2713,72 @@ describe('testing generating signed URL', () => {
     expect(response.statusCode).toBe(400)
     expect(JSON.parse(response.body).message).toContain('expiresIn')
   })
+
+  test('can sign a URL by an existing version id', async () => {
+    const runId = randomUUID()
+    const objectName = `authenticated/sign-by-version-${runId}.png`
+    const version = `sign-by-version-${runId}`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version,
+      metadata: { mimetype: 'image/png', size: 1234 },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/object/sign/bucket2/${objectName}`,
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+        payload: {
+          expiresIn: 1000,
+          versionId: version,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const result = JSON.parse(response.body)
+      expect(result.signedURL).toBeTruthy()
+
+      const token = result.signedURL.split('?token=').pop()
+      const jwtData = (await verifyJWT(token, jwtSecret)) as SignedToken
+      expect(jwtData.versionId).toBe(version)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [objectName])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('returns NoSuchKey when signing a URL by a version id that does not exist', async () => {
+    const response = await appInstance.inject({
+      method: 'POST',
+      url: '/object/sign/bucket2/authenticated/casestudy.png',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+      payload: {
+        expiresIn: 1000,
+        versionId: 'does-not-exist',
+      },
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'not_found',
+      message: 'Object not found',
+      code: ErrorCode.NoSuchKey,
+    })
+  })
 })
 
 /**
@@ -2151,6 +2822,7 @@ describe('testing generating signed URL for upload', () => {
         statusCode: '403',
         error: 'Unauthorized',
         message: 'new row violates row-level security policy',
+        code: ErrorCode.AccessDenied,
       })
     )
     // Ensure that row does not exist in database.
@@ -2588,6 +3260,48 @@ describe('testing generating signed URLs', () => {
     expect(result[0].error).toBe('Either the object does not exist or you do not have access to it')
   })
 
+  test('does not generate a signed URL for a key whose current row is a delete marker', async () => {
+    const objectName = `authenticated/deleted-${randomUUID()}.txt`
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: '317eadce-631a-4429-a0bb-f19a7a517b4a',
+      owner_id: '317eadce-631a-4429-a0bb-f19a7a517b4a',
+      version: randomUUID(),
+      is_delete_marker: true,
+      is_versioned: true,
+      metadata: null,
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/sign/bucket2',
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+        payload: { expiresIn: 1000, paths: [objectName] },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(response.json()).toEqual([
+        {
+          error: 'Either the object does not exist or you do not have access to it',
+          path: objectName,
+          signedURL: null,
+        },
+      ])
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, (db) => deleteObjectsByName(db, 'bucket2', objectName))
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
   test('user is not able to generate signedURLs without Auth header', async () => {
     const response = await appInstance.inject({
       method: 'POST',
@@ -2845,6 +3559,133 @@ describe('testing retrieving signed URL', () => {
     })
     expect(response.statusCode).toBe(400)
   })
+
+  test('get object with a token pinned to an existing version id', async () => {
+    const runId = randomUUID()
+    const objectName = `authenticated/redeem-by-version-${runId}.png`
+    const version = `redeem-by-version-${runId}`
+    const urlToSign = `bucket2/${objectName}`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version,
+      metadata: { mimetype: 'image/png', size: 1234 },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const jwtToken = await signJWT({ url: urlToSign, versionId: version }, jwtSecret, 100)
+      const response = await appInstance.inject({
+        method: 'GET',
+        url: `/object/sign/${urlToSign}?token=${jwtToken}`,
+      })
+      expect(response.statusCode).toBe(200)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [objectName])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('returns NoSuchKey for a token pinned to a version id that does not exist', async () => {
+    const urlToSign = 'bucket2/authenticated/casestudy.png'
+    const jwtToken = await signJWT({ url: urlToSign, versionId: 'does-not-exist' }, jwtSecret, 100)
+    const response = await appInstance.inject({
+      method: 'GET',
+      url: `/object/sign/${urlToSign}?token=${jwtToken}`,
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'not_found',
+      message: 'Object not found',
+      code: ErrorCode.NoSuchKey,
+    })
+  })
+})
+
+describe('current delete-marker reads', () => {
+  test('GET, HEAD, info, signed, and public reads return NoSuchKey', async () => {
+    const runId = randomUUID()
+    const authenticatedName = `authenticated/current-marker-${runId}.png`
+    const publicName = `current-marker-${runId}.png`
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, [
+      {
+        bucket_id: 'bucket2',
+        name: authenticatedName,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: `marker-auth-${runId}`,
+        archived_at: null,
+        is_delete_marker: true,
+        is_versioned: true,
+        metadata: null,
+      },
+      {
+        bucket_id: 'public-bucket-2',
+        name: publicName,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: `marker-public-${runId}`,
+        archived_at: null,
+        is_delete_marker: true,
+        is_versioned: true,
+        metadata: null,
+      },
+    ])
+    await seedTx.commit()
+    tnx = undefined
+
+    const noSuchKey = expect.objectContaining({ code: ErrorCode.NoSuchKey })
+    try {
+      const token = await signJWT({ url: `bucket2/${authenticatedName}` }, jwtSecret, 100)
+      const requests = [
+        {
+          method: 'GET' as const,
+          url: `/object/authenticated/bucket2/${authenticatedName}`,
+          headers: { authorization: `Bearer ${process.env.AUTHENTICATED_KEY}` },
+        },
+        {
+          method: 'HEAD' as const,
+          url: `/object/authenticated/bucket2/${authenticatedName}`,
+          headers: { authorization: `Bearer ${process.env.AUTHENTICATED_KEY}` },
+        },
+        {
+          method: 'GET' as const,
+          url: `/object/info/authenticated/bucket2/${authenticatedName}`,
+          headers: { authorization: `Bearer ${process.env.AUTHENTICATED_KEY}` },
+        },
+        {
+          method: 'GET' as const,
+          url: `/object/sign/bucket2/${authenticatedName}?token=${token}`,
+        },
+        {
+          method: 'GET' as const,
+          url: `/object/public/public-bucket-2/${publicName}`,
+        },
+      ]
+
+      for (const request of requests) {
+        const response = await appInstance.inject(request)
+        expect(response.statusCode, `${request.method} ${request.url}`).toBe(400)
+        if (request.method !== 'HEAD') expect(response.json()).toEqual(noSuchKey)
+      }
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', authenticatedName)
+        await deleteObjectsByName(db, 'public-bucket-2', publicName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
 })
 
 describe('testing move object', () => {
@@ -3038,9 +3879,196 @@ describe('testing move object', () => {
     expect(S3Backend.prototype.copyObject).not.toHaveBeenCalled()
     expect(S3Backend.prototype.deleteObject).not.toHaveBeenCalled()
   })
+
+  test('can move an object by an existing source version id', async () => {
+    const objectAdminDeleteSendSpy = vi.spyOn(ObjectAdminDelete, 'send')
+    const runId = randomUUID()
+    const sourceKey = `authenticated/move-by-version-source-${runId}.png`
+    const destinationKey = `authenticated/move-by-version-destination-${runId}.png`
+    const version = `move-by-version-${runId}`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: sourceKey,
+      owner: '317eadce-631a-4429-a0bb-f19a7a517b4a',
+      version,
+      metadata: { mimetype: 'image/png', size: 1234 },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/object/move`,
+        payload: {
+          bucketId: 'bucket2',
+          sourceKey,
+          sourceVersionId: version,
+          destinationKey,
+        },
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      expect(response.json()).toMatchObject({ message: 'Successfully moved' })
+      expect(S3Backend.prototype.copyObject).toHaveBeenCalled()
+      expect(objectAdminDeleteSendSpy).toHaveBeenCalled()
+
+      const conn = await getSuperuserPostgrestClient()
+      const destinationObject = await findObject(conn, 'bucket2', destinationKey)
+      expect(destinationObject).not.toBeFalsy()
+      const sourceObject = await findObject(conn, 'bucket2', sourceKey)
+      expect(sourceObject).toBeFalsy()
+      await conn.commit()
+      tnx = undefined
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [sourceKey, destinationKey])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('returns NoSuchKey when moving by a source version id that does not exist', async () => {
+    const response = await appInstance.inject({
+      method: 'POST',
+      url: `/object/move`,
+      payload: {
+        bucketId: 'bucket2',
+        sourceKey: 'authenticated/casestudy.png',
+        sourceVersionId: 'does-not-exist',
+        destinationKey: 'authenticated/move-by-version-missing.png',
+      },
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'not_found',
+      message: 'Object not found',
+      code: ErrorCode.NoSuchKey,
+    })
+  })
 })
 
 describe('testing list objects', () => {
+  test('list-v1 deleteMarkers=only advances in descending name order', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const prefix = `delete-marker-desc-${runId}/`
+    const objectNames = ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt'].map(
+      (name) => `${prefix}${name}`
+    )
+    const markerNames = new Set(['b.txt', 'd.txt', 'f.txt'])
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(
+      seedTx,
+      objectNames.map((name) => ({
+        bucket_id: bucketName,
+        name,
+        version: `${runId}-${name}`,
+        is_delete_marker: markerNames.has(name.slice(prefix.length)),
+        is_versioned: true,
+      }))
+    )
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/object/list/${bucketName}`,
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+        payload: {
+          prefix,
+          limit: 10,
+          offset: 0,
+          noncurrentVersions: 'exclude',
+          deleteMarkers: 'only',
+          sortBy: { column: 'name', order: 'desc' },
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(response.json<{ name: string }[]>().map((object) => object.name)).toEqual([
+        'f.txt',
+        'd.txt',
+        'b.txt',
+      ])
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectNames)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('list-v1 deleteMarkers=only advances in ascending name order without duplicating rows', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const prefix = `delete-marker-asc-${runId}/`
+    const objectNames = ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt', 'f.txt'].map(
+      (name) => `${prefix}${name}`
+    )
+    const markerNames = new Set(['b.txt', 'd.txt', 'f.txt'])
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(
+      seedTx,
+      objectNames.map((name) => ({
+        bucket_id: bucketName,
+        name,
+        version: `${runId}-${name}`,
+        is_delete_marker: markerNames.has(name.slice(prefix.length)),
+        is_versioned: true,
+      }))
+    )
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/object/list/${bucketName}`,
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+        payload: {
+          prefix,
+          limit: 10,
+          offset: 0,
+          noncurrentVersions: 'exclude',
+          deleteMarkers: 'only',
+          sortBy: { column: 'name', order: 'asc' },
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(response.json<{ name: string }[]>().map((object) => object.name)).toEqual([
+        'b.txt',
+        'd.txt',
+        'f.txt',
+      ])
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectNames)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
   test('searching the bucket root folder', async () => {
     const response = await appInstance.inject({
       method: 'POST',
@@ -3331,6 +4359,998 @@ describe('testing list objects', () => {
       const cleanupTx = await getSuperuserPostgrestClient()
       await withDeleteEnabled(cleanupTx, async (db) => {
         await deleteObjectsByName(db, bucketName, [literalMatch, wildcardOnlyMatch])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('searching a nested path with a trailing slash returns the file', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const objectName = `search-${runId}/blah/blah/blah/file.png`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: bucketName,
+      name: objectName,
+      owner: '317eadce-631a-4429-a0bb-f19a7a517b4a',
+      version: `${runId}-file`,
+      metadata: {
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        payload: {
+          prefix: '',
+          search: `search-${runId}/blah/blah/blah/`,
+          limit: 100,
+          offset: 0,
+          sortBy: {
+            column: 'name',
+            order: 'asc',
+          },
+        },
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json<{ name: string; id: string | null; metadata: unknown }[]>()
+      expect(responseJSON).toHaveLength(1)
+      expect(responseJSON[0].name).toBe(objectName)
+      expect(responseJSON[0].id).not.toBeNull()
+      expect(responseJSON[0].metadata).toMatchObject({
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      })
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('searching a nested path with the full file name returns the file', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const objectName = `search-${runId}/blah/blah/blah/file.png`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: bucketName,
+      name: objectName,
+      owner: '317eadce-631a-4429-a0bb-f19a7a517b4a',
+      version: `${runId}-file`,
+      metadata: {
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        payload: {
+          prefix: '',
+          search: `search-${runId}/blah/blah/blah/file.png`,
+          limit: 100,
+          offset: 0,
+          sortBy: {
+            column: 'name',
+            order: 'asc',
+          },
+        },
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json<{ name: string; id: string | null; metadata: unknown }[]>()
+      expect(responseJSON).toHaveLength(1)
+      expect(responseJSON[0].name).toBe(objectName)
+      expect(responseJSON[0].id).not.toBeNull()
+      expect(responseJSON[0].metadata).toMatchObject({
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      })
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('prefix and search combine to find a nested file', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const objectName = `search-${runId}/a/b/c/file.png`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: bucketName,
+      name: objectName,
+      owner: '317eadce-631a-4429-a0bb-f19a7a517b4a',
+      version: `${runId}-file`,
+      metadata: {
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        payload: {
+          prefix: `search-${runId}/a`,
+          search: 'b/c/file.png',
+          limit: 100,
+          offset: 0,
+          sortBy: {
+            column: 'name',
+            order: 'asc',
+          },
+        },
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json<{ name: string; id: string | null; metadata: unknown }[]>()
+      expect(responseJSON).toHaveLength(1)
+      expect(responseJSON[0].name).toBe('b/c/file.png')
+      expect(responseJSON[0].id).not.toBeNull()
+      expect(responseJSON[0].metadata).toMatchObject({
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      })
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('prefix and search combine to return nothing without a match', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const objectName = `search-${runId}/a/b/c/file.png`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: bucketName,
+      name: objectName,
+      owner: '317eadce-631a-4429-a0bb-f19a7a517b4a',
+      version: `${runId}-file`,
+      metadata: {
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        payload: {
+          prefix: `search-${runId}/a`,
+          search: 'x/y/file.png',
+          limit: 100,
+          offset: 0,
+          sortBy: {
+            column: 'name',
+            order: 'asc',
+          },
+        },
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json<{ name: string; id: string | null; metadata: unknown }[]>()
+      expect(responseJSON).toHaveLength(0)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('search spanning multiple folders returns the relative folder path', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const objectName = `search-${runId}/folder/sub1/file.png`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: bucketName,
+      name: objectName,
+      owner: '317eadce-631a-4429-a0bb-f19a7a517b4a',
+      version: `${runId}-file`,
+      metadata: {
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        payload: {
+          prefix: '',
+          search: `search-${runId}/folder/`,
+          limit: 100,
+          offset: 0,
+          sortBy: {
+            column: 'name',
+            order: 'asc',
+          },
+        },
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json<{ name: string; id: string | null; metadata: unknown }[]>()
+      expect(responseJSON).toEqual([
+        {
+          name: `search-${runId}/folder/sub1`,
+          id: null,
+          updated_at: null,
+          created_at: null,
+          last_accessed_at: null,
+          metadata: null,
+          version: null,
+          archived_at: null,
+          is_delete_marker: null,
+          is_versioned: null,
+        },
+      ])
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('prefix and search combine to find a nested file when sorting by a non-name column', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const objectName = `search-${runId}/a/b/c/file.png`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: bucketName,
+      name: objectName,
+      owner: '317eadce-631a-4429-a0bb-f19a7a517b4a',
+      version: `${runId}-file`,
+      metadata: {
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      },
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        payload: {
+          prefix: `search-${runId}/a`,
+          search: 'b/c/file.png',
+          limit: 100,
+          offset: 0,
+          sortBy: {
+            column: 'created_at',
+            order: 'asc',
+          },
+        },
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const responseJSON = response.json<{ name: string; id: string | null; metadata: unknown }[]>()
+      expect(responseJSON).toHaveLength(1)
+      expect(responseJSON[0].name).toBe('b/c/file.png')
+      expect(responseJSON[0].id).not.toBeNull()
+      expect(responseJSON[0].metadata).toMatchObject({
+        eTag: `${runId}-file`,
+        size: 42,
+        mimetype: 'image/png',
+      })
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('applies noncurrentVersions and deleteMarkers filters on the v1 list route', async () => {
+    const runId = randomUUID()
+    const objectName = `authenticated/v1-versions-${runId}.png`
+    const baseTime = Date.parse('2024-01-01T00:00:00.000Z')
+
+    function buildVersionRows(
+      bucketId: string,
+      name: string,
+      count: number,
+      baseTime: number
+    ): Array<Partial<Obj> & { bucket_id: string; name: string }> {
+      const rows: Array<Partial<Obj> & { bucket_id: string; name: string }> = []
+      for (let i = 0; i < count; i++) {
+        const isCurrent = i === count - 1
+        const createdAt = new Date(baseTime + i * 1000).toISOString()
+        rows.push({
+          bucket_id: bucketId,
+          name,
+          owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+          version: `v${i}-${randomUUID()}`,
+          metadata: { mimetype: 'image/png', size: 1000 + i },
+          created_at: createdAt,
+          archived_at: isCurrent ? null : createdAt,
+          is_versioned: true,
+          is_delete_marker: false,
+        })
+      }
+      return rows
+    }
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, [
+      ...buildVersionRows('bucket2', objectName, 3, baseTime),
+      {
+        bucket_id: 'bucket2',
+        name: objectName,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: `delete-marker-${runId}`,
+        created_at: new Date(baseTime + 3000).toISOString(),
+        archived_at: new Date(baseTime + 3000).toISOString(),
+        is_versioned: true,
+        is_delete_marker: true,
+      },
+    ])
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const exclude = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+        payload: { prefix: objectName, exactMatch: true, limit: 10, offset: 0 },
+      })
+      expect(exclude.statusCode).toBe(200)
+      expect(exclude.json<Obj[]>()).toHaveLength(1)
+
+      const include = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+        payload: {
+          prefix: objectName,
+          exactMatch: true,
+          noncurrentVersions: 'include',
+          limit: 10,
+          offset: 0,
+        },
+      })
+      expect(include.statusCode).toBe(200)
+      expect(include.json<Obj[]>()).toHaveLength(3)
+
+      const archivedMarkers = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+        payload: {
+          prefix: objectName,
+          exactMatch: true,
+          noncurrentVersions: 'only',
+          deleteMarkers: 'only',
+          limit: 10,
+          offset: 0,
+        },
+      })
+      expect(archivedMarkers.statusCode).toBe(200)
+      const markerRows = archivedMarkers.json<Obj[]>()
+      expect(markerRows).toHaveLength(1)
+      expect(markerRows[0].version).toBe(`delete-marker-${runId}`)
+      expect(markerRows[0].is_delete_marker).toBe(true)
+
+      const allRows = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+        payload: {
+          prefix: objectName,
+          exactMatch: true,
+          noncurrentVersions: 'include',
+          deleteMarkers: 'include',
+          limit: 10,
+          offset: 0,
+        },
+      })
+      expect(allRows.statusCode).toBe(200)
+      expect(allRows.json<Obj[]>()).toHaveLength(4)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', objectName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test.each([
+    'asc',
+    'desc',
+  ] as const)('v1 list resumes within a key when versions cross its internal batch boundary (%s)', async (order) => {
+    const runId = randomUUID()
+    const prefix = `authenticated/v1-version-batch-${runId}/`
+    const objectName = `${prefix}file.png`
+    const baseTime = Date.parse('2024-07-01T00:00:00.000Z')
+    const rows = Array.from({ length: 101 }, (_, index) => ({
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version: `v-${String(index).padStart(3, '0')}`,
+      created_at: new Date(baseTime + index * 1000).toISOString(),
+      archived_at: index === 100 ? null : new Date(baseTime + index * 1000).toISOString(),
+      is_versioned: true,
+      is_delete_marker: false,
+    }))
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, rows)
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      // limit=1 makes storage.search's internal batch size 100. Skipping the
+      // first 100 rows forces it to resume the same key in a second batch.
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+        payload: {
+          prefix,
+          noncurrentVersions: 'include',
+          deleteMarkers: 'include',
+          limit: 1,
+          offset: 100,
+          sortBy: { column: 'name', order },
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const result = response.json<Obj[]>()
+      expect(result).toHaveLength(1)
+      expect(result[0].name).toBe('file.png')
+      expect(result[0].version).toBe('v-000')
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', objectName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('v1 multi-version name listing matches the reference model across filters, directions, and offsets', async () => {
+    type VersionMode = 'include' | 'only'
+    type ModelRow = {
+      name: string
+      version: string
+      archived_at: string | null
+      is_delete_marker: boolean
+    }
+
+    const runId = randomUUID()
+    const prefix = `authenticated/v1-reference-${runId}/`
+    const baseTime = Date.parse('2024-10-01T00:00:00.000Z')
+    const modelRows: ModelRow[] = [
+      { name: 'alpha.txt', version: 'alpha-current', archived_at: null, is_delete_marker: false },
+      {
+        name: 'alpha.txt',
+        version: 'alpha-old-b',
+        archived_at: new Date(baseTime + 2).toISOString(),
+        is_delete_marker: false,
+      },
+      {
+        name: 'alpha.txt',
+        version: 'alpha-old-a',
+        archived_at: new Date(baseTime + 1).toISOString(),
+        is_delete_marker: true,
+      },
+      {
+        name: 'beta-file',
+        version: 'beta-current',
+        archived_at: null,
+        is_delete_marker: false,
+      },
+      {
+        name: 'beta/child.txt',
+        version: 'beta-child-old',
+        archived_at: new Date(baseTime + 3).toISOString(),
+        is_delete_marker: false,
+      },
+      {
+        name: 'folder-a/child.txt',
+        version: 'folder-marker',
+        archived_at: new Date(baseTime + 4).toISOString(),
+        is_delete_marker: true,
+      },
+      { name: 'middle.txt', version: 'middle-current', archived_at: null, is_delete_marker: false },
+      {
+        name: 'zulu.txt',
+        version: 'zulu-old',
+        archived_at: new Date(baseTime + 5).toISOString(),
+        is_delete_marker: false,
+      },
+    ]
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(
+      seedTx,
+      modelRows.map((row) => ({
+        bucket_id: 'bucket2',
+        name: `${prefix}${row.name}`,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: row.version,
+        archived_at: row.archived_at,
+        is_versioned: true,
+        is_delete_marker: row.is_delete_marker,
+      }))
+    )
+    await seedTx.commit()
+    tnx = undefined
+
+    const identity = (row: { id?: string | null; name: string; version?: string | null }) =>
+      `${row.id == null ? 'folder' : 'file'}:${row.name}:${row.version ?? ''}`
+
+    const reference = (
+      noncurrentVersions: VersionMode,
+      deleteMarkers: ObjectListingFilterMode,
+      order: 'asc' | 'desc'
+    ) => {
+      const filtered = modelRows.filter(
+        (row) =>
+          (noncurrentVersions !== 'only' || row.archived_at !== null) &&
+          (deleteMarkers !== 'exclude' || !row.is_delete_marker) &&
+          (deleteMarkers !== 'only' || row.is_delete_marker)
+      )
+      const folders = [
+        ...new Set(
+          filtered.flatMap((row) => {
+            const delimiter = row.name.indexOf('/')
+            return delimiter === -1 ? [] : [row.name.slice(0, delimiter)]
+          })
+        ),
+      ].map((name) => ({
+        name,
+        sortName: `${name}/`,
+        version: null,
+        archived_at: null,
+        id: null,
+        isPrefix: true,
+      }))
+      const leaves = filtered
+        .filter((row) => !row.name.includes('/'))
+        .map((row) => ({ ...row, sortName: row.name, id: row.version, isPrefix: false }))
+
+      return [...folders, ...leaves]
+        .sort((left, right) => {
+          const leftName = left.sortName.toLowerCase()
+          const rightName = right.sortName.toLowerCase()
+          const nameOrder = leftName === rightName ? 0 : leftName < rightName ? -1 : 1
+          if (nameOrder !== 0) return order === 'asc' ? nameOrder : -nameOrder
+          if (left.isPrefix !== right.isPrefix) {
+            return Number(left.isPrefix) - Number(right.isPrefix)
+          }
+          const leftTime =
+            left.archived_at === null ? Number.POSITIVE_INFINITY : Date.parse(left.archived_at)
+          const rightTime =
+            right.archived_at === null ? Number.POSITIVE_INFINITY : Date.parse(right.archived_at)
+          if (leftTime !== rightTime) return rightTime - leftTime
+          return (left.version ?? '').localeCompare(right.version ?? '', 'en')
+        })
+        .map(identity)
+    }
+
+    try {
+      for (const order of ['asc', 'desc'] as const) {
+        for (const noncurrentVersions of ['include', 'only'] as const) {
+          for (const deleteMarkers of OBJECT_LISTING_FILTER_MODES) {
+            const expected = reference(noncurrentVersions, deleteMarkers, order)
+            const offsets = [...new Set([0, 1, 3, Math.max(expected.length - 1, 0)])]
+
+            for (const offset of offsets) {
+              const response = await appInstance.inject({
+                method: 'POST',
+                url: '/object/list/bucket2',
+                headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+                payload: {
+                  prefix,
+                  noncurrentVersions,
+                  deleteMarkers,
+                  limit: 3,
+                  offset,
+                  sortBy: { column: 'name', order },
+                },
+              })
+
+              expect(response.statusCode).toBe(200)
+              expect(
+                response.json<Obj[]>().map(identity),
+                JSON.stringify({ order, noncurrentVersions, deleteMarkers, offset })
+              ).toEqual(expected.slice(offset, offset + 3))
+            }
+          }
+        }
+      }
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(
+          db,
+          'bucket2',
+          modelRows.map((row) => `${prefix}${row.name}`)
+        )
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  }, 15_000)
+
+  test.each([
+    'asc',
+    'desc',
+  ] as const)('v1 list terminates after exhausting the final multi-version key (%s)', async (order) => {
+    const runId = randomUUID()
+    const prefix = `authenticated/v1-final-version-key-${runId}/`
+    const objectName = `${prefix}file.png`
+    const baseTime = Date.parse('2024-08-01T00:00:00.000Z')
+    const rows = Array.from({ length: 300 }, (_, index) => ({
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version: `v-${String(index).padStart(3, '0')}`,
+      created_at: new Date(baseTime + index * 1000).toISOString(),
+      archived_at: index === 299 ? null : new Date(baseTime + index * 1000).toISOString(),
+      is_versioned: true,
+      is_delete_marker: false,
+    }))
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, rows)
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+        payload: {
+          prefix,
+          noncurrentVersions: 'include',
+          deleteMarkers: 'include',
+          limit: 500,
+          offset: 0,
+          sortBy: { column: 'name', order },
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const result = response.json<Obj[]>()
+      expect(result).toHaveLength(300)
+      expect(new Set(result.map((object) => object.version)).size).toBe(300)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', objectName)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  }, 5000)
+
+  test('v1 desc listing advances to the next key after exhausting a key at a batch boundary', async () => {
+    const runId = randomUUID()
+    const prefix = `authenticated/v1-desc-next-key-${runId}/`
+    const deepKey = `${prefix}zzz-deep.bin`
+    const targetKey = `${prefix}aaa-target.bin`
+    const baseTime = Date.parse('2024-09-01T00:00:00.000Z')
+    const deepRows = Array.from({ length: 100 }, (_, index) => ({
+      bucket_id: 'bucket2',
+      name: deepKey,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version: `deep-${String(index).padStart(3, '0')}`,
+      created_at: new Date(baseTime + index * 1000).toISOString(),
+      archived_at: index === 99 ? null : new Date(baseTime + index * 1000).toISOString(),
+      is_versioned: true,
+      is_delete_marker: false,
+    }))
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, [
+      ...deepRows,
+      {
+        bucket_id: 'bucket2',
+        name: targetKey,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: 'target',
+        archived_at: null,
+        is_versioned: true,
+        is_delete_marker: false,
+      },
+    ])
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      // limit=2 gives an internal batch size of 100. DESC visits the 100
+      // deep-key versions first; offset consumes them, so the next batch
+      // must advance to aaa-target instead of replaying zzz-deep.
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+        payload: {
+          prefix,
+          noncurrentVersions: 'include',
+          deleteMarkers: 'include',
+          limit: 2,
+          offset: 100,
+          sortBy: { column: 'name', order: 'desc' },
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const result = response.json<Obj[]>()
+      expect(result).toHaveLength(1)
+      expect(result[0].name).toBe('aaa-target.bin')
+      expect(result[0].version).toBe('target')
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [deepKey, targetKey])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  }, 5000)
+
+  test('v1 asc listing advances to the next key after exhausting a key at a batch boundary', async () => {
+    const runId = randomUUID()
+    const prefix = `authenticated/v1-asc-next-key-${runId}/`
+    const deepKey = `${prefix}aaa-deep.bin`
+    const siblingKey = `${deepKey}!`
+    const targetKey = `${prefix}zzz-target.bin`
+    const baseTime = Date.parse('2024-09-01T00:00:00.000Z')
+    const deepRows = Array.from({ length: 100 }, (_, index) => ({
+      bucket_id: 'bucket2',
+      name: deepKey,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version: `deep-${String(index).padStart(3, '0')}`,
+      created_at: new Date(baseTime + index * 1000).toISOString(),
+      archived_at: index === 99 ? null : new Date(baseTime + index * 1000).toISOString(),
+      is_versioned: true,
+      is_delete_marker: false,
+    }))
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, [
+      ...deepRows,
+      {
+        bucket_id: 'bucket2',
+        name: siblingKey,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: 'sibling',
+        archived_at: null,
+        is_versioned: true,
+        is_delete_marker: false,
+      },
+      {
+        bucket_id: 'bucket2',
+        name: targetKey,
+        owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+        version: 'target',
+        archived_at: null,
+        is_versioned: true,
+        is_delete_marker: false,
+      },
+    ])
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      // limit=2 gives an internal batch size of 100. ASC visits the 100
+      // deep-key versions first; offset consumes them, so the next batch
+      // must advance to the immediate sibling. `!` sorts after the exhausted
+      // key but before the `/` previously appended to advance the seek, so
+      // using `deepKey || '/'` here would silently skip this row.
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/object/list/bucket2',
+        headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+        payload: {
+          prefix,
+          noncurrentVersions: 'include',
+          deleteMarkers: 'include',
+          limit: 2,
+          offset: 100,
+          sortBy: { column: 'name', order: 'asc' },
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const result = response.json<Obj[]>()
+      expect(result).toHaveLength(2)
+      expect(result[0].name).toBe('aaa-deep.bin!')
+      expect(result[0].version).toBe('sibling')
+      expect(result[1].name).toBe('zzz-target.bin')
+      expect(result[1].version).toBe('target')
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [deepKey, siblingKey, targetKey])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  }, 5000)
+})
+
+describe('testing GET object info response fields gated on migration', () => {
+  const BEFORE_MIGRATION = 'mark-filename-immutable'
+
+  test('info response includes archived_at/is_delete_marker/is_versioned for a fully migrated tenant', async () => {
+    const runId = randomUUID()
+    const objectName = `authenticated/info-fields-${runId}.png`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version: `info-fields-${runId}`,
+      metadata: { mimetype: 'image/png', size: 1234 },
+      archived_at: null,
+      is_delete_marker: false,
+      is_versioned: true,
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'GET',
+        url: `/object/info/authenticated/bucket2/${objectName}`,
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const body = response.json()
+      expect(body.archived_at).toBeNull()
+      expect(body.is_delete_marker).toBe(false)
+      expect(body.is_versioned).toBe(true)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [objectName])
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('info column selection omits archived_at/is_delete_marker/is_versioned for a tenant pinned before object-versioning-core', async () => {
+    const runId = randomUUID()
+    const objectName = `authenticated/info-fields-gate-${runId}.png`
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjects(seedTx, {
+      bucket_id: 'bucket2',
+      name: objectName,
+      owner: 'd8c7bce9-cfeb-497b-bd61-e66ce2cbdaa2',
+      version: `info-fields-gate-${runId}`,
+      metadata: { mimetype: 'image/png', size: 1234 },
+      archived_at: null,
+      is_delete_marker: false,
+      is_versioned: true,
+    })
+    await seedTx.commit()
+    tnx = undefined
+
+    const adminUser = await getServiceKeyUser(tenantId)
+    const connection = await getPostgresConnection({
+      tenantId,
+      user: adminUser,
+      superUser: adminUser,
+      host: 'localhost',
+    })
+
+    try {
+      const pinnedDb = new StoragePgDB(connection, {
+        host: 'localhost',
+        tenantId,
+        latestMigration: BEFORE_MIGRATION,
+      })
+      expect(await pinnedDb.hasMigration('object-versioning-core')).toBe(false)
+
+      const preMigrationColumns =
+        'id,name,version,bucket_id,metadata,user_metadata,updated_at,created_at'
+      const obj = await pinnedDb.findObject('bucket2', objectName, preMigrationColumns)
+      expect(obj).not.toHaveProperty('archived_at')
+      expect(obj).not.toHaveProperty('is_delete_marker')
+      expect(obj).not.toHaveProperty('is_versioned')
+
+      const currentDb = new StoragePgDB(connection, { host: 'localhost', tenantId })
+      expect(await currentDb.hasMigration('object-versioning-core')).toBe(true)
+
+      const postMigrationColumns =
+        'id,name,version,bucket_id,metadata,user_metadata,updated_at,created_at,archived_at,is_delete_marker,is_versioned'
+      const migratedObj = await currentDb.findObject('bucket2', objectName, postMigrationColumns)
+      expect(migratedObj).toHaveProperty('archived_at', null)
+      expect(migratedObj).toHaveProperty('is_delete_marker', false)
+      expect(migratedObj).toHaveProperty('is_versioned', true)
+    } finally {
+      connection.dispose()
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, 'bucket2', [objectName])
       })
       await cleanupTx.commit()
       tnx = undefined

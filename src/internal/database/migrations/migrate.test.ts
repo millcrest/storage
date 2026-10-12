@@ -1,4 +1,12 @@
+import { AsyncAbortController } from '@internal/concurrency'
+import type { BasicPgClient } from 'postgres-migrations/dist/types'
 import { vi } from 'vitest'
+
+type MockEvent = {
+  payload: Record<string, unknown>
+}
+
+type MockBatchSend = (jobs: MockEvent[]) => Promise<void> | void
 
 const {
   mockRunBatchSend,
@@ -8,18 +16,26 @@ const {
   mockWarning,
   mockQuery,
   mockLastLocalMigrationName,
+  mockLoadMigrationFilesCached,
   mockLocalMigrationFiles,
   mockPgClientConstructor,
+  mockProgressiveStart,
+  mockConfigState,
 } = vi.hoisted(() => ({
-  mockRunBatchSend: vi.fn(),
-  mockResetBatchSend: vi.fn(),
+  mockRunBatchSend: vi.fn<MockBatchSend>(),
+  mockResetBatchSend: vi.fn<MockBatchSend>(),
   mockInfo: vi.fn(),
   mockBeginTransaction: vi.fn(),
   mockWarning: vi.fn(),
   mockQuery: vi.fn(),
   mockLastLocalMigrationName: vi.fn(),
+  mockLoadMigrationFilesCached: vi.fn(),
   mockLocalMigrationFiles: vi.fn(),
   mockPgClientConstructor: vi.fn(),
+  mockProgressiveStart: vi.fn(),
+  mockConfigState: {
+    migrationStrategy: 'ON_REQUEST',
+  },
 }))
 
 vi.mock('../../../config', () => ({
@@ -33,7 +49,7 @@ vi.mock('../../../config', () => ({
     multitenantDatabaseUrl: '',
     pgQueueEnable: true,
     databaseSSLRootCert: '',
-    dbMigrationStrategy: 'ON_REQUEST',
+    dbMigrationStrategy: mockConfigState.migrationStrategy,
     dbAnonRole: 'anon',
     dbAuthenticatedRole: 'authenticated',
     dbSuperUser: 'postgres',
@@ -41,7 +57,7 @@ vi.mock('../../../config', () => ({
     dbInstallRoles: false,
     dbRefreshMigrationHashesOnMismatch: false,
     dbMigrationFreezeAt: undefined,
-    icebergShards: 0,
+    icebergShards: [],
     multitenantDatabaseQueryTimeout: 1000,
   }),
 }))
@@ -49,17 +65,17 @@ vi.mock('../../../config', () => ({
 vi.mock('@storage/events', () => ({
   RunMigrationsOnTenants: class {
     static batchSend = mockRunBatchSend
-    payload: Record<string, unknown>
+    payload: MockEvent['payload']
 
-    constructor(payload: Record<string, unknown>) {
+    constructor(payload: MockEvent['payload']) {
       this.payload = payload
     }
   },
   ResetMigrationsOnTenant: class {
     static batchSend = mockResetBatchSend
-    payload: Record<string, unknown>
+    payload: MockEvent['payload']
 
-    constructor(payload: Record<string, unknown>) {
+    constructor(payload: MockEvent['payload']) {
       this.payload = payload
     }
   },
@@ -90,6 +106,7 @@ vi.mock('../multitenant-pg', () => ({
 }))
 
 vi.mock('../tenant', () => ({
+  deleteTenantConfig: vi.fn(),
   getTenantConfig: vi.fn(),
   TenantMigrationStatus: {
     COMPLETED: 'COMPLETED',
@@ -104,30 +121,34 @@ vi.mock('../pool', () => ({
 
 vi.mock('./files', () => ({
   lastLocalMigrationName: mockLastLocalMigrationName,
-  loadMigrationFilesCached: vi.fn(),
+  loadMigrationFilesCached: mockLoadMigrationFilesCached,
   localMigrationFiles: mockLocalMigrationFiles,
 }))
 
 vi.mock('./progressive', () => ({
   ProgressiveMigrations: class {
-    start() {
-      return undefined
+    start(...args: unknown[]) {
+      return mockProgressiveStart(...args)
     }
   },
 }))
 
+import { deleteTenantConfig, getTenantConfig, TenantMigrationStatus } from '../tenant'
 import {
+  areMigrationsUpToDate,
+  migrate,
   obtainLockOnMultitenantDB,
   resetMigration,
   resetMigrationsOnTenants,
   runMigrationsOnAllTenants,
+  updateTenantMigrationsState,
 } from './migrate'
 
 type MockPgClient = {
   connect: ReturnType<typeof vi.fn>
   end: ReturnType<typeof vi.fn>
   on: ReturnType<typeof vi.fn>
-  query: ReturnType<typeof vi.fn>
+  query: ReturnType<typeof vi.fn<(statement: unknown) => Promise<QueryResult>>>
 }
 
 type QueryResult = {
@@ -141,7 +162,7 @@ function getQueryText(statement: unknown): string {
   }
 
   if (statement && typeof statement === 'object' && 'text' in statement) {
-    return String((statement as { text: string }).text)
+    return String(statement.text)
   }
 
   return String(statement)
@@ -176,6 +197,84 @@ function createMigrationClient(migrations: Array<{ id: number; name: string }>):
   return client
 }
 
+function createMigrationRunnerClient(
+  indexRows: unknown[],
+  accessMethod = 'heap',
+  generatedRows: unknown[] = []
+): MockPgClient & BasicPgClient {
+  return {
+    connect: vi.fn().mockResolvedValue(undefined),
+    end: vi.fn().mockResolvedValue(undefined),
+    on: vi.fn(),
+    query: vi.fn(async (statement: unknown): Promise<QueryResult> => {
+      const text = normalizeSql(getQueryText(statement))
+
+      if (text.startsWith('-- storage-migrations generate-sql')) {
+        return { rows: generatedRows }
+      }
+
+      if (text === 'SHOW default_table_access_method') {
+        return { rows: [{ default_table_access_method: accessMethod }] }
+      }
+
+      if (text === 'SELECT pg_try_advisory_lock(-8525285245963000605);') {
+        return { rows: [{ pg_try_advisory_lock: true }] }
+      }
+
+      if (text.includes("c.relkind = 'r'")) {
+        return { rows: [{ exists: true }] }
+      }
+
+      if (text.startsWith('SELECT * FROM migrations WHERE id <=')) {
+        return { rows: [] }
+      }
+
+      if (text.includes('pg_catalog.to_regclass')) {
+        return { rows: indexRows }
+      }
+
+      return { rows: [], rowCount: 1 }
+    }),
+  } as MockPgClient & BasicPgClient
+}
+
+function setPendingConcurrentIndexMigration(
+  options: { unique?: boolean; generated?: boolean } = {}
+) {
+  const sql = `-- postgres-migrations disable-transaction
+CREATE ${options.unique ? 'UNIQUE ' : ''}INDEX CONCURRENTLY IF NOT EXISTS idx_objects_test
+  ON storage.objects (bucket_id, name);`
+  const contents = options.generated
+    ? `-- storage-migrations generate-sql\nSELECT $sql$${sql}$sql$ AS sql;`
+    : sql
+
+  mockLoadMigrationFilesCached.mockResolvedValue([
+    {
+      id: 1,
+      name: 'objects-test-index',
+      fileName: '0001-objects-test-index.sql',
+      hash: 'hash-1',
+      contents,
+      sql: contents,
+    },
+  ])
+
+  return sql
+}
+
+function runTestMigrations(client: BasicPgClient) {
+  return migrate({
+    client,
+    migrationsDirectory: './migrations/test',
+    migrationsTableSchema: 'storage',
+    waitForLock: false,
+  })
+}
+
+function migrationQueryTexts(client: MockPgClient) {
+  return client.query.mock.calls.map(([statement]) => normalizeSql(getQueryText(statement)))
+}
+
 function getMigrationQueryCall(client: MockPgClient, sql: string) {
   return client.query.mock.calls.find(([statement]) => {
     return normalizeSql(getQueryText(statement)).startsWith(sql)
@@ -200,9 +299,62 @@ function makeTransaction() {
   }
 }
 
+async function loadStartAsyncMigrations(
+  migrationStrategy: 'ON_REQUEST' | 'PROGRESSIVE' | 'FULL_FLEET'
+) {
+  mockConfigState.migrationStrategy = migrationStrategy
+  vi.resetModules()
+  return (await import('./migrate')).startAsyncMigrations
+}
+
+const queueStrategies = ['ON_REQUEST', 'PROGRESSIVE'] as const
+
+describe('startAsyncMigrations', () => {
+  beforeEach(() => {
+    mockConfigState.migrationStrategy = 'ON_REQUEST'
+  })
+
+  it.each(queueStrategies)('starts queue-driven scheduling for %s', async (strategy) => {
+    const signal = new AsyncAbortController().signal
+    const startForStrategy = await loadStartAsyncMigrations(strategy)
+
+    startForStrategy(signal)
+
+    expect(mockProgressiveStart).toHaveBeenCalledWith(signal)
+  })
+
+  it('lets asynchronous shutdown wait for an in-flight full-fleet enqueue', async () => {
+    const deferredBatch = Promise.withResolvers<void>()
+    const transaction = makeTransaction()
+    mockBeginTransaction.mockResolvedValue(transaction)
+    mockLastLocalMigrationName.mockResolvedValue('storage-schema')
+    mockQuery.mockImplementation(createTenantQueryMock([[{ id: 'tenant-a', cursor_id: 1 }], []]))
+    mockRunBatchSend.mockReturnValueOnce(deferredBatch.promise)
+    const startFullFleetMigrations = await loadStartAsyncMigrations('FULL_FLEET')
+    const abortController = new AsyncAbortController()
+
+    startFullFleetMigrations(abortController.signal)
+    expect(mockProgressiveStart).toHaveBeenCalledWith(abortController.signal)
+    await vi.waitFor(() => expect(mockRunBatchSend).toHaveBeenCalledOnce())
+
+    let abortSettled = false
+    const abortPromise = abortController.abortAsync().then(() => {
+      abortSettled = true
+    })
+    await Promise.resolve()
+
+    expect(abortSettled).toBe(false)
+
+    deferredBatch.resolve()
+    await abortPromise
+
+    expect(abortSettled).toBe(true)
+    expect(transaction.commit).toHaveBeenCalledOnce()
+  })
+})
+
 describe('migration helper request id propagation', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
     mockLastLocalMigrationName.mockResolvedValue('storage-schema')
     mockLocalMigrationFiles.mockResolvedValue([])
     mockQuery.mockResolvedValue({ rows: [], rowCount: 1 })
@@ -227,7 +379,7 @@ describe('migration helper request id propagation', () => {
 
     expect(mockRunBatchSend).toHaveBeenCalledTimes(1)
     const [[batch]] = mockRunBatchSend.mock.calls
-    expect((batch[0] as { payload: Record<string, unknown> }).payload).toMatchObject({
+    expect(batch[0].payload).toMatchObject({
       tenantId: 'tenant-a',
       sbReqId: 'sb-req-123',
       tenant: {
@@ -235,7 +387,7 @@ describe('migration helper request id propagation', () => {
         ref: 'tenant-a',
       },
     })
-    expect((batch[1] as { payload: Record<string, unknown> }).payload).toMatchObject({
+    expect(batch[1].payload).toMatchObject({
       tenantId: 'tenant-b',
       sbReqId: 'sb-req-123',
       tenant: {
@@ -277,7 +429,7 @@ describe('migration helper request id propagation', () => {
 
     expect(mockResetBatchSend).toHaveBeenCalledTimes(1)
     const [[batch]] = mockResetBatchSend.mock.calls
-    expect((batch[0] as { payload: Record<string, unknown> }).payload).toMatchObject({
+    expect(batch[0].payload).toMatchObject({
       tenantId: 'tenant-c',
       untilMigration: 'storage-schema',
       markCompletedTillMigration: 'create-migrations-table',
@@ -326,9 +478,170 @@ describe('migration helper request id propagation', () => {
   })
 })
 
+describe('concurrent index migration recovery', () => {
+  it.each([
+    false,
+    true,
+  ])('repairs an invalid index before creating it (generated=%s)', async (generated) => {
+    const sql = setPendingConcurrentIndexMigration({ unique: true, generated })
+    const client = createMigrationRunnerClient(
+      [
+        {
+          schema_name: 'storage',
+          index_name: 'idx_objects_test',
+          indisvalid: false,
+          on_table: true,
+        },
+      ],
+      'heap',
+      [{ sql }]
+    )
+
+    await expect(runTestMigrations(client)).resolves.toHaveLength(1)
+
+    const queryTexts = migrationQueryTexts(client)
+    const catalogCheck = queryTexts.findIndex((text) => text.includes('pg_catalog.to_regclass'))
+    const invalidIndexDrop = queryTexts.indexOf(
+      'DROP INDEX CONCURRENTLY IF EXISTS "storage"."idx_objects_test"'
+    )
+    const createIndex = queryTexts.indexOf(normalizeSql(sql))
+    const recordMigration = queryTexts.findIndex((text) =>
+      text.startsWith('INSERT INTO migrations')
+    )
+    const catalogCall = client.query.mock.calls[catalogCheck]?.[0]
+
+    expect(catalogCheck).toBeGreaterThan(-1)
+    expect(catalogCall).toMatchObject({
+      values: ['storage.objects', 'idx_objects_test'],
+    })
+    expect(invalidIndexDrop).toBeGreaterThan(catalogCheck)
+    expect(createIndex).toBeGreaterThan(invalidIndexDrop)
+    expect(recordMigration).toBeGreaterThan(createIndex)
+    expect(queryTexts).not.toContain('START TRANSACTION')
+    expect(getMigrationQueryCall(client, 'INSERT INTO migrations')?.[0]).toMatchObject({
+      values: [1, 'objects-test-index', 'hash-1'],
+    })
+    expect(mockWarning).toHaveBeenCalledWith(
+      expect.anything(),
+      '[Migrations] Removed invalid indexes before retry',
+      expect.objectContaining({
+        type: 'migrations',
+        metadata: JSON.stringify({
+          migrationId: 1,
+          migrationName: 'objects-test-index',
+          indexes: [{ schemaName: 'storage', indexName: 'idx_objects_test' }],
+        }),
+      })
+    )
+  })
+
+  it.each([
+    false,
+    true,
+  ])('keeps a valid index when its migration record was lost (generated=%s)', async (generated) => {
+    const sql = setPendingConcurrentIndexMigration({ generated })
+    const client = createMigrationRunnerClient(
+      [
+        {
+          schema_name: 'storage',
+          index_name: 'idx_objects_test',
+          indisvalid: true,
+          on_table: true,
+        },
+      ],
+      'heap',
+      [{ sql }]
+    )
+
+    await expect(runTestMigrations(client)).resolves.toHaveLength(1)
+
+    const queryTexts = migrationQueryTexts(client)
+
+    expect(queryTexts.some((text) => text.startsWith('DROP INDEX'))).toBe(false)
+    expect(queryTexts).toContain(normalizeSql(sql))
+    expect(queryTexts.some((text) => text.startsWith('INSERT INTO migrations'))).toBe(true)
+  })
+
+  it('fails closed when the name belongs to an index on another table', async () => {
+    const sql = setPendingConcurrentIndexMigration()
+    const client = createMigrationRunnerClient([
+      {
+        schema_name: 'storage',
+        index_name: 'idx_objects_test',
+        indisvalid: true,
+        on_table: false,
+      },
+    ])
+
+    await expect(runTestMigrations(client)).rejects.toThrow(
+      'its name is used by a different relation'
+    )
+
+    const queryTexts = migrationQueryTexts(client)
+
+    expect(queryTexts).not.toContain(normalizeSql(sql))
+    expect(queryTexts.some((text) => text.startsWith('INSERT INTO migrations'))).toBe(false)
+  })
+
+  it.each([
+    false,
+    true,
+  ])('applies Oriole handling before index repair (generated=%s)', async (generated) => {
+    const sql = setPendingConcurrentIndexMigration({ generated })
+    const client = createMigrationRunnerClient([], 'orioledb', [{ sql }])
+
+    await expect(runTestMigrations(client)).resolves.toHaveLength(1)
+
+    const queryTexts = migrationQueryTexts(client)
+
+    expect(queryTexts.some((text) => text.includes('pg_catalog.to_regclass'))).toBe(false)
+    expect(queryTexts).toContain(
+      'CREATE INDEX IF NOT EXISTS idx_objects_test ON storage.objects (bucket_id, name);'
+    )
+    expect(queryTexts).toContain('START TRANSACTION')
+    expect(queryTexts).toContain('COMMIT')
+  })
+
+  it.each([
+    { rows: [] },
+    { rows: [{ sql: null }] },
+    { rows: [{ sql: 1 }] },
+    { rows: [{ sql: '  ' }] },
+    { rows: [{ sql: 'SELECT 1' }, { sql: 'SELECT 2' }] },
+  ])('does not record a migration with invalid generated SQL: $rows', async ({ rows }) => {
+    setPendingConcurrentIndexMigration({ generated: true })
+    const client = createMigrationRunnerClient([], 'heap', rows)
+
+    await expect(runTestMigrations(client)).rejects.toThrow(
+      'Generated migration must return exactly one non-empty sql string'
+    )
+
+    expect(
+      migrationQueryTexts(client).some((text) => text.startsWith('INSERT INTO migrations'))
+    ).toBe(false)
+  })
+
+  it('does not record a generated migration when its index creation fails', async () => {
+    const sql = setPendingConcurrentIndexMigration({ generated: true })
+    const client = createMigrationRunnerClient([], 'heap', [{ sql }])
+    const query = client.query.getMockImplementation()!
+    client.query.mockImplementation((statement: unknown) => {
+      if (getQueryText(statement) === sql) {
+        throw new Error('index build failed')
+      }
+      return query(statement)
+    })
+
+    await expect(runTestMigrations(client)).rejects.toThrow('index build failed')
+
+    expect(
+      migrationQueryTexts(client).some((text) => text.startsWith('INSERT INTO migrations'))
+    ).toBe(false)
+  })
+})
+
 describe('resetMigration', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
     mockLastLocalMigrationName.mockResolvedValue('storage-schema')
     mockLocalMigrationFiles.mockResolvedValue([])
     mockQuery.mockResolvedValue({ rows: [], rowCount: 1 })
@@ -421,6 +734,125 @@ describe('resetMigration', () => {
     expect(client.end).toHaveBeenCalledTimes(1)
   })
 
+  it('replays storage-schema on a tenant past drop-bucketid-objname-index', async () => {
+    const client = createMigrationClient([
+      { id: 0, name: 'create-migrations-table' },
+      { id: 72, name: 'drop-bucketid-objname-index' },
+    ])
+
+    await expect(
+      resetMigration({
+        tenantId: 'tenant-reset',
+        untilMigration: 'initialmigration',
+        databaseUrl: 'postgres://tenant',
+      })
+    ).resolves.toBe(true)
+
+    const deleteCall = getMigrationQueryCall(client, 'DELETE FROM migrations WHERE id >')
+    expect(deleteCall?.[0]).toMatchObject({
+      values: [1],
+    })
+  })
+
+  it('resets to a migration in the middle of the history', async () => {
+    const client = createMigrationClient([
+      { id: 0, name: 'create-migrations-table' },
+      { id: 72, name: 'drop-bucketid-objname-index' },
+    ])
+
+    await expect(
+      resetMigration({
+        tenantId: 'tenant-reset',
+        untilMigration: 'objects-delete-marker-index',
+        databaseUrl: 'postgres://tenant',
+      })
+    ).resolves.toBe(true)
+
+    const deleteCall = getMigrationQueryCall(client, 'DELETE FROM migrations WHERE id >')
+    expect(deleteCall?.[0]).toMatchObject({
+      values: [71],
+    })
+  })
+
+  it('marks the skipped migrations completed when resetting below storage-schema', async () => {
+    const client = createMigrationClient([
+      { id: 0, name: 'create-migrations-table' },
+      { id: 72, name: 'drop-bucketid-objname-index' },
+    ])
+    mockLocalMigrationFiles.mockResolvedValue([
+      { id: 1, name: 'initialmigration', hash: 'hash-1' },
+      { id: 2, name: 'storage-schema', hash: 'hash-2' },
+    ])
+
+    await expect(
+      resetMigration({
+        tenantId: 'tenant-reset',
+        untilMigration: 'create-migrations-table',
+        markCompletedTillMigration: 'storage-schema',
+        databaseUrl: 'postgres://tenant',
+      })
+    ).resolves.toBe(true)
+
+    const deleteCall = getMigrationQueryCall(client, 'DELETE FROM migrations WHERE id >')
+    expect(deleteCall?.[0]).toMatchObject({
+      values: [0],
+    })
+
+    const insertCall = getMigrationQueryCall(client, 'INSERT INTO migrations')
+    expect(insertCall?.[0]).toMatchObject({
+      values: [1, 'initialmigration', 'hash-1', 2, 'storage-schema', 'hash-2'],
+    })
+  })
+
+  it('replays object-versioning-core on a tenant past unlock-object-versioning', async () => {
+    const client = createMigrationClient([
+      { id: 0, name: 'create-migrations-table' },
+      { id: 74, name: 'unlock-object-versioning' },
+    ])
+
+    await expect(
+      resetMigration({
+        tenantId: 'tenant-reset',
+        untilMigration: 'mark-filename-immutable',
+        databaseUrl: 'postgres://tenant',
+      })
+    ).resolves.toBe(true)
+
+    const deleteCall = getMigrationQueryCall(client, 'DELETE FROM migrations WHERE id >')
+    expect(deleteCall?.[0]).toMatchObject({
+      values: [61],
+    })
+  })
+
+  it('marks object-versioning-core completed without replaying it', async () => {
+    const client = createMigrationClient([
+      { id: 0, name: 'create-migrations-table' },
+      { id: 74, name: 'unlock-object-versioning' },
+    ])
+    mockLocalMigrationFiles.mockResolvedValue([
+      { id: 62, name: 'object-versioning-core', hash: 'hash-62' },
+    ])
+
+    await expect(
+      resetMigration({
+        tenantId: 'tenant-reset',
+        untilMigration: 'mark-filename-immutable',
+        markCompletedTillMigration: 'object-versioning-core',
+        databaseUrl: 'postgres://tenant',
+      })
+    ).resolves.toBe(true)
+
+    const deleteCall = getMigrationQueryCall(client, 'DELETE FROM migrations WHERE id >')
+    expect(deleteCall?.[0]).toMatchObject({
+      values: [61],
+    })
+
+    const insertCall = getMigrationQueryCall(client, 'INSERT INTO migrations')
+    expect(insertCall?.[0]).toMatchObject({
+      values: [62, 'object-versioning-core', 'hash-62'],
+    })
+  })
+
   it('rolls back, unlocks, and closes the client when mark-completed migration files are missing', async () => {
     const client = createMigrationClient([
       { id: 0, name: 'create-migrations-table' },
@@ -448,5 +880,66 @@ describe('resetMigration', () => {
     expect(queryTexts.at(-1)).toBe('SELECT pg_advisory_unlock(-8525285245963000605);')
     expect(mockQuery).not.toHaveBeenCalled()
     expect(client.end).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('migration state for a tenant recorded by a newer release', () => {
+  beforeEach(() => {
+    mockLastLocalMigrationName.mockResolvedValue('storage-schema')
+    mockQuery.mockResolvedValue({ rows: [], rowCount: 0 })
+  })
+
+  it('treats an ahead tenant as up to date regardless of its status', async () => {
+    vi.mocked(getTenantConfig).mockResolvedValue({
+      migrationVersion: 'storage-schema',
+      migrationVersionAhead: true,
+      migrationStatus: TenantMigrationStatus.FAILED,
+    } as Awaited<ReturnType<typeof getTenantConfig>>)
+
+    await expect(areMigrationsUpToDate('tenant-ahead')).resolves.toBe(true)
+  })
+
+  it('still reports a known tenant behind the local latest as outdated', async () => {
+    vi.mocked(getTenantConfig).mockResolvedValue({
+      migrationVersion: 'initialmigration',
+      migrationVersionAhead: false,
+      migrationStatus: TenantMigrationStatus.COMPLETED,
+    } as Awaited<ReturnType<typeof getTenantConfig>>)
+
+    await expect(areMigrationsUpToDate('tenant-behind')).resolves.toBe(false)
+  })
+
+  it('writes completion through the known-version guard', async () => {
+    await expect(
+      updateTenantMigrationsState('tenant-ahead', {
+        migration: 'storage-schema',
+        state: TenantMigrationStatus.COMPLETED,
+      })
+    ).resolves.toBe(0)
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('migrations_version = ANY($4::text[])'),
+        values: expect.arrayContaining(['tenant-ahead', 'storage-schema', 'COMPLETED']),
+      }),
+      expect.anything()
+    )
+    expect(deleteTenantConfig).toHaveBeenCalledWith('tenant-ahead')
+    expect(mockInfo).toHaveBeenCalledWith(
+      expect.anything(),
+      '[Migrations] Skipped state update for a tenant recorded by a newer release',
+      expect.objectContaining({ project: 'tenant-ahead' })
+    )
+  })
+
+  it('keeps the cached config when the guarded write applies', async () => {
+    mockQuery.mockResolvedValue({ rows: [], rowCount: 1 })
+
+    await updateTenantMigrationsState('tenant-known', {
+      migration: 'storage-schema',
+      state: TenantMigrationStatus.COMPLETED,
+    })
+
+    expect(deleteTenantConfig).not.toHaveBeenCalled()
   })
 })

@@ -1,18 +1,19 @@
+import { getXForwardedHostRegExp } from '@internal/http/x-forwarded-host'
 import { getConfig } from '../../config'
 
 const {
   version,
   requestTraceHeader,
   isMultitenant,
-  requestXForwardedHostRegExp,
   tenantId: defaultTenantId,
   region,
   serviceName,
   storageS3InternalTracesEnabled,
 } = getConfig()
 
+const xForwardedHostRegExp = getXForwardedHostRegExp()
+
 import { FastifyOtelInstrumentation } from '@fastify/otel'
-import * as grpc from '@grpc/grpc-js'
 import { logger, logSchema } from '@internal/monitoring/logger'
 import { TenantSpanProcessor } from '@internal/monitoring/otel-instrumentation'
 import { trace } from '@opentelemetry/api'
@@ -26,34 +27,6 @@ import { BatchSpanProcessor, SpanExporter, SpanProcessor } from '@opentelemetry/
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions'
 
 const tracingEnabled = process.env.TRACING_ENABLED === 'true'
-const headersEnv = process.env.OTEL_EXPORTER_OTLP_TRACES_HEADERS || ''
-
-const exporterHeaders = headersEnv
-  .split(',')
-  .filter(Boolean)
-  .reduce(
-    (all, header) => {
-      const separator = header.indexOf('=')
-      if (separator <= 0 || separator === header.length - 1) {
-        return all
-      }
-
-      const name = header.slice(0, separator).trim()
-      const value = header.slice(separator + 1).trim()
-      if (!name || !value) {
-        return all
-      }
-
-      all[name] = value
-      return all
-    },
-    {} as Record<string, string>
-  )
-
-const grpcMetadata = new grpc.Metadata()
-Object.keys(exporterHeaders).forEach((key) => {
-  grpcMetadata.set(key, exporterHeaders[key])
-})
 
 const endpoint = process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
 let traceExporter: SpanExporter | undefined = undefined
@@ -91,8 +64,6 @@ if (tracingEnabled && endpoint) {
   traceExporter = new OTLPTraceExporter({
     url: endpoint,
     compression: process.env.OTEL_EXPORTER_OTLP_COMPRESSION as CompressionAlgorithm,
-    headers: exporterHeaders,
-    metadata: grpcMetadata,
   })
 }
 
@@ -158,11 +129,11 @@ if (tracingEnabled && traceExporter && spanProcessors.length > 0) {
         startIncomingSpanHook: (req) => {
           let tenantId = ''
           if (isMultitenant) {
-            if (requestXForwardedHostRegExp) {
+            if (xForwardedHostRegExp) {
               const serverRequest = req
               const xForwardedHost = serverRequest.headers['x-forwarded-host']
               if (typeof xForwardedHost !== 'string') return {}
-              const result = xForwardedHost.match(requestXForwardedHostRegExp)
+              const result = xForwardedHost.match(xForwardedHostRegExp)
               if (!result) return {}
               tenantId = result[1]
             }

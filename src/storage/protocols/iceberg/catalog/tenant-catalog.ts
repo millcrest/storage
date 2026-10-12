@@ -155,7 +155,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
       })
 
       if (catalogCount >= this.options.limits.maxCatalogsCount) {
-        throw ERRORS.IcebergMaximumResourceLimit(this.options.limits.maxCatalogsCount)
+        throw ERRORS.IcebergMaximumResourceLimit('catalog', this.options.limits.maxCatalogsCount)
       }
 
       return store.assignCatalog({
@@ -215,7 +215,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
       })
 
       if (tableCount >= this.options.limits.maxTableCount) {
-        throw ERRORS.IcebergMaximumResourceLimit(this.options.limits.maxTableCount)
+        throw ERRORS.IcebergMaximumResourceLimit('table', this.options.limits.maxTableCount)
       }
 
       const namespaceName = this.getTenantNamespaceName(dbNamespace.id)
@@ -481,7 +481,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
       })
 
       if (namespaceCount >= this.options.limits.maxNamespaceCount) {
-        throw ERRORS.IcebergMaximumResourceLimit(this.options.limits.maxNamespaceCount)
+        throw ERRORS.IcebergMaximumResourceLimit('namespace', this.options.limits.maxNamespaceCount)
       }
 
       const catalog = await store.findCatalogByName({
@@ -587,7 +587,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
         logicalName: `${namespace.id}/${params.table}`,
         tenantId: this.tenantId,
         kind: 'iceberg-table',
-        bucketName: params.warehouse,
+        bucketName: catalog.id,
       })
 
       // Catalog call to drop the table

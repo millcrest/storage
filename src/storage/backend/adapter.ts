@@ -1,3 +1,4 @@
+import { isS3Error, StorageBackendError } from '@internal/errors'
 import { Readable } from 'stream'
 import { getConfig } from '../../config'
 
@@ -5,8 +6,10 @@ import { getConfig } from '../../config'
  * Browser cache headers
  */
 export interface BrowserCacheHeaders {
+  ifMatch?: string
   ifModifiedSince?: string
   ifNoneMatch?: string
+  ifUnmodifiedSince?: string
   range?: string
 }
 
@@ -24,6 +27,7 @@ export type ObjectResponse = {
  */
 export type ObjectMetadata = {
   cacheControl: string
+  contentEncoding?: string
   contentLength: number
   size: number
   mimetype: string
@@ -42,6 +46,26 @@ export type UploadPart = {
   ChecksumCRC32C?: string
   ChecksumSHA1?: string
   ChecksumSHA256?: string
+}
+
+export type CopyObjectOptions = {
+  copyMetadata?: boolean
+}
+
+export type HeadObjectOptions = {
+  /** Confirm ambiguous absence with an extra backend request. Defaults to false. */
+  confirmMissing?: boolean
+}
+
+export interface DeleteObjectDetailedResult {
+  key: string
+  // DELETED also covers an already-absent key. UNKNOWN may have been deleted.
+  outcome: 'DELETED' | 'FAILED' | 'UNKNOWN'
+  error?: {
+    code?: string
+    message?: string
+    httpStatusCode?: number
+  }
 }
 
 /**
@@ -75,7 +99,7 @@ export abstract class StorageBackendAdapter {
   async getObject(
     bucketName: string,
     key: string,
-    version: string | undefined,
+    version: string | null | undefined,
     headers?: BrowserCacheHeaders,
     signal?: AbortSignal
   ): Promise<ObjectResponse> {
@@ -93,12 +117,13 @@ export abstract class StorageBackendAdapter {
   async uploadObject(
     bucketName: string,
     key: string,
-    version: string | undefined,
+    version: string | null | undefined,
     body: NodeJS.ReadableStream,
     contentType: string,
     cacheControl: string,
     signal?: AbortSignal,
-    contentLength?: number
+    contentLength?: number,
+    contentEncoding?: string
   ): Promise<ObjectMetadata> {
     throw new Error('uploadObject not implemented')
   }
@@ -109,7 +134,11 @@ export abstract class StorageBackendAdapter {
    * @param key
    * @param version
    */
-  async deleteObject(bucket: string, key: string, version: string | undefined): Promise<void> {
+  async deleteObject(
+    bucket: string,
+    key: string,
+    version: string | null | undefined
+  ): Promise<void> {
     throw new Error('deleteObject not implemented')
   }
 
@@ -126,16 +155,17 @@ export abstract class StorageBackendAdapter {
   async copyObject(
     bucket: string,
     source: string,
-    version: string | undefined,
+    version: string | null | undefined,
     destination: string,
-    destinationVersion: string | undefined,
-    metadata?: { cacheControl?: string; mimetype?: string },
+    destinationVersion: string | null | undefined,
+    metadata?: { cacheControl?: string; contentEncoding?: string; mimetype?: string },
     conditions?: {
       ifMatch?: string
       ifNoneMatch?: string
       ifModifiedSince?: Date
       ifUnmodifiedSince?: Date
-    }
+    },
+    options?: CopyObjectOptions
   ): Promise<Pick<ObjectMetadata, 'httpStatusCode' | 'eTag' | 'lastModified'>> {
     throw new Error('copyObject not implemented')
   }
@@ -149,6 +179,14 @@ export abstract class StorageBackendAdapter {
     throw new Error('deleteObjects not implemented')
   }
 
+  /** Returns one deletion outcome per requested key, in request order. */
+  async deleteObjectsDetailed(
+    bucket: string,
+    keys: string[]
+  ): Promise<DeleteObjectDetailedResult[]> {
+    throw new Error('deleteObjectsDetailed not implemented')
+  }
+
   /**
    * Returns metadata information of a specific object
    * @param bucket
@@ -158,7 +196,8 @@ export abstract class StorageBackendAdapter {
   async headObject(
     bucket: string,
     key: string,
-    version: string | undefined
+    version: string | null | undefined,
+    options?: HeadObjectOptions
   ): Promise<ObjectMetadata> {
     throw new Error('headObject not implemented')
   }
@@ -169,17 +208,22 @@ export abstract class StorageBackendAdapter {
    * @param key
    * @param version
    */
-  async privateAssetUrl(bucket: string, key: string, version: string | undefined): Promise<string> {
+  async privateAssetUrl(
+    bucket: string,
+    key: string,
+    version: string | null | undefined
+  ): Promise<string> {
     throw new Error('privateAssetUrl not implemented')
   }
 
   async createMultiPartUpload(
     bucketName: string,
     key: string,
-    version: string | undefined,
+    version: string | null | undefined,
     contentType: string,
     cacheControl: string,
-    metadata?: Record<string, string>
+    metadata?: Record<string, string>,
+    contentEncoding?: string
   ): Promise<string | undefined> {
     throw new Error('not implemented')
   }
@@ -218,7 +262,7 @@ export abstract class StorageBackendAdapter {
     bucketName: string,
     key: string,
     uploadId: string,
-    version?: string
+    version?: string | null
   ): Promise<void> {
     throw new Error('not implemented')
   }
@@ -230,7 +274,7 @@ export abstract class StorageBackendAdapter {
     UploadId: string,
     PartNumber: number,
     sourceKey: string,
-    sourceKeyVersion?: string,
+    sourceKeyVersion?: string | null,
     bytes?: { fromByte: number; toByte: number }
   ): Promise<{ eTag?: string; lastModified?: Date }> {
     throw new Error('not implemented')
@@ -247,6 +291,22 @@ export const PATH_SEPARATOR = '/'
 export const FILE_VERSION_SEPARATOR = '-$v-'
 export const SEPARATOR = tusUseFileVersionSeparator ? FILE_VERSION_SEPARATOR : PATH_SEPARATOR
 
-export function withOptionalVersion(key: string, version?: string): string {
+export function withOptionalVersion(key: string, version?: string | null): string {
   return version ? `${key}${SEPARATOR}${version}` : key
+}
+
+export function splitOptionalVersion(key: string): { key: string; version: string | null } {
+  const separatorIndex = key.lastIndexOf(SEPARATOR)
+  const version = separatorIndex < 0 ? '' : key.slice(separatorIndex + SEPARATOR.length)
+  if (version === '') return { key, version: null }
+
+  return { key: key.slice(0, separatorIndex), version }
+}
+
+export function isMissingBackendObject(error: unknown): boolean {
+  if (error instanceof StorageBackendError) {
+    const cause = error.getOriginalError()
+    return isS3Error(cause) && cause.name === 'NoSuchKey' && cause.$metadata.httpStatusCode === 404
+  }
+  return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT'
 }

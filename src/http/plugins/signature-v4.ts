@@ -7,6 +7,7 @@ import { RequestByteCounterStream } from '@internal/streams'
 import { HashSpillWritable } from '@internal/streams/hash-stream'
 import { ClientSignature, SignatureV4, SignatureV4Service } from '@storage/protocols/s3'
 import { ByteLimitTransformStream } from '@storage/protocols/s3/byte-limit-stream'
+import { getContentLengthRange, parsePolicy } from '@storage/protocols/s3/policy'
 import {
   ChunkSignatureV4Parser,
   V4StreamingAlgorithm,
@@ -41,6 +42,7 @@ declare module 'fastify' {
   interface FastifyRequest {
     streamingSignatureV4?: ChunkSignatureV4Parser
     multiPartFileStream?: MultipartFile
+    postPolicyContentLengthRange?: Readonly<{ min: number; max: number }>
     bodySha256: string
   }
 }
@@ -134,8 +136,10 @@ async function authorizeRequestSignV4(
       alg: 'sha256',
       limitInMemoryBytes: 1024 * 1024 * 5, // 5MB
     })
-    hashStreamComposer = compose(new ByteLimitTransformStream(1024 * 1024 * 20), byteHasherStream)
-    hashStreamComposer!.digestHex = byteHasherStream.digestHex.bind(byteHasherStream)
+    hashStreamComposer = Object.assign(
+      compose(new ByteLimitTransformStream(1024 * 1024 * 20), byteHasherStream),
+      { digestHex: byteHasherStream.digestHex.bind(byteHasherStream) }
+    )
   }
 
   const isVerified = await signatureV4.verify(clientSignature, {
@@ -146,6 +150,7 @@ async function authorizeRequestSignV4(
     query: request.query as Record<string, string>,
     prefix: storagePrefix,
     payloadHasher: hashStreamComposer,
+    bucket: (request.params as Record<string, string | undefined>)?.Bucket,
   })
 
   if (!isVerified && !sessionToken) {
@@ -188,6 +193,13 @@ async function authorizeRequestSignV4(
     request.owner = payload.sub
   }
 
+  if (clientSignature.policy) {
+    // Multipart fields keep changing as the file is parsed. Retain the range
+    // from the policy whose signature and conditions were verified above.
+    const range = getContentLengthRange(parsePolicy(clientSignature.policy.raw))
+    request.postPolicyContentLengthRange = range ? Object.freeze(range) : undefined
+  }
+
   if (SignatureV4.isChunkedUpload(request.headers)) {
     request.streamingSignatureV4 = createStreamingSignatureV4Parser({
       signatureV4,
@@ -204,8 +216,13 @@ async function authorizeRequestSignV4(
   return returnStream
 }
 
-async function extractSignature(req: AWSRequest) {
-  if (typeof req.headers.authorization === 'string') {
+async function extractSignature(req: AWSRequest): Promise<ClientSignature> {
+  const authorization = req.headers.authorization
+
+  // Only treat the Authorization header as an S3 signature when it actually
+  // carries one. A presigned request can pick up an unrelated Authorization
+  // header which must not override a valid query-string signature.
+  if (typeof authorization === 'string' && authorization.startsWith('AWS4-HMAC-SHA256 ')) {
     return SignatureV4.parseAuthorizationHeader(req.headers)
   }
 
@@ -224,13 +241,16 @@ async function extractSignature(req: AWSRequest) {
     })
 
     const fields = data?.fields
-    if (fields) {
+    if (data && fields) {
       for (const key in fields) {
         const field = fields[key] as MultipartValue<string | Blob>
         if (fields.hasOwnProperty(key) && field.fieldname !== 'file') {
           formData.append(key, field.value)
         }
       }
+      // Busboy keeps adding parts that follow the file to this object; keep the
+      // fields the policy was verified against.
+      data.fields = { ...fields }
     }
     // Assign the multipartFileStream for later use
     req.multiPartFileStream = data
@@ -253,8 +273,12 @@ async function createServerSignature(
       ? (await getTenantConfig(tenantId)).anonKey
       : await anonKeyAsync
 
-    if (!tenantAnonKey) {
-      throw ERRORS.AccessDenied('Missing tenant anon key')
+    // The session token is the real credential (verified as a JWT after the
+    // signature check). The signing secret is the tenantId itself, or the
+    // anon key for backwards compatibility.
+    const secretKeys = [tenantId]
+    if (tenantAnonKey) {
+      secretKeys.push(tenantAnonKey)
     }
 
     const signature = new SignatureV4({
@@ -266,7 +290,7 @@ async function createServerSignature(
       s3OmitPrefixFromCanonicalUri: s3OmitPrefixFromCanonicalUri,
       credentials: {
         accessKey: tenantId,
-        secretKey: tenantAnonKey,
+        secretKey: secretKeys,
         region: awsRegion,
         service: awsService,
       },

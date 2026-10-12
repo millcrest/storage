@@ -16,7 +16,7 @@ import { randomUUID } from 'crypto'
 import { FastifyInstance } from 'fastify'
 import FormData from 'form-data'
 import fs from 'fs'
-import yaml from 'js-yaml'
+import * as yaml from 'js-yaml'
 import path from 'path'
 import { Pool } from 'pg'
 import * as tus from 'tus-js-client'
@@ -24,7 +24,7 @@ import { DetailedError } from 'tus-js-client'
 import app from '../app'
 import { getConfig } from '../config'
 import { Storage } from '../storage'
-import { checkBucketExists } from './common'
+import { checkBucketExists } from './utils/storage'
 
 interface Policy {
   name: string
@@ -176,12 +176,11 @@ describe('RLS policies', () => {
 
   afterEach(async () => {
     await appInstance.close()
-    vi.clearAllMocks()
   })
 
   afterAll(async () => {
     await db.end()
-    await (currentStorage.db as StoragePgDB).connection.dispose()
+    ;(currentStorage.db as StoragePgDB).connection.dispose()
   })
 
   testSpec.tests.forEach((_test, index) => {

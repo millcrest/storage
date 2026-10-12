@@ -4,6 +4,7 @@ import { ERRORS } from '@internal/errors'
 import crypto from 'crypto'
 import { Readable } from 'stream'
 import { pipeline } from 'stream/promises'
+import { assertPolicyConditionsSatisfied, assertPolicyNotExpired, parsePolicy } from './policy'
 
 export enum SignatureV4Service {
   S3 = 's3',
@@ -17,7 +18,7 @@ interface SignatureV4Options {
   nonCanonicalForwardedHost?: string
   publicUrl?: URL
   s3OmitPrefixFromCanonicalUri?: string
-  credentials: Omit<Credentials, 'shortDate'> & { secretKey: string }
+  credentials: Omit<Credentials, 'shortDate'> & { secretKey: string | string[] }
 }
 
 export interface ClientSignature {
@@ -29,7 +30,7 @@ export interface ClientSignature {
   contentSha?: string
   policy?: {
     raw: string
-    value: Policy
+    fields: Record<string, string>
   }
 }
 
@@ -41,6 +42,7 @@ interface SignatureRequest {
   query?: Record<string, string>
   prefix?: string
   payloadHasher?: Writable & { digestHex: () => string }
+  bucket?: string
 }
 
 interface Credentials {
@@ -52,26 +54,6 @@ interface Credentials {
 
 type SignatureHeaders = Record<string, string | string[] | undefined>
 type SignatureQuery = Record<string, unknown>
-
-export interface Policy {
-  expiration: string
-  conditions: PolicyConditions
-}
-
-interface PolicyConditions {
-  policies: PolicyEntry[]
-  contentLengthRange: {
-    min: number
-    max: number
-    valid: boolean
-  }
-}
-
-interface PolicyEntry {
-  operator: string
-  key: string
-  value: string
-}
 
 /**
  * Lists the headers that should never be included in the
@@ -100,6 +82,24 @@ export const ALWAYS_UNSIGNABLE_QUERY_PARAMS = {
 
 export const EMPTY_SHA256_HASH = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
 
+/**
+ * Encodes a URI component according to RFC 3986.
+ * Unlike encodeURIComponent, this also encodes !'()* as required by AWS.
+ */
+export function encodeRFC3986URIComponent(str: string): string {
+  return encodeURIComponent(str).replace(/[!'()*]/g, (c) => {
+    return '%' + c.charCodeAt(0).toString(16).toUpperCase()
+  })
+}
+
+function canonicalUri(requestTarget: string, prefix?: string) {
+  const queryIndex = requestTarget.indexOf('?')
+  const path = queryIndex === -1 ? requestTarget : requestTarget.slice(0, queryIndex)
+  const pathPrefix = prefix ? prefix.replace(/\/+$/, '') : ''
+
+  return pathPrefix + path || '/'
+}
+
 export class SignatureV4 {
   public readonly serverCredentials: SignatureV4Options['credentials']
   enforceRegion: boolean
@@ -108,10 +108,27 @@ export class SignatureV4 {
   nonCanonicalForwardedHost?: string
   publicUrl?: URL
   s3OmitPrefixFromCanonicalUri?: string
-  private readonly signingKeyCache = new Map<string, Buffer>()
+  private readonly signingKeyCache: {
+    dateStamp: string
+    regionName: string
+    serviceName: string
+    signingKey: Buffer
+  }[] = []
+  private readonly secretKeys: string[]
+  // Index of the secret that matched during verify(); chunk signatures of a
+  // streaming upload must be validated with the same secret as the seed signature.
+  private matchedSecretIndex = 0
 
   constructor(options: SignatureV4Options) {
     this.serverCredentials = options.credentials
+    this.secretKeys = Array.isArray(options.credentials.secretKey)
+      ? options.credentials.secretKey
+      : [options.credentials.secretKey]
+
+    if (this.secretKeys.length === 0) {
+      throw new Error('SignatureV4 requires at least one secret key')
+    }
+
     this.enforceRegion = options.enforceRegion
     this.allowForwardedHeader = options.allowForwardedHeader
     this.allowBodyHashing = options.allowBodyHashing
@@ -231,11 +248,17 @@ export class SignatureV4 {
       throw ERRORS.InvalidSignature('Invalid signature format')
     }
 
-    const xPolicy: Policy = JSON.parse(Buffer.from(policy, 'base64').toString('utf-8'))
-
-    if (xPolicy.expiration) {
-      this.checkExpiration(longDate, xPolicy.expiration)
-    }
+    const fields: Record<string, string> = Object.create(null)
+    form.forEach((value, key) => {
+      if (typeof value !== 'string') {
+        return
+      }
+      const normalizedKey = key.toLowerCase()
+      if (Object.prototype.hasOwnProperty.call(fields, normalizedKey)) {
+        throw ERRORS.InvalidSignature('Duplicate form field in POST policy request')
+      }
+      fields[normalizedKey] = value
+    })
 
     const credentialsPart = credentialPart.split('/')
     if (credentialsPart.length !== 5) {
@@ -252,7 +275,7 @@ export class SignatureV4 {
       sessionToken,
       policy: {
         raw: policy,
-        value: xPolicy,
+        fields,
       },
     }
   }
@@ -294,14 +317,23 @@ export class SignatureV4 {
    */
   async verify(clientSignature: ClientSignature, request: SignatureRequest) {
     if (typeof clientSignature.policy?.raw === 'string') {
-      return this.verifyPostPolicySignature(clientSignature, clientSignature.policy.raw)
+      const verified = this.verifyPostPolicySignature(clientSignature, clientSignature.policy.raw)
+      if (!verified) {
+        return false
+      }
+
+      const value = parsePolicy(clientSignature.policy.raw)
+
+      // A POST policy must declare an expiration; AWS treats a missing one as
+      // invalid. Without this check a signed policy with no expiration would never
+      // expire and could be replayed forever.
+      assertPolicyNotExpired(value.expiration)
+      assertPolicyConditionsSatisfied(value, clientSignature.policy.fields, request.bucket)
+      return true
     }
 
     const serverSignature = await this.sign(clientSignature, request)
-    return crypto.timingSafeEqual(
-      Buffer.from(clientSignature.signature),
-      Buffer.from(serverSignature.signature)
-    )
+    return this.matchClientSignature(clientSignature.signature, serverSignature.signatures)
   }
 
   /**
@@ -310,11 +342,8 @@ export class SignatureV4 {
    * @param policy
    */
   verifyPostPolicySignature(clientSignature: ClientSignature, policy: string) {
-    const serverSignature = this.signPostPolicy(clientSignature, policy)
-    return crypto.timingSafeEqual(
-      Buffer.from(clientSignature.signature),
-      Buffer.from(serverSignature)
-    )
+    const serverSignatures = this.signPostPolicy(clientSignature, policy)
+    return this.matchClientSignature(clientSignature.signature, serverSignatures)
   }
 
   public validateChunkSignature(
@@ -324,7 +353,7 @@ export class SignatureV4 {
     prevSignature: string = clientSignature.signature
   ): boolean {
     const { shortDate, region, service } = clientSignature.credentials
-    const signingKey = this.getCachedSigningKey(shortDate, region, service)
+    const signingKey = this.getCachedSigningKey(shortDate, region, service, this.matchedSecretIndex)
 
     // Build the “String to Sign” for this chunk exactly per AWS:
     //    AWS4-HMAC-SHA256-PAYLOAD
@@ -345,8 +374,8 @@ export class SignatureV4 {
 
     // 4) HMAC it with the derived key and compare
     const expected = this.hmac(signingKey, stringToSign)
-
-    return crypto.timingSafeEqual(expected, Buffer.from(chunkSignature, 'hex'))
+    const clientSig = Buffer.from(chunkSignature, 'hex')
+    return clientSig.length === expected.length && crypto.timingSafeEqual(expected, clientSig)
   }
 
   signPostPolicy(clientSignature: ClientSignature, policy: string) {
@@ -355,13 +384,16 @@ export class SignatureV4 {
     this.validateCredentials(clientSignature.credentials)
     const selectedRegion = this.getSelectedRegion(clientSignature.credentials.region)
 
-    const signingKey = this.getCachedSigningKey(
-      clientSignature.credentials.shortDate,
-      selectedRegion,
-      serverCredentials.service
-    )
+    return this.secretKeys.map((_, index) => {
+      const signingKey = this.getCachedSigningKey(
+        clientSignature.credentials.shortDate,
+        selectedRegion,
+        serverCredentials.service,
+        index
+      )
 
-    return this.hmac(signingKey, policy).toString('hex')
+      return this.hmac(signingKey, policy).toString('hex')
+    })
   }
 
   /**
@@ -394,13 +426,18 @@ export class SignatureV4 {
       canonicalRequest
     )
 
-    const signingKey = this.getCachedSigningKey(
-      clientSignature.credentials.shortDate,
-      selectedRegion,
-      serverCredentials.service
-    )
+    const signatures = this.secretKeys.map((_, index) => {
+      const signingKey = this.getCachedSigningKey(
+        clientSignature.credentials.shortDate,
+        selectedRegion,
+        serverCredentials.service,
+        index
+      )
 
-    return { signature: this.hmac(signingKey, stringToSign).toString('hex'), canonicalRequest }
+      return this.hmac(signingKey, stringToSign).toString('hex')
+    })
+
+    return { signatures, canonicalRequest }
   }
 
   protected async getPayloadHash(clientSignature: ClientSignature, request: SignatureRequest) {
@@ -446,28 +483,16 @@ export class SignatureV4 {
     signedHeaders: string[]
   ) {
     const method = request.method
-    const prefix = request.prefix ? request.prefix.replace(/\/+$/, '') : ''
-    let canonicalUri = new URL(`http://localhost:8080${prefix}${request.url}`).pathname
+    let uri = canonicalUri(request.url, request.prefix)
     if (this.s3OmitPrefixFromCanonicalUri) {
-      canonicalUri = canonicalUri.replace(new RegExp(`^${this.s3OmitPrefixFromCanonicalUri}`), '')
+      uri = uri.replace(new RegExp(`^${this.s3OmitPrefixFromCanonicalUri}`), '')
     }
     const canonicalQueryString = this.constructCanonicalQueryString(request.query || {})
     const canonicalHeaders = this.constructCanonicalHeaders(request, signedHeaders)
     const signedHeadersString = signedHeaders.sort().join(';')
     const payloadHash = await this.getPayloadHash(clientSignature, request)
 
-    return `${method}\n${canonicalUri}\n${canonicalQueryString}\n${canonicalHeaders}\n${signedHeadersString}\n${payloadHash}`
-  }
-
-  /**
-   * Encodes a URI component according to RFC 3986, as required by AWS Signature V4.
-   * This differs from encodeURIComponent which doesn't encode certain characters
-   * like parentheses that AWS requires to be percent-encoded.
-   */
-  protected encodeRFC3986URIComponent(str: string): string {
-    return encodeURIComponent(str).replace(/[!'()*]/g, (c) => {
-      return '%' + c.charCodeAt(0).toString(16).toUpperCase()
-    })
+    return `${method}\n${uri}\n${canonicalQueryString}\n${canonicalHeaders}\n${signedHeadersString}\n${payloadHash}`
   }
 
   protected constructCanonicalQueryString(query: Record<string, string>) {
@@ -476,9 +501,7 @@ export class SignatureV4 {
       .sort()
       .map(
         (key) =>
-          `${this.encodeRFC3986URIComponent(key)}=${this.encodeRFC3986URIComponent(
-            query[key] as string
-          )}`
+          `${encodeRFC3986URIComponent(key)}=${encodeRFC3986URIComponent(query[key] as string)}`
       )
       .join('&')
   }
@@ -612,21 +635,43 @@ export class SignatureV4 {
     return this.hmac(kService, 'aws4_request')
   }
 
-  private getCachedSigningKey(dateStamp: string, regionName: string, serviceName: string) {
-    const cacheKey = `${dateStamp}\0${regionName}\0${serviceName}`
-    let signingKey = this.signingKeyCache.get(cacheKey)
-
-    if (!signingKey) {
-      signingKey = this.signingKey(
-        this.serverCredentials.secretKey,
-        dateStamp,
-        regionName,
-        serviceName
-      )
-      this.signingKeyCache.set(cacheKey, signingKey)
+  private getCachedSigningKey(
+    dateStamp: string,
+    regionName: string,
+    serviceName: string,
+    secretIndex = 0
+  ) {
+    const cached = this.signingKeyCache[secretIndex]
+    if (
+      cached?.dateStamp === dateStamp &&
+      cached.regionName === regionName &&
+      cached.serviceName === serviceName
+    ) {
+      return cached.signingKey
     }
 
+    const signingKey = this.signingKey(
+      this.secretKeys[secretIndex],
+      dateStamp,
+      regionName,
+      serviceName
+    )
+    this.signingKeyCache[secretIndex] = { dateStamp, regionName, serviceName, signingKey }
     return signingKey
+  }
+
+  private matchClientSignature(clientSignature: string, serverSignatures: string[]) {
+    const clientSig = Buffer.from(clientSignature)
+
+    for (const [index, candidate] of serverSignatures.entries()) {
+      const serverSig = Buffer.from(candidate)
+      if (clientSig.length === serverSig.length && crypto.timingSafeEqual(clientSig, serverSig)) {
+        this.matchedSecretIndex = index
+        return true
+      }
+    }
+
+    return false
   }
 
   protected async sha256OfRequest(req: Readable) {
@@ -643,10 +688,8 @@ export class SignatureV4 {
 
   protected getHeader(request: SignatureRequest, name: string) {
     const item = request.headers[name]
-    if (Array.isArray(item)) {
-      return item.join(',')
-    }
-    return item
+    const value = Array.isArray(item) ? item.join(',') : item
+    return value?.trim().replace(/\s+/g, ' ')
   }
 }
 

@@ -50,9 +50,26 @@ export interface JwksConfigKeyOKP extends JwksConfigKeyBase {
 
 export type JwksConfigKey = JwksConfigKeyOCT | JwksConfigKeyRSA | JwksConfigKeyEC | JwksConfigKeyOKP
 
+// The key types that are supported for signing urls
+export type UrlSigningJwksConfigKey = JwksConfigKeyOCT | JwksConfigKeyEC
+
+// The key type used when generating a new url signing jwk
+export const URL_SIGNING_JWK_TYPES = ['HS512', 'ES256'] as const
+export type UrlSigningJwkType = (typeof URL_SIGNING_JWK_TYPES)[number]
+
+// jwtAlgorithm must stay HMAC-only: the legacy flat jwtSecret signing/verification path (used when a tenant has no jwks configured)
+// treats the secret as raw symmetric key material, which only supports HMAC algorithms
+export const JWT_ALGORITHMS = ['HS256', 'HS384', 'HS512'] as const
+export type JwtAlgorithm = (typeof JWT_ALGORITHMS)[number]
+
 export interface JwksConfig {
-  keys: JwksConfigKey[]
-  urlSigningKey?: JwksConfigKeyOCT
+  readonly keys: readonly JwksConfigKey[]
+  readonly urlSigningKey?: UrlSigningJwksConfigKey
+}
+
+export function freezeJwksConfig(jwks: JwksConfig): JwksConfig {
+  Object.freeze(jwks.keys)
+  return Object.freeze(jwks)
 }
 
 type StorageConfigType = {
@@ -60,6 +77,9 @@ type StorageConfigType = {
   isProduction: boolean
   version: string
   numWorkers: number
+  clusterDiscoveryTimeoutMs: number
+  clusterDiscoveryPollIntervalMs: number
+  clusterDiscoveryEcsMaxRps: number
   exposeDocs: boolean
   keepAliveTimeout: number
   headersTimeout: number
@@ -83,11 +103,13 @@ type StorageConfigType = {
   storageS3ForcePathStyle?: boolean
   storageS3Region: string
   storageS3ClientTimeout: number
+  storageLifecycleEnabled: boolean
   isMultitenant: boolean
   jwtSecret: string
-  jwtAlgorithm: string
+  jwtAlgorithm: JwtAlgorithm
   jwtCachingEnabled: boolean
   jwtJWKS?: JwksConfig
+  urlSigningJwkType: UrlSigningJwkType
   multitenantDatabaseUrl?: string
   multitenantDatabasePoolUrl?: string
   multitenantMaxConnections: number
@@ -108,9 +130,11 @@ type StorageConfigType = {
   databasePoolURL?: string
   databaseMaxConnections: number
   databaseFreePoolAfterInactivity: number
+  databaseTlsSessionResumption: boolean
   databasePoolDrainTimeout: number
   databaseConnectionTimeout: number
   databaseEnableQueryCancellation: boolean
+  databaseHealthcheckUnscoped: boolean
   databaseStatementTimeout: number
   databaseApplicationName: string
   region: string
@@ -118,6 +142,8 @@ type StorageConfigType = {
   requestTraceHeader?: string
   requestEtagHeaders: string[]
   responseSMaxAge: number
+  responseStaleWhileRevalidate: number
+  responseStaleIfError: number
   anonKeyAsync: Promise<string>
   serviceKeyAsync: Promise<string>
   emptyBucketMax: number
@@ -196,10 +222,22 @@ type StorageConfigType = {
     upload: boolean
   }
   prometheusMetricsEnabled: boolean
-  tenantPoolCacheTtlMs: number
-  tenantPoolCacheHitLogSampleRate: number
-  tenantPoolCacheMissLogSampleRate: number
+  profilingAutomaticEnabled: boolean
+  profilingS3Bucket?: string
+  profilingS3Region: string
+  profilingS3Endpoint?: string
+  profilingS3ForcePathStyle: boolean
+  profilingCaptureSeconds: number
+  profilingCpuIntervalMicros: number
+  profilingTriggerElu: number
+  profilingMaxElu: number
+  profilingTriggerDelayP99Ms: number
+  profilingSevereDelayP99Ms: number
+  profilingCooldownSeconds: number
+  profilingMaxCapturesPerHour: number
+  tenantPoolCacheMaxEntries: number
   otelMetricsEnabled: boolean
+  otlpMetricsEndpoint?: string
   otelMetricsTemporality: 'DELTA' | 'CUMULATIVE'
   otelMetricsExportIntervalMs: number
   cdnPurgeEndpointURL?: string
@@ -217,6 +255,8 @@ type StorageConfigType = {
   icebergBucketDetectionSuffix: string
   icebergBucketDetectionMode: 'BUCKET' | 'FULL_PATH'
   icebergS3DeleteEnabled: boolean
+
+  storageVersioningEnabled: boolean
 
   vectorEnabled: boolean
   vectorBucketProvider: VectorBucketProvider
@@ -279,6 +319,23 @@ function normalizeStorageS3ChecksumConfig(
   throw new Error(`Invalid ${envKey} "${value}". Expected "WHEN_SUPPORTED" or "WHEN_REQUIRED".`)
 }
 
+export function normalizeEnumValue<T extends string>(
+  value: string | undefined,
+  allowedValues: readonly T[],
+  fallback: T,
+  label: string
+): T {
+  if (!value) {
+    return fallback
+  }
+
+  if ((allowedValues as readonly string[]).includes(value)) {
+    return value as T
+  }
+
+  throw new Error(`Invalid ${label} "${value}". Expected one of: ${allowedValues.join(', ')}.`)
+}
+
 function getOptionalIfMultitenantConfigFromEnv(key: string, fallback?: string): string | undefined {
   return getOptionalConfigFromEnv('MULTI_TENANT', 'IS_MULTITENANT') === 'true'
     ? getOptionalConfigFromEnv(key, fallback)
@@ -293,6 +350,9 @@ export function setEnvPaths(paths: string[]) {
 }
 
 export function mergeConfig(newConfig: Partial<StorageConfigType>) {
+  if (newConfig.jwtJWKS) {
+    freezeJwksConfig(newConfig.jwtJWKS)
+  }
   config = { ...config, ...(newConfig as Required<StorageConfigType>) }
 }
 
@@ -307,6 +367,21 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
   config = {
     serviceName: getOptionalConfigFromEnv('SERVICE_NAME') || 'storage_api',
     numWorkers: envNumber(getOptionalConfigFromEnv('WORKERS_NUM'), 1),
+    clusterDiscoveryTimeoutMs: envBoundedPositiveInteger(
+      getOptionalConfigFromEnv('CLUSTER_DISCOVERY_TIMEOUT_MS'),
+      30_000,
+      MAX_TIMER_DELAY_MS
+    ),
+    clusterDiscoveryPollIntervalMs: envBoundedPositiveInteger(
+      getOptionalConfigFromEnv('CLUSTER_DISCOVERY_POLL_INTERVAL_MS'),
+      20_000,
+      MAX_TIMER_DELAY_MS
+    ),
+    clusterDiscoveryEcsMaxRps: envBoundedPositiveInteger(
+      getOptionalConfigFromEnv('CLUSTER_DISCOVERY_ECS_MAX_RPS'),
+      10,
+      Number.MAX_SAFE_INTEGER
+    ),
     isProduction: process.env.NODE_ENV === 'production',
     exposeDocs: getOptionalConfigFromEnv('EXPOSE_DOCS') !== 'false',
     isMultitenant,
@@ -340,6 +415,14 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       'if-none-match',
     ],
     responseSMaxAge: parseInt(getOptionalConfigFromEnv('RESPONSE_S_MAXAGE') || '0', 10),
+    responseStaleWhileRevalidate: envNonNegativeInteger(
+      getOptionalConfigFromEnv('RESPONSE_STALE_WHILE_REVALIDATE'),
+      0
+    ),
+    responseStaleIfError: envNonNegativeInteger(
+      getOptionalConfigFromEnv('RESPONSE_STALE_IF_ERROR'),
+      0
+    ),
 
     // Admin
     adminApiKeys: getOptionalConfigFromEnv('SERVER_ADMIN_API_KEYS', 'ADMIN_API_KEYS') || '',
@@ -352,8 +435,19 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
 
     encryptionKey: getOptionalConfigFromEnv('AUTH_ENCRYPTION_KEY', 'ENCRYPTION_KEY') || '',
     jwtSecret: getOptionalIfMultitenantConfigFromEnv('AUTH_JWT_SECRET', 'PGRST_JWT_SECRET') || '',
-    jwtAlgorithm: getOptionalConfigFromEnv('AUTH_JWT_ALGORITHM', 'PGRST_JWT_ALGORITHM') || 'HS256',
+    jwtAlgorithm: normalizeEnumValue(
+      getOptionalConfigFromEnv('AUTH_JWT_ALGORITHM', 'PGRST_JWT_ALGORITHM'),
+      JWT_ALGORITHMS,
+      'HS256',
+      'jwt algorithm'
+    ),
     jwtCachingEnabled: getOptionalConfigFromEnv('JWT_CACHING_ENABLED') === 'true',
+    urlSigningJwkType: normalizeEnumValue(
+      getOptionalConfigFromEnv('AUTH_URL_SIGNING_JWK_TYPE'),
+      URL_SIGNING_JWK_TYPES,
+      'HS512',
+      'url signing key type'
+    ),
 
     // Upload
     uploadFileSizeLimit: Number(
@@ -404,6 +498,7 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     // Storage
     storageBackendType: getOptionalConfigFromEnv('STORAGE_BACKEND') as StorageBackendType,
     emptyBucketMax: parseInt(getOptionalConfigFromEnv('STORAGE_EMPTY_BUCKET_MAX') || '200000', 10),
+    storageLifecycleEnabled: getOptionalConfigFromEnv('STORAGE_LIFECYCLE_ENABLED') === 'true',
 
     // Storage - File
     storageFilePath: getOptionalConfigFromEnv(
@@ -445,6 +540,51 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       'true',
     storageS3Region: getOptionalConfigFromEnv('STORAGE_S3_REGION', 'REGION') as string,
     storageS3ClientTimeout: Number(getOptionalConfigFromEnv('STORAGE_S3_CLIENT_TIMEOUT') || `0`),
+
+    // Watt profiling uses a dedicated bucket/client and ELU-gated capture windows.
+    profilingAutomaticEnabled: getOptionalConfigFromEnv('PROFILING_AUTOMATIC_ENABLED') === 'true',
+    profilingS3Bucket: getOptionalConfigFromEnv('PROFILING_S3_BUCKET'),
+    profilingS3Region:
+      getOptionalConfigFromEnv('PROFILING_S3_REGION') ||
+      (getOptionalConfigFromEnv('STORAGE_S3_REGION', 'REGION') as string),
+    profilingS3Endpoint:
+      getOptionalConfigFromEnv('PROFILING_S3_ENDPOINT') ||
+      getOptionalConfigFromEnv('STORAGE_S3_ENDPOINT', 'GLOBAL_S3_ENDPOINT'),
+    profilingS3ForcePathStyle:
+      (getOptionalConfigFromEnv('PROFILING_S3_FORCE_PATH_STYLE') ||
+        getOptionalConfigFromEnv('STORAGE_S3_FORCE_PATH_STYLE', 'GLOBAL_S3_FORCE_PATH_STYLE')) ===
+      'true',
+    profilingCaptureSeconds: envIntegerInRange(
+      getOptionalConfigFromEnv('PROFILING_CAPTURE_SECONDS'),
+      30,
+      1,
+      300
+    ),
+    profilingCpuIntervalMicros: envIntegerInRange(
+      getOptionalConfigFromEnv('PROFILING_CPU_INTERVAL_MICROS'),
+      33_000,
+      1_000,
+      1_000_000
+    ),
+    profilingTriggerElu: envSampleRate(getOptionalConfigFromEnv('PROFILING_TRIGGER_ELU'), 0.55),
+    profilingMaxElu: envSampleRate(getOptionalConfigFromEnv('PROFILING_MAX_ELU'), 0.8),
+    // Event-loop-delay capture triggers action only when watt health.maxEventLoopDelayP99 is set.
+    profilingTriggerDelayP99Ms: envPositiveInteger(
+      getOptionalConfigFromEnv('PROFILING_TRIGGER_DELAY_P99_MS'),
+      150
+    ),
+    profilingSevereDelayP99Ms: envPositiveInteger(
+      getOptionalConfigFromEnv('PROFILING_SEVERE_DELAY_P99_MS'),
+      1_000
+    ),
+    profilingCooldownSeconds: envNonNegativeInteger(
+      getOptionalConfigFromEnv('PROFILING_COOLDOWN_SECONDS'),
+      300
+    ),
+    profilingMaxCapturesPerHour: envNonNegativeInteger(
+      getOptionalConfigFromEnv('PROFILING_MAX_CAPTURES_PER_HOUR'),
+      6
+    ),
 
     // DB - Migrations
     dbAnonRole: getOptionalConfigFromEnv('DB_ANON_ROLE') || 'anon',
@@ -494,9 +634,12 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
       getOptionalConfigFromEnv('DATABASE_FREE_POOL_AFTER_INACTIVITY') || (1000 * 60).toString(),
       10
     ),
-    databasePoolDrainTimeout: envPositiveInteger(
+    databaseTlsSessionResumption:
+      getOptionalConfigFromEnv('DATABASE_TLS_SESSION_RESUMPTION') === 'true',
+    databasePoolDrainTimeout: envBoundedPositiveInteger(
       getOptionalConfigFromEnv('DATABASE_POOL_DRAIN_TIMEOUT'),
-      30_000
+      30_000,
+      MAX_TIMER_DELAY_MS
     ),
     databaseConnectionTimeout: parseInt(
       getOptionalConfigFromEnv('DATABASE_CONNECTION_TIMEOUT') || '3000',
@@ -504,6 +647,8 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     ),
     databaseEnableQueryCancellation:
       getOptionalConfigFromEnv('DATABASE_ENABLE_QUERY_CANCELLATION') === 'true',
+    databaseHealthcheckUnscoped:
+      getOptionalConfigFromEnv('DATABASE_HEALTHCHECK_UNSCOPED') === 'true',
     databaseStatementTimeout: parseInt(
       getOptionalConfigFromEnv('DATABASE_STATEMENT_TIMEOUT') || '30000',
       10
@@ -521,17 +666,10 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     logflareApiKey: getOptionalConfigFromEnv('LOGFLARE_API_KEY'),
     logflareSourceToken: getOptionalConfigFromEnv('LOGFLARE_SOURCE_TOKEN'),
     logflareBatchSize: parseInt(getOptionalConfigFromEnv('LOGFLARE_BATCH_SIZE') || '200', 10),
-    tenantPoolCacheTtlMs: envPositiveInteger(
-      getOptionalConfigFromEnv('TENANT_POOL_CACHE_TTL_MS'),
-      1000 * 10
-    ),
-    tenantPoolCacheHitLogSampleRate: envSampleRate(
-      getOptionalConfigFromEnv('TENANT_POOL_CACHE_HIT_LOG_SAMPLE_RATE'),
-      0
-    ),
-    tenantPoolCacheMissLogSampleRate: envSampleRate(
-      getOptionalConfigFromEnv('TENANT_POOL_CACHE_MISS_LOG_SAMPLE_RATE'),
-      0
+    tenantPoolCacheMaxEntries: envBoundedPositiveInteger(
+      getOptionalConfigFromEnv('TENANT_POOL_CACHE_MAX_ENTRIES'),
+      16_384,
+      MAX_TENANT_CACHE_ENTRIES
     ),
     tracingEnabled: getOptionalConfigFromEnv('TRACING_ENABLED') === 'true',
     tracingMode: getOptionalConfigFromEnv('TRACING_MODE') ?? 'basic',
@@ -547,6 +685,10 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     // OpenTelemetry Metrics
     prometheusMetricsEnabled: getOptionalConfigFromEnv('PROMETHEUS_METRICS_ENABLED') === 'true',
     otelMetricsEnabled: getOptionalConfigFromEnv('OTEL_METRICS_ENABLED') === 'true',
+    otlpMetricsEndpoint: getOptionalConfigFromEnv(
+      'OTEL_EXPORTER_OTLP_METRICS_ENDPOINT',
+      'OTEL_EXPORTER_OTLP_ENDPOINT'
+    ),
     otelMetricsTemporality: getOptionalConfigFromEnv('OTEL_METRICS_TEMPORALITY') || 'CUMULATIVE',
     otelMetricsExportIntervalMs: parseInt(
       getOptionalConfigFromEnv('OTEL_METRICS_EXPORT_INTERVAL_MS') || '60000',
@@ -669,10 +811,16 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     icebergMaxTableCount: parseInt(getOptionalConfigFromEnv('ICEBERG_MAX_TABLES') || '10', 10),
     icebergS3DeleteEnabled: getOptionalConfigFromEnv('ICEBERG_S3_DELETE_ENABLED') === 'true',
 
+    storageVersioningEnabled: getOptionalConfigFromEnv('STORAGE_VERSIONING_ENABLED') === 'true',
+
     vectorEnabled: getOptionalConfigFromEnv('VECTOR_ENABLED') === 'true',
     vectorBucketProvider: (getOptionalConfigFromEnv('VECTOR_BUCKET_PROVIDER') ||
       's3') as VectorBucketProvider,
-    vectorS3Buckets: getOptionalConfigFromEnv('VECTOR_S3_BUCKETS')?.trim()?.split(',') || [],
+    vectorS3Buckets:
+      getOptionalConfigFromEnv('VECTOR_S3_BUCKETS')
+        ?.split(',')
+        .map((s) => s.trim())
+        .filter(Boolean) || [],
     vectorBucketRegion: getOptionalConfigFromEnv('VECTOR_BUCKET_REGION') || undefined,
     vectorDatabaseURL: getOptionalConfigFromEnv('VECTOR_DATABASE_URL') || undefined,
     vectorDatabaseCreate: getOptionalConfigFromEnv('VECTOR_DATABASE_CREATE') !== 'false',
@@ -681,6 +829,24 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
     vectorMaxBucketsCount: parseInt(getOptionalConfigFromEnv('VECTOR_MAX_BUCKETS') || '10', 10),
     vectorMaxIndexesCount: parseInt(getOptionalConfigFromEnv('VECTOR_MAX_INDEXES') || '20', 10),
   } as StorageConfigType
+
+  if (
+    config.profilingS3Bucket &&
+    config.storageS3Bucket &&
+    config.profilingS3Bucket === config.storageS3Bucket
+  ) {
+    throw new Error('PROFILING_S3_BUCKET must be different from the normal storage data bucket')
+  }
+
+  if (config.profilingMaxElu <= config.profilingTriggerElu) {
+    throw new Error('PROFILING_MAX_ELU must be greater than PROFILING_TRIGGER_ELU')
+  }
+
+  if (config.profilingSevereDelayP99Ms <= config.profilingTriggerDelayP99Ms) {
+    throw new Error(
+      'PROFILING_SEVERE_DELAY_P99_MS must be greater than PROFILING_TRIGGER_DELAY_P99_MS'
+    )
+  }
 
   const serviceKey = getOptionalConfigFromEnv('SERVICE_KEY') || ''
   if (!config.isMultitenant && !serviceKey) {
@@ -708,7 +874,7 @@ export function getConfig(options?: { reload?: boolean }): StorageConfigType {
 
   if (jwtJWKS) {
     try {
-      config.jwtJWKS = JSON.parse(jwtJWKS)
+      config.jwtJWKS = freezeJwksConfig(JSON.parse(jwtJWKS))
     } catch {
       throw new Error('Unable to parse JWT_JWKS value to JSON')
     }
@@ -732,6 +898,41 @@ function envPositiveInteger(value: string | undefined, defaultValue: number): nu
   const parsed = envNumber(value, defaultValue)
 
   return parsed && parsed > 0 ? parsed : defaultValue
+}
+
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
+const MAX_TENANT_CACHE_ENTRIES = 65_536
+
+function envBoundedPositiveInteger(
+  value: string | undefined,
+  defaultValue: number,
+  maximum: number
+): number {
+  if (!value || !/^[1-9]\d*$/.test(value)) {
+    return defaultValue
+  }
+
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= maximum ? parsed : defaultValue
+}
+
+function envNonNegativeInteger(value: string | undefined, defaultValue: number): number {
+  const parsed = envNumber(value, defaultValue)
+
+  return parsed !== undefined && parsed >= 0 ? parsed : defaultValue
+}
+
+function envIntegerInRange(
+  value: string | undefined,
+  defaultValue: number,
+  minimum: number,
+  maximum: number
+): number {
+  if (!value) return defaultValue
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum
+    ? parsed
+    : defaultValue
 }
 
 function envSampleRate(value: string | undefined, defaultValue: number): number {

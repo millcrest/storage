@@ -1,12 +1,14 @@
 import {
+  type DatabaseExecutor,
+  type DatabaseStatement,
   getServiceKeyUser,
-  type PgExecutor,
   PgPoolStrategy,
-  type PgStatement,
   PgTenantConnection,
   PgTransaction,
 } from '@internal/database'
 import { runMigrationsOnTenant } from '@internal/database/migrations'
+import type { TenantConnectionOptions } from '@internal/database/pool'
+import { hashStringToInt } from '@internal/hashing'
 import { logger, logSchema } from '@internal/monitoring'
 import { dbQueryPerformance } from '@internal/monitoring/metrics'
 import { StoragePgDB } from '@storage/database'
@@ -17,12 +19,16 @@ import { getConfig } from '../config'
 
 const { databaseURL, tenantId } = getConfig()
 
+function poolLease(pool: PgPoolStrategy) {
+  return { value: pool, release: () => {} }
+}
+
 describe('StoragePgDB bucket metadata', () => {
   let pool: PgPoolStrategy
   let db: StoragePgDB
   let runId: string
   let superUser: Awaited<ReturnType<typeof getServiceKeyUser>>
-  let connectionSettings: ConstructorParameters<typeof PgPoolStrategy>[0]
+  let connectionSettings: TenantConnectionOptions
 
   beforeAll(async () => {
     await runMigrationsOnTenant({
@@ -46,7 +52,7 @@ describe('StoragePgDB bucket metadata', () => {
     }
 
     pool = new PgPoolStrategy(connectionSettings)
-    db = new StoragePgDB(new PgTenantConnection(pool, connectionSettings), {
+    db = new StoragePgDB(new PgTenantConnection(poolLease(pool), connectionSettings), {
       tenantId,
       host: 'localhost',
     })
@@ -61,7 +67,7 @@ describe('StoragePgDB bucket metadata', () => {
   })
 
   afterAll(async () => {
-    await pool.destroy()
+    await pool.dispose('destroy')
   })
 
   it('creates, finds, lists, updates, counts, and deletes buckets through pg', async () => {
@@ -203,6 +209,111 @@ describe('StoragePgDB bucket metadata', () => {
       releaseLock?.()
       await lockHolder
     }
+  })
+
+  it('acquires every key of a lock batch or times out on the held one', async () => {
+    const bucketId = `${runId}-lock-batch-bucket`
+    const heldName = `${runId}-lock-batch-held`
+    const freeName = `${runId}-lock-batch-free`
+    const lockReady = Promise.withResolvers<void>()
+    const releaseLock = Promise.withResolvers<void>()
+    const lockHolder = db.withTransaction(async (tx) => {
+      await tx.waitObjectLock(bucketId, heldName)
+      lockReady.resolve()
+      await releaseLock.promise
+    })
+
+    await lockReady.promise
+
+    try {
+      await expect(
+        db.waitObjectLocks(
+          [
+            { bucketId, objectName: freeName },
+            { bucketId, objectName: heldName },
+          ],
+          { timeout: 200 }
+        )
+      ).rejects.toMatchObject({ code: 'LockTimeout' })
+    } finally {
+      releaseLock.resolve()
+      await lockHolder
+    }
+
+    await expect(
+      db.withTransaction(async (tx) => {
+        await tx.waitObjectLocks(
+          [
+            { bucketId, objectName: freeName },
+            { bucketId, objectName: heldName },
+            { bucketId, objectName: heldName, version: 'v1' },
+          ],
+          { timeout: 200 }
+        )
+
+        // Both keys are held by this transaction now: a second taker must time out.
+        await expect(
+          db.waitObjectLock(bucketId, freeName, undefined, { timeout: 100 })
+        ).rejects.toMatchObject({ code: 'LockTimeout' })
+        await expect(
+          db.waitObjectLock(bucketId, heldName, 'v1', { timeout: 100 })
+        ).rejects.toMatchObject({ code: 'LockTimeout' })
+        return true
+      })
+    ).resolves.toBe(true)
+  })
+
+  it('reads combined delete targets and several buckets in one locked statement each', async () => {
+    const versionedBucket = `${runId}-targets-versioned`
+    const plainBucket = `${runId}-targets-plain`
+    await db.createBucket({
+      id: versionedBucket,
+      name: versionedBucket,
+      versioning_status: 'ENABLED',
+    })
+    await db.createBucket({ id: plainBucket, name: plainBucket })
+    const write = (name: string, version: string) =>
+      db.upsertObject({
+        bucket_id: versionedBucket,
+        name,
+        owner: undefined,
+        metadata: { size: 1 },
+        user_metadata: null,
+        version,
+      })
+    await write('k1', 'v1')
+    await write('k1', 'v2')
+    await write('k2', 'v1')
+
+    await db.withTransaction(async (tx) => {
+      const buckets = await tx.findBucketsById(
+        [versionedBucket, plainBucket],
+        'id,versioning_status',
+        { forShare: true }
+      )
+      expect(buckets.map((bucket) => [bucket.id, bucket.versioning_status])).toEqual([
+        [plainBucket, 'DISABLED'],
+        [versionedBucket, 'ENABLED'],
+      ])
+
+      const rows = await tx.findObjectTargets(
+        versionedBucket,
+        {
+          names: ['k1', 'k2', 'missing'],
+          versions: [
+            { name: 'k1', version: 'v1' },
+            { name: 'k2', version: 'nope' },
+          ],
+        },
+        'name,version,archived_at',
+        { forUpdate: true }
+      )
+      expect(rows.map((row) => [row.name, row.version, row.archived_at === null])).toEqual([
+        ['k1', 'v1', false],
+        ['k1', 'v2', true],
+        ['k2', 'v1', true],
+      ])
+    })
   })
 
   it('restores lock_timeout before later row locks in the same transaction', async () => {
@@ -350,29 +461,30 @@ describe('StoragePgDB bucket metadata', () => {
     ).resolves.toBeUndefined()
   })
 
-  it('restores parent transaction scope after failed super-user queries', async () => {
-    const authenticatedUser = {
-      jwt: 'storage-pg-db-authenticated-jwt',
-      payload: {
-        role: 'authenticated',
-        sub: randomUUID(),
-      },
-    }
-    const authenticatedSettings = {
-      ...connectionSettings,
-      user: authenticatedUser,
-      superUser,
-    }
-    const authenticatedPool = new PgPoolStrategy(authenticatedSettings)
-    const authenticatedDb = new StoragePgDB(
-      new PgTenantConnection(authenticatedPool, authenticatedSettings),
-      {
-        tenantId,
-        host: 'localhost',
-      }
-    )
+  it('keeps the caller scope when a service adapter is derived repeatedly', async () => {
+    await withAuthenticatedDb('storage-pg-db-repeated-super-user', async (authenticatedDb) => {
+      await authenticatedDb.withTransaction(async (tx) => {
+        const serviceDb = tx.asSuperUser().asSuperUser()
 
-    try {
+        await expect(
+          runStorageQuery(serviceDb, 'RepeatedSuperUserRole', readCurrentRoleFromExecutor)
+        ).resolves.toBe(superUser.payload.role)
+        await expect(readCurrentRole(tx)).resolves.toBe('authenticated')
+
+        const failure = new Error('failed repeated super-user query')
+        await expect(
+          runStorageQuery(serviceDb, 'RepeatedSuperUserFailure', async (pg) => {
+            expect(await readCurrentRoleFromExecutor(pg)).toBe(superUser.payload.role)
+            throw failure
+          })
+        ).rejects.toBe(failure)
+        await expect(readCurrentRole(tx)).resolves.toBe('authenticated')
+      })
+    })
+  })
+
+  it('restores parent transaction scope after failed super-user queries', async () => {
+    await withAuthenticatedDb('storage-pg-db-authenticated-jwt', async (authenticatedDb) => {
       await authenticatedDb.withTransaction(async (tx) => {
         await expect(readCurrentRole(tx)).resolves.toBe('authenticated')
 
@@ -408,9 +520,62 @@ describe('StoragePgDB bucket metadata', () => {
         )
         expect(result.rows[0].n).toBe(1)
       })
-    } finally {
-      await authenticatedPool.destroy()
-    }
+    })
+  })
+
+  it('preserves custom statement timeout after nested super-user scope restores', async () => {
+    await withAuthenticatedDb('storage-pg-db-timeout-jwt', async (authenticatedDb) => {
+      await authenticatedDb.withTransaction(
+        async (tx) => {
+          await expect(readCurrentRole(tx)).resolves.toBe('authenticated')
+          await expect(readCurrentStatementTimeoutMs(tx)).resolves.toBe(4321)
+
+          await expect(
+            runStorageQuery(
+              tx.asSuperUser() as StoragePgDB,
+              'ReadSuperUserStatementTimeout',
+              async (pg) => {
+                await expect(readCurrentRoleFromExecutor(pg)).resolves.toBe(superUser.payload.role)
+                await expect(readStatementTimeoutMs(pg)).resolves.toBe(4321)
+              }
+            )
+          ).resolves.toBeUndefined()
+
+          await expect(readCurrentRole(tx)).resolves.toBe('authenticated')
+          await expect(readCurrentStatementTimeoutMs(tx)).resolves.toBe(4321)
+        },
+        { timeout: 4321 }
+      )
+    })
+  })
+
+  it('preserves custom statement timeout after failed nested super-user scope rolls back', async () => {
+    await withAuthenticatedDb('storage-pg-db-timeout-rollback-jwt', async (authenticatedDb) => {
+      await authenticatedDb.withTransaction(
+        async (tx) => {
+          await expect(readCurrentRole(tx)).resolves.toBe('authenticated')
+          await expect(readCurrentStatementTimeoutMs(tx)).resolves.toBe(4321)
+
+          await expect(
+            runStorageQuery(
+              tx.asSuperUser() as StoragePgDB,
+              'FailSuperUserStatementTimeout',
+              async (pg) => {
+                await expect(readCurrentRoleFromExecutor(pg)).resolves.toBe(superUser.payload.role)
+                await expect(readStatementTimeoutMs(pg)).resolves.toBe(4321)
+                await pg.query("SELECT set_config('statement_timeout', '30s', true)")
+                await expect(readStatementTimeoutMs(pg)).resolves.toBe(30000)
+                throw new Error('failed nested super-user timeout query')
+              }
+            )
+          ).rejects.toThrow('failed nested super-user timeout query')
+
+          await expect(readCurrentRole(tx)).resolves.toBe('authenticated')
+          await expect(readCurrentStatementTimeoutMs(tx)).resolves.toBe(4321)
+        },
+        { timeout: 4321 }
+      )
+    })
   })
 
   it('preserves original errors when best-effort parent scope restoration fails', async () => {
@@ -443,28 +608,24 @@ describe('StoragePgDB bucket metadata', () => {
     })
     const logSpy = vi.spyOn(logSchema, 'error').mockImplementation(() => undefined)
 
-    try {
-      await expect(
-        runStorageQuery(storage, 'RestoreScopeFailure', async () => {
-          throw originalError
-        })
-      ).rejects.toBe(originalError)
+    await expect(
+      runStorageQuery(storage, 'RestoreScopeFailure', async () => {
+        throw originalError
+      })
+    ).rejects.toBe(originalError)
 
-      expect(parentConnection.setScope).toHaveBeenCalledWith(parentTnx)
-      expect(logSpy).toHaveBeenCalledWith(
-        logger,
-        '[StoragePgDB] Failed to restore parent transaction scope',
-        expect.objectContaining({
-          type: 'db',
-          tenantId,
-          project: tenantId,
-          error: restoreError,
-          metadata: expect.stringContaining('"errorCode":"25P02"'),
-        })
-      )
-    } finally {
-      logSpy.mockRestore()
-    }
+    expect(parentConnection.setScope).toHaveBeenCalledWith(parentTnx)
+    expect(logSpy).toHaveBeenCalledWith(
+      logger,
+      '[StoragePgDB] Failed to restore parent transaction scope',
+      expect.objectContaining({
+        type: 'db',
+        tenantId,
+        project: tenantId,
+        error: restoreError,
+        metadata: expect.stringContaining('"errorCode":"25P02"'),
+      })
+    )
   })
 
   it('skips best-effort parent scope restoration after parent transaction completion', async () => {
@@ -607,32 +768,28 @@ describe('StoragePgDB bucket metadata', () => {
     })
     const logSpy = vi.spyOn(logSchema, 'warning').mockImplementation(() => undefined)
 
-    try {
-      await expect(
-        runStorageQuery(storage, 'SavepointRollbackFailure', async () => {
-          throw originalError
-        })
-      ).rejects.toBe(originalError)
+    await expect(
+      runStorageQuery(storage, 'SavepointRollbackFailure', async () => {
+        throw originalError
+      })
+    ).rejects.toBe(originalError)
 
-      expect(transaction.query).toHaveBeenCalledTimes(2)
-      expect(transaction.query).toHaveBeenNthCalledWith(1, expect.stringMatching(/^SAVEPOINT /))
-      expect(transaction.query).toHaveBeenNthCalledWith(
-        2,
-        expect.stringMatching(/^ROLLBACK TO SAVEPOINT /)
-      )
-      expect(logSpy).toHaveBeenCalledWith(
-        logger,
-        '[StoragePgDB] Failed to rollback savepoint',
-        expect.objectContaining({
-          type: 'db',
-          tenantId,
-          project: tenantId,
-          error: rollbackError,
-        })
-      )
-    } finally {
-      logSpy.mockRestore()
-    }
+    expect(transaction.query).toHaveBeenCalledTimes(2)
+    expect(transaction.query).toHaveBeenNthCalledWith(1, expect.stringMatching(/^SAVEPOINT /))
+    expect(transaction.query).toHaveBeenNthCalledWith(
+      2,
+      expect.stringMatching(/^ROLLBACK TO SAVEPOINT /)
+    )
+    expect(logSpy).toHaveBeenCalledWith(
+      logger,
+      '[StoragePgDB] Failed to rollback savepoint',
+      expect.objectContaining({
+        type: 'db',
+        tenantId,
+        project: tenantId,
+        error: rollbackError,
+      })
+    )
   })
 
   it('preserves original errors when top-level transaction rollback fails', async () => {
@@ -653,28 +810,24 @@ describe('StoragePgDB bucket metadata', () => {
     })
     const logSpy = vi.spyOn(logSchema, 'warning').mockImplementation(() => undefined)
 
-    try {
-      await expect(
-        storage.withTransaction(async () => {
-          throw originalError
-        })
-      ).rejects.toBe(originalError)
+    await expect(
+      storage.withTransaction(async () => {
+        throw originalError
+      })
+    ).rejects.toBe(originalError)
 
-      expect(transaction.rollback).toHaveBeenCalledTimes(1)
-      expect(transaction.commit).not.toHaveBeenCalled()
-      expect(logSpy).toHaveBeenCalledWith(
-        logger,
-        '[StoragePgDB] Failed to rollback transaction',
-        expect.objectContaining({
-          type: 'db',
-          tenantId,
-          project: tenantId,
-          error: rollbackError,
-        })
-      )
-    } finally {
-      logSpy.mockRestore()
-    }
+    expect(transaction.rollback).toHaveBeenCalledTimes(1)
+    expect(transaction.commit).not.toHaveBeenCalled()
+    expect(logSpy).toHaveBeenCalledWith(
+      logger,
+      '[StoragePgDB] Failed to rollback transaction',
+      expect.objectContaining({
+        type: 'db',
+        tenantId,
+        project: tenantId,
+        error: rollbackError,
+      })
+    )
   })
 
   it('preserves original runQuery errors when top-level rollback fails', async () => {
@@ -696,34 +849,30 @@ describe('StoragePgDB bucket metadata', () => {
     })
     const logSpy = vi.spyOn(logSchema, 'warning').mockImplementation(() => undefined)
 
-    try {
-      await expect(
-        runStorageQuery(storage, 'TopLevelRunQueryRollbackFailure', async () => {
-          throw originalError
-        })
-      ).rejects.toBe(originalError)
+    await expect(
+      runStorageQuery(storage, 'TopLevelRunQueryRollbackFailure', async () => {
+        throw originalError
+      })
+    ).rejects.toBe(originalError)
 
-      expect(transaction.rollback).toHaveBeenCalledTimes(1)
-      expect(logSpy).toHaveBeenCalledWith(
-        logger,
-        '[StoragePgDB] Failed to rollback transaction',
-        expect.objectContaining({
-          type: 'db',
-          tenantId,
-          project: tenantId,
-          error: rollbackError,
-        })
-      )
-    } finally {
-      logSpy.mockRestore()
-    }
+    expect(transaction.rollback).toHaveBeenCalledTimes(1)
+    expect(logSpy).toHaveBeenCalledWith(
+      logger,
+      '[StoragePgDB] Failed to rollback transaction',
+      expect.objectContaining({
+        type: 'db',
+        tenantId,
+        project: tenantId,
+        error: rollbackError,
+      })
+    )
   })
 
   it('maps PostgreSQL lock_timeout from waitObjectLock to LockTimeout', async () => {
     const lockTimeoutError = createPgError('55P03', 'canceling statement due to lock timeout')
-    const queries: Array<string | PgStatement> = []
+    const queries: Array<string | DatabaseStatement> = []
     const transaction = {
-      query: vi.fn(async (statement: string | PgStatement) => {
+      query: vi.fn(async (statement: string | DatabaseStatement) => {
         queries.push(statement)
 
         const text = typeof statement === 'string' ? statement : statement.text
@@ -770,9 +919,9 @@ describe('StoragePgDB bucket metadata', () => {
   })
 
   it('restores the prior transaction-local lock_timeout after waitObjectLock succeeds', async () => {
-    const queries: Array<string | PgStatement> = []
+    const queries: Array<string | DatabaseStatement> = []
     const transaction = {
-      query: vi.fn(async (statement: string | PgStatement) => {
+      query: vi.fn(async (statement: string | DatabaseStatement) => {
         queries.push(statement)
 
         const text = typeof statement === 'string' ? statement : statement.text
@@ -814,9 +963,9 @@ describe('StoragePgDB bucket metadata', () => {
   })
 
   it('uses top-level lock_timeout statements for Multigres waitObjectLock', async () => {
-    const queries: Array<string | PgStatement> = []
+    const queries: Array<string | DatabaseStatement> = []
     const transaction = {
-      query: vi.fn(async (statement: string | PgStatement) => {
+      query: vi.fn(async (statement: string | DatabaseStatement) => {
         queries.push(statement)
 
         const text = typeof statement === 'string' ? statement : statement.text
@@ -859,6 +1008,143 @@ describe('StoragePgDB bucket metadata', () => {
     expect(statementValues(queries[3])).toEqual(['2s'])
   })
 
+  it('acquires a batch of object locks in one sorted, deduplicated statement', async () => {
+    const queries: Array<string | DatabaseStatement> = []
+    const transaction = {
+      query: vi.fn(async (statement: string | DatabaseStatement) => {
+        queries.push(statement)
+        return { rows: [{ locked_count: '2' }], rowCount: 1 }
+      }),
+      commit: vi.fn().mockResolvedValue(undefined),
+      rollback: vi.fn().mockResolvedValue(undefined),
+      isCompleted: vi.fn().mockReturnValue(false),
+    } as unknown as PgTransaction
+    const connection = {
+      role: superUser.payload.role,
+      getAbortSignal: vi.fn().mockReturnValue(undefined),
+      transaction: vi.fn().mockResolvedValue(transaction),
+      setScope: vi.fn().mockResolvedValue(undefined),
+    } as unknown as PgTenantConnection
+    const storage = new StoragePgDB(connection, {
+      tenantId,
+      host: 'localhost',
+      databaseEngine: 'postgres',
+    })
+
+    await expect(
+      storage.waitObjectLocks(
+        [
+          { bucketId: 'bucket', objectName: 'b.txt' },
+          { bucketId: 'bucket', objectName: 'a.txt' },
+          { bucketId: 'bucket', objectName: 'b.txt' },
+        ],
+        { timeout: 123 }
+      )
+    ).resolves.toBe(true)
+
+    const expectedHashes = [hashStringToInt('bucket/a.txt'), hashStringToInt('bucket/b.txt')].sort(
+      (left, right) => left - right
+    )
+    expect(queries).toHaveLength(1)
+    expect(statementText(queries[0])).toContain('WITH previous_lock_timeout AS MATERIALIZED')
+    expect(statementText(queries[0])).toContain('unnest($1::bigint[])')
+    expect(statementText(queries[0])).toContain(`set_config('lock_timeout', $2, true)`)
+    expect(statementValues(queries[0])).toEqual([expectedHashes, '123ms'])
+    expect(transaction.commit).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails a lock batch that acquired fewer locks than requested', async () => {
+    const transaction = {
+      query: vi.fn().mockResolvedValue({ rows: [{ locked_count: '1' }], rowCount: 1 }),
+      commit: vi.fn().mockResolvedValue(undefined),
+      rollback: vi.fn().mockResolvedValue(undefined),
+      isCompleted: vi.fn().mockReturnValue(false),
+    } as unknown as PgTransaction
+    const connection = {
+      role: superUser.payload.role,
+      getAbortSignal: vi.fn().mockReturnValue(undefined),
+      transaction: vi.fn().mockResolvedValue(transaction),
+      setScope: vi.fn().mockResolvedValue(undefined),
+    } as unknown as PgTenantConnection
+    const storage = new StoragePgDB(connection, {
+      tenantId,
+      host: 'localhost',
+      databaseEngine: 'postgres',
+    })
+
+    await expect(
+      storage.waitObjectLocks(
+        [
+          { bucketId: 'bucket', objectName: 'a.txt' },
+          { bucketId: 'bucket', objectName: 'b.txt' },
+        ],
+        { timeout: 123 }
+      )
+    ).rejects.toMatchObject({ code: 'InternalError' })
+    expect(transaction.rollback).toHaveBeenCalledTimes(1)
+  })
+
+  it('skips the statement for an empty lock batch', async () => {
+    const connection = {
+      role: superUser.payload.role,
+      getAbortSignal: vi.fn().mockReturnValue(undefined),
+      transaction: vi.fn(),
+      setScope: vi.fn().mockResolvedValue(undefined),
+    } as unknown as PgTenantConnection
+    const storage = new StoragePgDB(connection, { tenantId, host: 'localhost' })
+
+    await expect(storage.waitObjectLocks([], { timeout: 123 })).resolves.toBe(true)
+    expect(connection.transaction).not.toHaveBeenCalled()
+  })
+
+  it('uses top-level lock_timeout statements for Multigres waitObjectLocks', async () => {
+    const queries: Array<string | DatabaseStatement> = []
+    const transaction = {
+      query: vi.fn(async (statement: string | DatabaseStatement) => {
+        queries.push(statement)
+
+        const text = typeof statement === 'string' ? statement : statement.text
+        if (text.includes(`current_setting('lock_timeout')`)) {
+          return { rows: [{ value: '2s' }] }
+        }
+
+        return { rows: [{}, {}], rowCount: 2 }
+      }),
+      commit: vi.fn().mockResolvedValue(undefined),
+      rollback: vi.fn().mockResolvedValue(undefined),
+      isCompleted: vi.fn().mockReturnValue(false),
+    } as unknown as PgTransaction
+    const connection = {
+      role: superUser.payload.role,
+      getAbortSignal: vi.fn().mockReturnValue(undefined),
+      transaction: vi.fn().mockResolvedValue(transaction),
+      setScope: vi.fn().mockResolvedValue(undefined),
+    } as unknown as PgTenantConnection
+    const storage = new StoragePgDB(connection, {
+      tenantId,
+      host: 'localhost',
+      databaseEngine: 'multigres',
+    } as ConstructorParameters<typeof StoragePgDB>[1])
+
+    await expect(
+      storage.waitObjectLocks(
+        [
+          { bucketId: 'bucket', objectName: 'a.txt' },
+          { bucketId: 'bucket', objectName: 'b.txt' },
+        ],
+        { timeout: 123 }
+      )
+    ).resolves.toBe(true)
+
+    expect(queries).toHaveLength(4)
+    expect(statementText(queries[0])).toContain(`current_setting('lock_timeout')`)
+    expect(statementText(queries[1])).toContain(`set_config('lock_timeout', $1, true)`)
+    expect(statementText(queries[2])).toContain('unnest($1::bigint[])')
+    expect(statementValues(queries[2])).toEqual([[expect.any(Number), expect.any(Number)]])
+    expect(statementText(queries[3])).toContain(`set_config('lock_timeout', $1, true)`)
+    expect(statementValues(queries[3])).toEqual(['2s'])
+  })
+
   it('preserves original metastore errors when top-level rollback fails', async () => {
     const originalError = new Error('metastore failed')
     const rollbackError = new Error('rollback failed')
@@ -874,25 +1160,21 @@ describe('StoragePgDB bucket metadata', () => {
     })
     const logSpy = vi.spyOn(logSchema, 'warning').mockImplementation(() => undefined)
 
-    try {
-      await expect(
-        metastore.transaction(async () => {
-          throw originalError
-        })
-      ).rejects.toBe(originalError)
+    await expect(
+      metastore.transaction(async () => {
+        throw originalError
+      })
+    ).rejects.toBe(originalError)
 
-      expect(trx.rollback).toHaveBeenCalledTimes(1)
-      expect(logSpy).toHaveBeenCalledWith(
-        logger,
-        '[PgMetastore] Failed to rollback transaction',
-        expect.objectContaining({
-          type: 'db',
-          error: rollbackError,
-        })
-      )
-    } finally {
-      logSpy.mockRestore()
-    }
+    expect(trx.rollback).toHaveBeenCalledTimes(1)
+    expect(logSpy).toHaveBeenCalledWith(
+      logger,
+      '[PgMetastore] Failed to rollback transaction',
+      expect.objectContaining({
+        type: 'db',
+        error: rollbackError,
+      })
+    )
   })
 
   it('rolls back nested metastore transactions to a savepoint', async () => {
@@ -922,7 +1204,6 @@ describe('StoragePgDB bucket metadata', () => {
         expect.stringMatching(/^RELEASE SAVEPOINT "iceberg_pg_transaction_/)
       )
     } finally {
-      querySpy.mockRestore()
       if (!trx.isCompleted()) {
         await trx.rollback()
       }
@@ -960,7 +1241,7 @@ describe('StoragePgDB bucket metadata', () => {
   })
 
   it('tags request-aborted pg query duration metrics', async () => {
-    const connection = new PgTenantConnection(pool, connectionSettings)
+    const connection = new PgTenantConnection(poolLease(pool), connectionSettings)
     const storage = new StoragePgDB(connection, {
       tenantId,
       host: 'localhost',
@@ -970,30 +1251,26 @@ describe('StoragePgDB bucket metadata', () => {
     connection.setAbortSignal(controller.signal)
     const recordSpy = vi.spyOn(dbQueryPerformance, 'record')
 
-    try {
-      await expect(
-        runStorageQuery(storage, 'AbortedStoragePgQueryMetric', async (pg, signal) => {
-          await pg.query('SELECT 1', { signal })
-        })
-      ).rejects.toMatchObject({
-        name: 'AbortError',
-        code: 'ABORT_ERR',
-        message: 'Query was aborted',
+    await expect(
+      runStorageQuery(storage, 'AbortedStoragePgQueryMetric', async (pg, signal) => {
+        await pg.query('SELECT 1', { signal })
       })
+    ).rejects.toMatchObject({
+      name: 'AbortError',
+      code: 'ABORT_ERR',
+      message: 'Query was aborted',
+    })
 
-      expect(recordSpy).toHaveBeenCalledWith(
-        expect.any(Number),
-        expect.objectContaining({
-          name: 'AbortedStoragePgQueryMetric',
-          requestAborted: true,
-          requestAbortedBeforeStart: true,
-          requestAbortedAfterStart: false,
-        })
-      )
-      expect(recordSpy.mock.calls[0]?.[1]).not.toHaveProperty('tenantId')
-    } finally {
-      recordSpy.mockRestore()
-    }
+    expect(recordSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.objectContaining({
+        name: 'AbortedStoragePgQueryMetric',
+        requestAborted: true,
+        requestAbortedBeforeStart: true,
+        requestAbortedAfterStart: false,
+      })
+    )
+    expect(recordSpy.mock.calls[0]?.[1]).not.toHaveProperty('tenantId')
   })
 
   it('records pg query duration when transaction setup fails', async () => {
@@ -1009,26 +1286,22 @@ describe('StoragePgDB bucket metadata', () => {
     })
     const recordSpy = vi.spyOn(dbQueryPerformance, 'record')
 
-    try {
-      await expect(
-        runStorageQuery(storage, 'TransactionSetupFailureMetric', async () => 'unreachable')
-      ).rejects.toBe(transactionError)
+    await expect(
+      runStorageQuery(storage, 'TransactionSetupFailureMetric', async () => 'unreachable')
+    ).rejects.toBe(transactionError)
 
-      expect(recordSpy).toHaveBeenCalledWith(
-        expect.any(Number),
-        expect.objectContaining({
-          name: 'TransactionSetupFailureMetric',
-          requestAborted: false,
-        })
-      )
-      expect(recordSpy.mock.calls[0]?.[1]).not.toHaveProperty('tenantId')
-    } finally {
-      recordSpy.mockRestore()
-    }
+    expect(recordSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.objectContaining({
+        name: 'TransactionSetupFailureMetric',
+        requestAborted: false,
+      })
+    )
+    expect(recordSpy.mock.calls[0]?.[1]).not.toHaveProperty('tenantId')
   })
 
   it('tags request aborts observed after query start separately', async () => {
-    const connection = new PgTenantConnection(pool, connectionSettings)
+    const connection = new PgTenantConnection(poolLease(pool), connectionSettings)
     const storage = new StoragePgDB(connection, {
       tenantId,
       host: 'localhost',
@@ -1037,28 +1310,24 @@ describe('StoragePgDB bucket metadata', () => {
     connection.setAbortSignal(controller.signal)
     const recordSpy = vi.spyOn(dbQueryPerformance, 'record')
 
-    try {
-      await expect(
-        runStorageQuery(storage, 'RequestAbortAfterStartMetric', async (pg) => {
-          const result = await pg.query('SELECT 1')
-          controller.abort()
-          return result.rows
-        })
-      ).resolves.toEqual([{ '?column?': 1 }])
+    await expect(
+      runStorageQuery(storage, 'RequestAbortAfterStartMetric', async (pg) => {
+        const result = await pg.query('SELECT 1')
+        controller.abort()
+        return result.rows
+      })
+    ).resolves.toEqual([{ '?column?': 1 }])
 
-      expect(recordSpy).toHaveBeenCalledWith(
-        expect.any(Number),
-        expect.objectContaining({
-          name: 'RequestAbortAfterStartMetric',
-          requestAborted: true,
-          requestAbortedBeforeStart: false,
-          requestAbortedAfterStart: true,
-        })
-      )
-      expect(recordSpy.mock.calls[0]?.[1]).not.toHaveProperty('tenantId')
-    } finally {
-      recordSpy.mockRestore()
-    }
+    expect(recordSpy).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.objectContaining({
+        name: 'RequestAbortAfterStartMetric',
+        requestAborted: true,
+        requestAbortedBeforeStart: false,
+        requestAbortedAfterStart: true,
+      })
+    )
+    expect(recordSpy.mock.calls[0]?.[1]).not.toHaveProperty('tenantId')
   })
 
   it('creates, finds, lists, updates, locks, and deletes object metadata through pg', async () => {
@@ -1209,19 +1478,6 @@ describe('StoragePgDB bucket metadata', () => {
       version: 'v2',
     })
 
-    await expect(
-      db.updateObjectMetadata(bucketId, objectB, {
-        cacheControl: 'no-cache',
-        contentLength: 23,
-        size: 23,
-        mimetype: 'text/plain',
-        eTag: 'etag-b',
-      })
-    ).resolves.toMatchObject({
-      name: objectB,
-      metadata: { size: 23, eTag: 'etag-b' },
-    })
-
     await expect(db.updateObjectOwner(bucketId, objectB, owner)).resolves.toMatchObject({
       name: objectB,
       owner,
@@ -1249,10 +1505,17 @@ describe('StoragePgDB bucket metadata', () => {
       ])
     )
 
-    const firstPage = await db.listObjects(bucketId, 'name', 2)
+    const firstPage = await db.listObjects(bucketId, 'name,version', 2)
     expect(firstPage).toHaveLength(2)
     await expect(
-      db.listObjects(bucketId, 'name', 10, undefined, firstPage[1].name)
+      db.listObjects(
+        bucketId,
+        'name,version',
+        10,
+        undefined,
+        firstPage[1].name,
+        firstPage[1].version ?? undefined
+      )
     ).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ name: objectC })]))
 
     await expect(
@@ -1439,6 +1702,124 @@ describe('StoragePgDB bucket metadata', () => {
     await expect(db.listParts(uploadIdA, { maxParts: 10 })).resolves.toEqual([])
   })
 
+  it.each([
+    undefined,
+    '/',
+  ])('continues same-key multipart uploads when the marker is present or gone with delimiter %s', async (deltimeter) => {
+    const bucketId = `${runId}-multipart-cursor`
+    const prefix = `${runId}-same-key/`
+    const objectName = `${prefix}file.txt`
+    const markerUploadId = `f${randomUUID().slice(1)}`
+    const remainingOlderUploadId = `8${randomUUID().slice(1)}`
+    const remainingNewerUploadId = `0${randomUUID().slice(1)}`
+
+    await db.createBucket({
+      id: bucketId,
+      name: bucketId,
+      public: false,
+    })
+    await db.createMultipartUpload(
+      markerUploadId,
+      bucketId,
+      objectName,
+      'marker-version',
+      'marker-signature'
+    )
+    await db.createMultipartUpload(
+      remainingOlderUploadId,
+      bucketId,
+      objectName,
+      'remaining-older-version',
+      'remaining-older-signature'
+    )
+    await db.createMultipartUpload(
+      remainingNewerUploadId,
+      bucketId,
+      objectName,
+      'remaining-newer-version',
+      'remaining-newer-signature'
+    )
+
+    await pool.acquire().query({
+      text: `
+        UPDATE storage.s3_multipart_uploads
+        SET created_at = CASE id
+          WHEN $2 THEN '2026-01-01T00:00:00Z'::timestamptz
+          WHEN $3 THEN '2026-01-02T00:00:00Z'::timestamptz
+          ELSE '2026-01-03T00:00:00Z'::timestamptz
+        END
+        WHERE bucket_id = $1 AND id = ANY($4::text[])
+      `,
+      values: [
+        bucketId,
+        markerUploadId,
+        remainingOlderUploadId,
+        [markerUploadId, remainingOlderUploadId, remainingNewerUploadId],
+      ],
+    })
+
+    const listAfterMarker = () =>
+      db.listMultipartUploads(bucketId, {
+        prefix,
+        deltimeter,
+        nextUploadKeyToken: objectName,
+        nextUploadToken: markerUploadId,
+        maxKeys: 10,
+      })
+
+    const expectedIds = [remainingOlderUploadId, remainingNewerUploadId]
+    const uploadMarkerOnly = await db.listMultipartUploads(bucketId, {
+      prefix,
+      deltimeter,
+      nextUploadToken: markerUploadId,
+      maxKeys: 10,
+    })
+    expect(uploadMarkerOnly.map((upload) => upload.id)).toEqual([markerUploadId, ...expectedIds])
+
+    const keyMarkerOnly = await db.listMultipartUploads(bucketId, {
+      prefix,
+      deltimeter,
+      nextUploadKeyToken: objectName,
+      maxKeys: 10,
+    })
+    expect(keyMarkerOnly).toEqual([])
+
+    expect((await listAfterMarker()).map((upload) => upload.id)).toEqual(expectedIds)
+
+    await db.deleteMultipartUpload(markerUploadId)
+    expect((await listAfterMarker()).map((upload) => upload.id)).toEqual(expectedIds)
+  })
+
+  it.each([
+    '%',
+    '_',
+    '\\',
+  ])('uses the raw multipart prefix for delimiter parsing when it contains %s', async (specialCharacter) => {
+    const bucketId = `${runId}-multipart-prefix`
+    const prefix = `${runId}-${specialCharacter.repeat(4)}/`
+    const objectName = `${prefix}a/file.txt`
+    const uploadId = randomUUID()
+
+    await db.createBucket({
+      id: bucketId,
+      name: bucketId,
+      public: false,
+    })
+    await db.createMultipartUpload(uploadId, bucketId, objectName, 'version', 'signature')
+
+    await expect(
+      db.listMultipartUploads(bucketId, {
+        prefix,
+        deltimeter: '/',
+        maxKeys: 10,
+      })
+    ).resolves.toEqual([
+      expect.objectContaining({
+        key: `${prefix}a/`,
+      }),
+    ])
+  })
+
   it('creates, loads, searches, and drops scanner S3 key cache tables through pg', async () => {
     const tableName = `storage._s3_remote_keys_${Date.now()}_${randomUUID().replaceAll('-', '_')}`
     const keyA = `${runId}/a/v1`
@@ -1477,6 +1858,29 @@ describe('StoragePgDB bucket metadata', () => {
       ).resolves.toEqual([{ key: keyC }])
     } finally {
       await db.dropS3KeysTempTable(tableName)
+    }
+  })
+
+  it.each([
+    ['createS3KeysTempTable', (table: string) => db.createS3KeysTempTable(table)],
+    ['dropS3KeysTempTable', (table: string) => db.dropS3KeysTempTable(table)],
+    ['listS3KeysFromTempTable', (table: string) => db.listS3KeysFromTempTable(table, '', 1)],
+    ['findS3KeysInTempTable', (table: string) => db.findS3KeysInTempTable(table, ['key'])],
+    [
+      'insertS3KeysIntoTempTable',
+      (table: string) => db.insertS3KeysIntoTempTable(table, [{ key: 'key', size: 1 }]),
+    ],
+  ])('%s rejects unrelated table names at the scanner database boundary', async (_, call) => {
+    const tableName = `storage.advisory_probe_${randomUUID().replaceAll('-', '_')}`
+    await pool
+      .acquire()
+      .query(`CREATE TABLE ${tableName} (key text PRIMARY KEY, size bigint NOT NULL)`)
+
+    try {
+      await expect(call(tableName)).rejects.toThrow('Invalid Parameter tmpTable')
+      await expect(tableExists(tableName)).resolves.toBe(true)
+    } finally {
+      await pool.acquire().query(`DROP TABLE IF EXISTS ${tableName}`)
     }
   })
 
@@ -1709,23 +2113,23 @@ describe('StoragePgDB bucket metadata', () => {
   function runStorageQuery<T>(
     storage: StoragePgDB,
     queryName: string,
-    fn: (db: PgExecutor, signal?: AbortSignal) => Promise<T>
+    fn: (db: DatabaseExecutor, signal?: AbortSignal) => Promise<T>
   ): Promise<T> {
     return (
       storage as unknown as {
         runQuery<T>(
           queryName: string,
-          fn: (db: PgExecutor, signal?: AbortSignal) => Promise<T>
+          fn: (db: DatabaseExecutor, signal?: AbortSignal) => Promise<T>
         ): Promise<T>
       }
     ).runQuery(queryName, fn)
   }
 
-  function statementText(statement: string | PgStatement): string {
+  function statementText(statement: string | DatabaseStatement): string {
     return typeof statement === 'string' ? statement : statement.text
   }
 
-  function statementValues(statement: string | PgStatement): unknown[] | undefined {
+  function statementValues(statement: string | DatabaseStatement): unknown[] | undefined {
     return typeof statement === 'string' ? undefined : statement.values
   }
 
@@ -1739,12 +2143,82 @@ describe('StoragePgDB bucket metadata', () => {
     return runStorageQuery(storage, 'ReadCurrentRole', (pg) => readCurrentRoleFromExecutor(pg))
   }
 
-  async function readCurrentRoleFromExecutor(pg: PgExecutor): Promise<string> {
+  async function readCurrentRoleFromExecutor(pg: DatabaseExecutor): Promise<string> {
     const result = await pg.query<{ role: string }>(`
       SELECT current_setting('role', true) AS role
     `)
 
     return result.rows[0].role
+  }
+
+  function readCurrentStatementTimeoutMs(storage: StoragePgDB): Promise<number> {
+    return runStorageQuery(storage, 'ReadCurrentStatementTimeout', (pg) =>
+      readStatementTimeoutMs(pg)
+    )
+  }
+
+  async function readStatementTimeoutMs(pg: DatabaseExecutor): Promise<number> {
+    const result = await pg.query<{ statement_timeout: string }>(`
+      SELECT current_setting('statement_timeout') AS statement_timeout
+    `)
+
+    return parseStatementTimeoutMs(result.rows[0].statement_timeout)
+  }
+
+  function parseStatementTimeoutMs(statementTimeout: string): number {
+    const value = statementTimeout.trim()
+    if (value === '0') {
+      return 0
+    }
+
+    const match = /^(\d+(?:\.\d+)?)\s*(ms|s|min|h|d)?$/.exec(value)
+    if (!match) {
+      throw new Error(`Unexpected statement_timeout value: ${statementTimeout}`)
+    }
+
+    const multipliers = {
+      ms: 1,
+      s: 1000,
+      min: 60 * 1000,
+      h: 60 * 60 * 1000,
+      d: 24 * 60 * 60 * 1000,
+    }
+    const amount = Number(match[1])
+    const unit = (match[2] ?? 'ms') as keyof typeof multipliers
+
+    return Math.round(amount * multipliers[unit])
+  }
+
+  async function withAuthenticatedDb(
+    jwt: string,
+    fn: (authenticatedDb: StoragePgDB) => Promise<void>
+  ): Promise<void> {
+    const authenticatedUser = {
+      jwt,
+      payload: {
+        role: 'authenticated',
+        sub: randomUUID(),
+      },
+    }
+    const authenticatedSettings = {
+      ...connectionSettings,
+      user: authenticatedUser,
+      superUser,
+    }
+    const authenticatedPool = new PgPoolStrategy(authenticatedSettings)
+    const authenticatedDb = new StoragePgDB(
+      new PgTenantConnection(poolLease(authenticatedPool), authenticatedSettings),
+      {
+        tenantId,
+        host: 'localhost',
+      }
+    )
+
+    try {
+      await fn(authenticatedDb)
+    } finally {
+      await authenticatedPool.dispose('destroy')
+    }
   }
 
   async function tableExists(tableName: string): Promise<boolean> {

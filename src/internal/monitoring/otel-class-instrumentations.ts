@@ -2,7 +2,6 @@ import { S3Client } from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
 import { PgTenantConnection } from '@internal/database'
 import { Event as QueueBaseEvent } from '@internal/queue'
-import { Permit, Semaphore } from '@shopify/semaphore'
 import { S3Backend } from '@storage/backend'
 import { StoragePgDB } from '@storage/database'
 import { ObjectStorage } from '@storage/object'
@@ -19,6 +18,9 @@ export const classInstrumentations = [
     enabled: true,
     methodsToInstrument: [
       'findBucket',
+      'getBucketLifecycle',
+      'putBucketLifecycle',
+      'deleteBucketLifecycle',
       'listBuckets',
       'createBucket',
       'updateBucket',
@@ -36,7 +38,6 @@ export const classInstrumentations = [
       'uploadOverridingObject',
       'deleteObject',
       'deleteObjects',
-      'updateObjectMetadata',
       'updateObjectOwner',
       'findObject',
       'findObjects',
@@ -88,11 +89,6 @@ export const classInstrumentations = [
       'deleteBucket',
       'listBuckets',
       'getBucketLocation',
-      'getBucketVersioning',
-      'putBucketVersioning',
-      'getBucketLifecycleConfiguration',
-      'putBucketLifecycleConfiguration',
-      'deleteBucketLifecycle',
       'uploadObject',
       'privateAssetUrl',
     ],
@@ -160,16 +156,6 @@ export const classInstrumentations = [
     targetClass: PgLock,
     enabled: true,
     methodsToInstrument: ['lock', 'unlock', 'acquireLock'],
-  }),
-  new ClassInstrumentation({
-    targetClass: Semaphore,
-    enabled: true,
-    methodsToInstrument: ['acquire'],
-  }),
-  new ClassInstrumentation({
-    targetClass: Permit,
-    enabled: true,
-    methodsToInstrument: ['release'],
   }),
   new ClassInstrumentation({
     targetClass: S3Client,

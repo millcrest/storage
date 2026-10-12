@@ -1,5 +1,4 @@
 import { createStorageBackend, StorageBackendAdapter } from '@storage/backend'
-import { CdnCacheManager } from '@storage/cdn/cdn-cache-manager'
 import type { Database } from '@storage/database'
 import { StoragePgDB } from '@storage/database'
 import { PassThroughLocation, TenantLocation } from '@storage/locator'
@@ -11,7 +10,6 @@ declare module 'fastify' {
   interface FastifyRequest {
     storage: Storage
     backend: StorageBackendAdapter
-    cdnCache: CdnCacheManager
   }
 }
 
@@ -19,10 +17,13 @@ const { storageBackendType, storageS3Bucket } = getConfig()
 
 const storageBackend = createStorageBackend(storageBackendType)
 
+// TenantLocation is immutable so singleton not to allocate per request.
+const tenantLocation = new TenantLocation(storageS3Bucket)
+
 export const storage = fastifyPlugin(
   async function storagePlugin(fastify) {
     fastify.decorateRequest('storage')
-    fastify.addHook('preHandler', async (request) => {
+    fastify.addHook('preHandler', (request, _reply, done) => {
       const databaseOptions = {
         tenantId: request.tenantId,
         host: request.headers['x-forwarded-host'] as string,
@@ -35,15 +36,16 @@ export const storage = fastifyPlugin(
 
       const location = request.isIcebergBucket
         ? new PassThroughLocation(request.internalIcebergBucketName!)
-        : new TenantLocation(storageS3Bucket)
+        : tenantLocation
 
       request.backend = storageBackend
       request.storage = new Storage(storageBackend, database, location)
-      request.cdnCache = new CdnCacheManager(request.storage)
+      done()
     })
 
-    fastify.addHook('onClose', async () => {
+    fastify.addHook('onClose', (_instance, done) => {
       storageBackend.close()
+      done()
     })
   },
   { name: 'storage-init' }

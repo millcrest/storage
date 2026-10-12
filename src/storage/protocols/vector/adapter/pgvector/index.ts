@@ -17,20 +17,20 @@ import {
   QueryVectorsOutput,
 } from '@aws-sdk/client-s3vectors'
 import {
-  PgExecutor,
+  type DatabaseExecutor,
+  type DatabaseTransaction,
+  type DatabaseTransactionalExecutor,
+  isDatabaseTransaction,
   PgTenantConnection,
-  PgTransaction,
-  PgTransactionalExecutor,
   quoteIdentifier,
 } from '@internal/database'
 import { ERRORS } from '@internal/errors'
-import BaseTtlCache from '@isaacs/ttlcache'
 import type { DocumentType } from '@smithy/types'
 import {
   MAX_DELETE_VECTOR_KEYS,
   MAX_GET_VECTOR_KEYS,
   MAX_LIST_RESULTS,
-  MAX_QUERY_TOP_K,
+  MAX_PGVECTOR_QUERY_TOP_K,
   MAX_SEGMENT_COUNT,
   validatePutVectors,
   validateVectorKeys,
@@ -39,23 +39,8 @@ import { paginateNPlusOne } from '../../pagination'
 import { VectorStore } from '../s3-vector'
 import { handlePgVectorError } from './errors'
 import { S3VectorFilter, translateFilter } from './filter'
+import { metricCache } from './metric-cache'
 
-// Cache the resolved distance metric for ~5 min per (bucket, index). Avoids
-// hammering pg_index on every queryVectors call; stale entries (e.g., an
-// index dropped out-of-band) self-heal on miss via the lookupMetric fallback.
-//
-// Module-scoped on purpose: in multi-tenant mode the Fastify plugin builds a
-// new PgVectorStore per request, so an instance-scoped cache would be cold
-// every call. Bucket/index identifiers are already tenant-scoped at the HTTP
-// layer (each tenant's `storage_vectors` schema lives in its own DB pool), so
-// sharing across requests within a process is safe.
-const METRIC_CACHE_TTL_MS = 5 * 60 * 1000
-const METRIC_CACHE_MAX = 1_000
-const metricCache = new BaseTtlCache<string, DistanceMetric>({
-  ttl: METRIC_CACHE_TTL_MS,
-  max: METRIC_CACHE_MAX,
-  updateAgeOnGet: true,
-})
 type PgVectorTableCapabilityKind = 'bridged-hnsw' | 'standard' | 'unknown'
 interface PgVectorTableCapability {
   kind: PgVectorTableCapabilityKind
@@ -78,8 +63,33 @@ const UNKNOWN_TABLE_CAPABILITY: PgVectorTableCapability = {
   requiresExactQueryScan: true,
 }
 const tableCapabilityCaches = new WeakMap<object, Map<string, Promise<PgVectorTableCapability>>>()
+const metricLookupCaches = new WeakMap<object, Map<string, Promise<DistanceMetric>>>()
+const metricCacheScopeIds = new WeakMap<object, number>()
+let nextMetricCacheScopeId = 1
 
-function metricCacheKey(bucket: string, index: string): string {
+function metricLookupCache(db: object): Map<string, Promise<DistanceMetric>> {
+  let cache = metricLookupCaches.get(db)
+  if (!cache) {
+    cache = new Map()
+    metricLookupCaches.set(db, cache)
+  }
+  return cache
+}
+
+function metricCacheScopeId(db: object): number {
+  let id = metricCacheScopeIds.get(db)
+  if (id === undefined) {
+    id = nextMetricCacheScopeId++
+    metricCacheScopeIds.set(db, id)
+  }
+  return id
+}
+
+function metricCacheKey(db: object, bucket: string, index: string): string {
+  return `${metricCacheScopeId(db)}\x00${bucket}\x00${index}`
+}
+
+function metricLookupKey(bucket: string, index: string): string {
   return `${bucket}\x00${index}`
 }
 
@@ -152,12 +162,12 @@ function tableCapabilityCache(db: object): Map<string, Promise<PgVectorTableCapa
   return cache
 }
 
-function tableCapabilityCacheKey(db: PgTransactionalExecutor | PgTransaction): object {
-  if (db instanceof PgTenantConnection) {
-    return db.pool
-  }
+function tableCapabilityCacheKey(db: DatabaseExecutor): object {
+  return databaseCacheScope(db)
+}
 
-  return db
+function databaseCacheScope(db: DatabaseExecutor): object {
+  return (db as DatabaseExecutor & { getCacheScope?: () => object }).getCacheScope?.() ?? db
 }
 
 function capabilityForAccessMethod(accessMethod: unknown): PgVectorTableCapability {
@@ -173,9 +183,9 @@ function forgetTableCapability(db: object, table: string): void {
 }
 
 async function resolveTableCapability(
-  db: PgExecutor,
+  db: DatabaseExecutor,
   table: string,
-  cacheKey: object = tableCapabilityCacheKey(db as PgTransactionalExecutor | PgTransaction)
+  cacheKey: object = tableCapabilityCacheKey(db)
 ): Promise<PgVectorTableCapability> {
   const cache = tableCapabilityCache(cacheKey)
   let capability = cache.get(table)
@@ -216,25 +226,29 @@ async function resolveTableCapability(
 }
 
 export type PgExecutorResolver =
-  | PgTransactionalExecutor
-  | PgTransaction
+  | DatabaseTransactionalExecutor
+  | DatabaseTransaction
   | {
-      resolve: () => PgTransactionalExecutor | PgTransaction
-      root?: () => PgTransactionalExecutor | PgTransaction
+      resolve: () => DatabaseTransactionalExecutor | DatabaseTransaction
+      root?: () => DatabaseTransactionalExecutor | DatabaseTransaction
     }
 
 function isPgExecutorProvider(r: PgExecutorResolver): r is {
-  resolve: () => PgTransactionalExecutor | PgTransaction
-  root?: () => PgTransactionalExecutor | PgTransaction
+  resolve: () => DatabaseTransactionalExecutor | DatabaseTransaction
+  root?: () => DatabaseTransactionalExecutor | DatabaseTransaction
 } {
-  return typeof (r as { resolve?: unknown }).resolve === 'function'
+  return 'resolve' in r && typeof r.resolve === 'function'
 }
 
-function resolvePgExecutor(r: PgExecutorResolver): PgTransactionalExecutor | PgTransaction {
+function resolvePgExecutor(
+  r: PgExecutorResolver
+): DatabaseTransactionalExecutor | DatabaseTransaction {
   return isPgExecutorProvider(r) ? r.resolve() : r
 }
 
-function resolveRootPgExecutor(r: PgExecutorResolver): PgTransactionalExecutor | PgTransaction {
+function resolveRootPgExecutor(
+  r: PgExecutorResolver
+): DatabaseTransactionalExecutor | DatabaseTransaction {
   return isPgExecutorProvider(r) ? (r.root?.() ?? r.resolve()) : r
 }
 
@@ -243,10 +257,10 @@ function hasRootPgResolver(r: PgExecutorResolver): boolean {
 }
 
 async function withPgTransaction<T>(
-  db: PgTransactionalExecutor | PgTransaction,
-  fn: (trx: PgTransaction) => Promise<T>
+  db: DatabaseTransactionalExecutor | DatabaseTransaction,
+  fn: (trx: DatabaseTransaction) => Promise<T>
 ): Promise<T> {
-  if (db instanceof PgTransaction) {
+  if (isDatabaseTransaction(db)) {
     const savepoint = nextSavepointName()
     await db.query(`SAVEPOINT ${savepoint}`)
     try {
@@ -377,12 +391,35 @@ export class PgVectorStore implements VectorStore {
     this.transactionalIndexOperations = hasRootPgResolver(executor)
   }
 
-  private db(): PgTransactionalExecutor | PgTransaction {
-    return resolvePgExecutor(this.executor)
+  private db(): DatabaseTransactionalExecutor | DatabaseTransaction {
+    const db = resolvePgExecutor(this.executor)
+    return db instanceof PgTenantConnection ? db.acquireExecutor() : db
   }
 
-  private rootDb(): PgTransactionalExecutor | PgTransaction {
+  private withTenantTransaction<T>(
+    fn: (
+      db: DatabaseTransactionalExecutor | DatabaseTransaction,
+      ownsTransaction: boolean
+    ) => Promise<T>
+  ): Promise<T> {
+    const db = resolvePgExecutor(this.executor)
+    return db instanceof PgTenantConnection
+      ? withPgTransaction(db, (trx) => fn(trx, true))
+      : fn(db, false)
+  }
+
+  private rootDb(): DatabaseTransactionalExecutor | DatabaseTransaction {
     return resolveRootPgExecutor(this.executor)
+  }
+
+  private clearMetricLookup(
+    db: DatabaseTransactionalExecutor | DatabaseTransaction,
+    bucket: string,
+    index: string
+  ): string {
+    const scope = databaseCacheScope(db)
+    metricLookupCache(scope).delete(metricLookupKey(bucket, index))
+    return metricCacheKey(scope, bucket, index)
   }
 
   async createVectorIndex(command: CreateIndexCommandInput): Promise<CreateIndexCommandOutput> {
@@ -412,11 +449,11 @@ export class PgVectorStore implements VectorStore {
 
     return handlePgVectorError(
       async () => {
-        const db = this.db()
+        const db = resolvePgExecutor(this.executor)
         // Wrap DDL in a transaction so a failed CREATE INDEX (missing
         // opclass, permissions, transient error) rolls back the CREATE TABLE.
         // Otherwise the orphan table would block retries with "already exists".
-        await withPgTransaction(db, async (trx) => {
+        const transactionDb = await withPgTransaction(db, async (trx) => {
           // Postgres doesn't allow parameter binding inside type modifiers
           // like `halfvec(N)` — N must be a literal at parse time. We've
           // validated `dimension` is an integer in [1, 4_000] above, so
@@ -436,16 +473,20 @@ export class PgVectorStore implements VectorStore {
             ON ${qualifiedTableName(table)}
             USING hnsw (embedding ${choice.opClass})
           `)
+          return trx
         })
-        forgetTableCapability(tableCapabilityCacheKey(db), table)
-        forgetTableCapability(tableCapabilityCacheKey(this.rootDb()), table)
+        forgetTableCapability(tableCapabilityCacheKey(transactionDb), table)
+        const rootDb = this.rootDb()
+        if (rootDb !== db) {
+          forgetTableCapability(tableCapabilityCacheKey(rootDb), table)
+        }
         // Prime the metric cache so subsequent queryVectors don't need a
         // round-trip lookup to pick the right distance operator. The two
         // names are validated non-empty at the top of this method.
-        metricCache.set(
-          metricCacheKey(command.vectorBucketName as string, command.indexName as string),
-          choice.metric
-        )
+        const bucket = command.vectorBucketName as string
+        const index = command.indexName as string
+        const cacheKey = this.clearMetricLookup(transactionDb, bucket, index)
+        metricCache.set(cacheKey, choice.metric)
         return { $metadata: {} } as CreateIndexCommandOutput
       },
       { type: 'vector-index', name: command.indexName }
@@ -460,9 +501,14 @@ export class PgVectorStore implements VectorStore {
       async () => {
         const db = this.db()
         await db.query(`DROP TABLE IF EXISTS ${qualifiedTableName(table)}`)
-        forgetTableCapability(tableCapabilityCacheKey(db), table)
-        forgetTableCapability(tableCapabilityCacheKey(this.rootDb()), table)
-        metricCache.delete(metricCacheKey(bucket, index))
+        const capabilityScope = tableCapabilityCacheKey(db)
+        const rootCapabilityScope = tableCapabilityCacheKey(this.rootDb())
+        forgetTableCapability(capabilityScope, table)
+        if (rootCapabilityScope !== capabilityScope) {
+          forgetTableCapability(rootCapabilityScope, table)
+        }
+        const cacheKey = this.clearMetricLookup(db, bucket, index)
+        metricCache.delete(cacheKey)
         return { $metadata: {} } as DeleteIndexCommandOutput
       },
       { type: 'vector-index', name: index }
@@ -498,7 +544,9 @@ export class PgVectorStore implements VectorStore {
         const capability = await resolveTableCapability(db, table, capabilityCacheKey)
 
         if (capability.requiresManualUpsert) {
-          await this.putVectorsManually(db, qualified, serializedRows)
+          await this.withTenantTransaction((transactionDb) =>
+            this.putVectorsManually(transactionDb, qualified, serializedRows)
+          )
           return {} as PutVectorsOutput
         }
 
@@ -526,7 +574,9 @@ export class PgVectorStore implements VectorStore {
             throw e
           }
 
-          await this.putVectorsManually(db, qualified, serializedRows)
+          await this.withTenantTransaction((transactionDb) =>
+            this.putVectorsManually(transactionDb, qualified, serializedRows)
+          )
         }
 
         return {} as PutVectorsOutput
@@ -536,7 +586,7 @@ export class PgVectorStore implements VectorStore {
   }
 
   private async putVectorsManually(
-    db: PgTransactionalExecutor | PgTransaction,
+    db: DatabaseTransactionalExecutor | DatabaseTransaction,
     table: string,
     serializedRows: string
   ): Promise<void> {
@@ -604,33 +654,37 @@ export class PgVectorStore implements VectorStore {
   }
 
   private async queryVectorsRaw(
-    db: PgTransactionalExecutor | PgTransaction,
+    db: DatabaseTransactionalExecutor | DatabaseTransaction,
     table: string,
     sql: string,
     params: unknown[],
-    topK: number
+    topK: number,
+    ownsTransaction = false
   ): Promise<{ rows: unknown[] }> {
     const capability = await resolveTableCapability(db, table, tableCapabilityCacheKey(db))
-    if (!capability.requiresExactQueryScan) {
-      return withPgTransaction(db, async (trx): Promise<{ rows: unknown[] }> => {
+
+    const runQuery = async (trx: DatabaseTransaction): Promise<{ rows: unknown[] }> => {
+      if (!capability.requiresExactQueryScan) {
         await trx.query({
           text: `SELECT set_config('hnsw.ef_search', $1, true)`,
           values: [String(Math.max(topK, DEFAULT_HNSW_EF_SEARCH))],
         })
         return trx.query({ text: sql, values: params })
-      })
-    }
+      }
 
-    // The same OrioleDB bridged HNSW path that rejects ON CONFLICT DO UPDATE
-    // can also miss rows inserted after the index was created. Use exact scan
-    // semantics for pools where we have observed that path.
-    return withPgTransaction(db, async (trx): Promise<{ rows: unknown[] }> => {
+      // The same OrioleDB bridged HNSW path that rejects ON CONFLICT DO UPDATE
+      // can also miss rows inserted after the index was created. Use exact scan
+      // semantics for pools where we have observed that path.
       await trx.query(`
         SELECT set_config('enable_indexscan', 'off', true),
                set_config('enable_bitmapscan', 'off', true)
       `)
       return trx.query({ text: sql, values: params })
-    })
+    }
+
+    return ownsTransaction && isDatabaseTransaction(db)
+      ? runQuery(db)
+      : withPgTransaction(db, runQuery)
   }
 
   async getVectors(input: GetVectorsCommandInput): Promise<GetVectorsCommandOutput> {
@@ -686,6 +740,12 @@ export class PgVectorStore implements VectorStore {
   async queryVectors(input: QueryVectorsInput): Promise<QueryVectorsOutput> {
     const bucket = input.vectorBucketName!
     const index = input.indexName!
+    if (input.nextToken !== undefined) {
+      throw ERRORS.InvalidParameter('nextToken', {
+        message: 'QueryVectors pagination is not supported by the pgvector backend',
+      })
+    }
+
     const queryVector = input.queryVector
     if (!queryVector || !queryVector.float32) {
       throw ERRORS.MissingParameter('queryVector.float32')
@@ -693,68 +753,93 @@ export class PgVectorStore implements VectorStore {
 
     const wantMeta = input.returnMetadata === true
     const wantDistance = input.returnDistance === true
-    const topK = validatePositiveInt('topK', input.topK ?? 10, MAX_QUERY_TOP_K)
+    const topK = validatePositiveInt('topK', input.topK ?? 10, MAX_PGVECTOR_QUERY_TOP_K)
 
     return handlePgVectorError(
-      async () => {
-        // The operator chosen for the distance expression AND for ORDER BY must
-        // match the HNSW index's operator class — otherwise the index isn't
-        // used and the returned distance is in the wrong metric. Resolve the
-        // metric (cached after createVectorIndex) before assembling the query.
-        const metric = await this.getOrLookupMetric(bucket, index)
-        const distanceOp: '<=>' | '<->' = metric === 'euclidean' ? '<->' : '<=>'
+      () =>
+        this.withTenantTransaction(async (db, ownsTransaction) => {
+          // The operator chosen for the distance expression AND for ORDER BY must
+          // match the HNSW index's operator class — otherwise the index isn't
+          // used and the returned distance is in the wrong metric. Resolve the
+          // metric (cached after createVectorIndex) before assembling the query.
+          const metric = await this.getOrLookupMetric(db, bucket, index)
+          const distanceOp: '<=>' | '<->' = metric === 'euclidean' ? '<->' : '<=>'
 
-        const cols: string[] = ['key']
-        if (wantDistance) cols.push(`embedding ${distanceOp} $1::halfvec AS distance`)
-        if (wantMeta) cols.push('metadata')
+          const cols: string[] = ['key']
+          if (wantDistance) cols.push(`embedding ${distanceOp} $1::halfvec AS distance`)
+          if (wantMeta) cols.push('metadata')
 
-        const params: unknown[] = []
-        if (wantDistance) params.push(toVectorLiteral(queryVector.float32 as number[]))
+          const params: unknown[] = []
+          if (wantDistance) params.push(toVectorLiteral(queryVector.float32 as number[]))
 
-        let whereClause = ''
-        if (input.filter) {
-          const translated = translateFilter(input.filter as unknown as S3VectorFilter)
-          whereClause = ' WHERE ' + offsetPlaceholders(translated.sql, params.length)
-          params.push(...translated.params)
-        }
+          let whereClause = ''
+          if (input.filter) {
+            const translated = translateFilter(input.filter as unknown as S3VectorFilter)
+            whereClause = ' WHERE ' + offsetPlaceholders(translated.sql, params.length)
+            params.push(...translated.params)
+          }
 
-        params.push(toVectorLiteral(queryVector.float32 as number[]))
-        params.push(topK)
+          params.push(toVectorLiteral(queryVector.float32 as number[]))
+          params.push(topK)
 
-        const table = tableName(bucket, index)
-        const orderVectorParam = params.length - 1
-        const limitParam = params.length
-        const sql = `SELECT ${cols.join(', ')}
+          const table = tableName(bucket, index)
+          const orderVectorParam = params.length - 1
+          const limitParam = params.length
+          const sql = `SELECT ${cols.join(', ')}
                      FROM ${qualifiedTableName(table)}${whereClause}
                      ORDER BY embedding ${distanceOp} $${orderVectorParam}::halfvec ASC
                      LIMIT $${limitParam}`
-        const result = await this.queryVectorsRaw(this.db(), table, sql, params, topK)
-        const rows = result.rows as Array<{
-          key: string
-          distance?: number
-          metadata?: DocumentType
-        }>
+          const result = await this.queryVectorsRaw(db, table, sql, params, topK, ownsTransaction)
+          const rows = result.rows as Array<{
+            key: string
+            distance?: number
+            metadata?: DocumentType
+          }>
 
-        return {
-          vectors: rows.map((r) => ({
-            key: r.key,
-            distance: wantDistance ? r.distance : undefined,
-            metadata: wantMeta ? (r.metadata ?? {}) : undefined,
-          })),
-          distanceMetric: metric,
-        } as QueryVectorsOutput
-      },
+          return {
+            vectors: rows.map((r) => ({
+              key: r.key,
+              distance: wantDistance ? r.distance : undefined,
+              metadata: wantMeta ? (r.metadata ?? {}) : undefined,
+            })),
+            distanceMetric: metric,
+          } as QueryVectorsOutput
+        }),
       { type: 'vector-index', name: index }
     )
   }
 
-  private async getOrLookupMetric(bucket: string, index: string): Promise<DistanceMetric> {
-    const key = metricCacheKey(bucket, index)
-    const cached = metricCache.get(key)
+  private async getOrLookupMetric(
+    db: DatabaseTransactionalExecutor | DatabaseTransaction,
+    bucket: string,
+    index: string
+  ): Promise<DistanceMetric> {
+    const scope = databaseCacheScope(db)
+    const cacheKey = metricCacheKey(scope, bucket, index)
+    const cached = metricCache.get(cacheKey)
     if (cached) return cached
-    const metric = await this.lookupMetric(bucket, index)
-    metricCache.set(key, metric)
-    return metric
+
+    const lookupKey = metricLookupKey(bucket, index)
+    const lookups = metricLookupCache(scope)
+    let lookup = lookups.get(lookupKey)
+    if (!lookup) {
+      lookup = this.lookupMetric(db, bucket, index)
+      lookups.set(lookupKey, lookup)
+    }
+
+    try {
+      const metric = await lookup
+      if (lookups.get(lookupKey) === lookup) {
+        lookups.delete(lookupKey)
+        metricCache.set(cacheKey, metric)
+      }
+      return metric
+    } catch {
+      if (lookups.get(lookupKey) === lookup) {
+        lookups.delete(lookupKey)
+      }
+      return 'cosine'
+    }
   }
 
   async listVectors(input: ListVectorsInput): Promise<ListVectorsOutput> {
@@ -812,11 +897,14 @@ export class PgVectorStore implements VectorStore {
     )
   }
 
-  private async lookupMetric(bucket: string, index: string): Promise<DistanceMetric> {
+  private async lookupMetric(
+    db: DatabaseTransactionalExecutor | DatabaseTransaction,
+    bucket: string,
+    index: string
+  ): Promise<DistanceMetric> {
     const table = tableName(bucket, index)
-    try {
-      const result = await this.db().query({
-        text: `
+    const result = await db.query({
+      text: `
           SELECT am.amname, opc.opcname
           FROM pg_index i
           JOIN pg_class ic ON ic.oid = i.indexrelid
@@ -829,14 +917,11 @@ export class PgVectorStore implements VectorStore {
             AND am.amname = 'hnsw'
           LIMIT 1
         `,
-        values: [SCHEMA, table],
-      })
-      const op = result.rows?.[0]?.opcname as string | undefined
-      if (op === 'halfvec_l2_ops') return 'euclidean'
-      return 'cosine'
-    } catch {
-      return 'cosine'
-    }
+      values: [SCHEMA, table],
+    })
+    const op = result.rows?.[0]?.opcname as string | undefined
+    if (op === 'halfvec_l2_ops') return 'euclidean'
+    return 'cosine'
   }
 }
 

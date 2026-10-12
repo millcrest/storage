@@ -23,8 +23,8 @@ const createBucketBodySchema = {
 const listBucketsQuerySchema = {
   type: 'object',
   properties: {
-    limit: { type: 'integer', minimum: 1, examples: [10] },
-    offset: { type: 'integer', minimum: 0, examples: [0] },
+    limit: { type: 'integer', finite: true, minimum: 1, examples: [10] },
+    offset: { type: 'integer', finite: true, minimum: 0, examples: [0] },
     sortColumn: { type: 'string', enum: ['id', 'name', 'created_at', 'updated_at'] },
     sortOrder: { type: 'string', enum: ['asc', 'desc'] },
     search: { type: 'string', examples: ['my-bucket'] },
@@ -58,7 +58,7 @@ export default async function routes(fastify: FastifyInstance) {
           tags: ['bucket'],
         },
         config: {
-          operation: { type: ROUTE_OPERATIONS.DELETE_BUCKET },
+          operation: ROUTE_OPERATIONS.DELETE_BUCKET,
         },
       },
       async (request, response) => {
@@ -79,7 +79,7 @@ export default async function routes(fastify: FastifyInstance) {
         tags: ['bucket'],
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.CREATE_BUCKET },
+        operation: ROUTE_OPERATIONS.CREATE_BUCKET,
       },
     },
     async (request, response) => {
@@ -106,7 +106,7 @@ export default async function routes(fastify: FastifyInstance) {
         tags: ['bucket'],
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.LIST_BUCKET },
+        operation: ROUTE_OPERATIONS.LIST_BUCKET,
       },
     },
     async (request, response) => {

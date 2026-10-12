@@ -1,7 +1,7 @@
 import type { Stats } from 'node:fs'
 import fs from 'node:fs'
 import * as fsp from 'node:fs/promises'
-import { ERRORS, StorageBackendError } from '@internal/errors'
+import { ERRORS, ErrorCode, StorageBackendError } from '@internal/errors'
 import { ensureDir, ensureFile, pathExists, removePath } from '@internal/fs'
 import { createHash, randomUUID } from 'crypto'
 import * as xattr from 'fs-xattr'
@@ -12,6 +12,8 @@ import { getConfig } from '../../config'
 import { parseRangeHeader } from '../range'
 import {
   BrowserCacheHeaders,
+  CopyObjectOptions,
+  DeleteObjectDetailedResult,
   ObjectMetadata,
   ObjectResponse,
   StorageBackendAdapter,
@@ -23,19 +25,27 @@ import { resolveSecureFilesystemPath } from './secure-path'
 const pipeline = promisify(stream.pipeline)
 
 interface FileMetadata {
-  cacheControl: string
-  contentType: string
+  cacheControl?: string
+  contentEncoding?: string
+  contentType?: string
+}
+
+function isMissingXattrError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code
+  return code === 'ENODATA' || code === 'ENOATTR'
 }
 
 // file metadata attribute keys on different platforms
 const METADATA_ATTR_KEYS = {
   darwin: {
     'cache-control': 'com.apple.metadata.supabase.cache-control',
+    'content-encoding': 'com.apple.metadata.supabase.content-encoding',
     'content-type': 'com.apple.metadata.supabase.content-type',
     etag: 'com.apple.metadata.supabase.etag',
   },
   linux: {
     'cache-control': 'user.supabase.cache-control',
+    'content-encoding': 'user.supabase.content-encoding',
     'content-type': 'user.supabase.content-type',
     etag: 'user.supabase.etag',
   },
@@ -83,7 +93,7 @@ export class FileBackend implements StorageBackendAdapter {
   async getObject(
     bucketName: string,
     key: string,
-    version: string | undefined,
+    version: string | null | undefined,
     headers?: BrowserCacheHeaders
   ): Promise<ObjectResponse> {
     // 'Range: bytes=#######-######
@@ -91,14 +101,38 @@ export class FileBackend implements StorageBackendAdapter {
     const data = await fsp.stat(file)
     const eTag = await this.etag(file, data)
     const fileSize = data.size
-    const { cacheControl, contentType } = await this.getFileMetadata(file)
+    const { cacheControl, contentEncoding, mimetype } = await this.getFileMetadata(file)
     const lastModified = data.mtime
 
-    if (headers?.ifNoneMatch && headers.ifNoneMatch === eTag) {
+    // RFC 9110 13.1.4: If-Unmodified-Since is ignored when If-Match is present.
+    const preconditionFailed =
+      headers?.ifMatch !== undefined
+        ? !matchesETag(headers.ifMatch, eTag)
+        : headers?.ifUnmodifiedSince !== undefined &&
+          toSeconds(lastModified) > toSeconds(new Date(headers.ifUnmodifiedSince))
+
+    if (preconditionFailed) {
+      throw StorageBackendError.withStatusCode(412, {
+        error: 'PreconditionFailed',
+        code: ErrorCode.PreconditionFailed,
+        httpStatusCode: 412,
+        message: 'PreconditionFailed',
+      })
+    }
+
+    // RFC 9110 13.1.3: If-Modified-Since is ignored when If-None-Match is present.
+    const notModified =
+      (headers?.ifNoneMatch && matchesETag(headers.ifNoneMatch, eTag)) ||
+      (headers?.ifNoneMatch === undefined &&
+        headers?.ifModifiedSince &&
+        toSeconds(lastModified) <= toSeconds(new Date(headers.ifModifiedSince)))
+
+    if (notModified) {
       return {
         metadata: {
-          cacheControl: cacheControl || 'no-cache',
-          mimetype: contentType || 'application/octet-stream',
+          cacheControl,
+          contentEncoding,
+          mimetype,
           lastModified,
           httpStatusCode: 304,
           size: data.size,
@@ -110,33 +144,15 @@ export class FileBackend implements StorageBackendAdapter {
       }
     }
 
-    if (headers?.ifModifiedSince) {
-      const ifModifiedSince = new Date(headers.ifModifiedSince)
-      if (lastModified <= ifModifiedSince) {
-        return {
-          metadata: {
-            cacheControl: cacheControl || 'no-cache',
-            mimetype: contentType || 'application/octet-stream',
-            lastModified,
-            httpStatusCode: 304,
-            size: data.size,
-            eTag,
-            contentLength: 0,
-          },
-          body: undefined,
-          httpStatusCode: 304,
-        }
-      }
-    }
-
     if (headers?.range) {
       const range = parseRangeHeader(headers.range, fileSize)
       const body = fs.createReadStream(file, { start: range.fromByte, end: range.toByte })
 
       return {
         metadata: {
-          cacheControl: cacheControl || 'no-cache',
-          mimetype: contentType || 'application/octet-stream',
+          cacheControl,
+          contentEncoding,
+          mimetype,
           lastModified,
           contentRange: `bytes ${range.fromByte}-${range.toByte}/${fileSize}`,
           httpStatusCode: 206,
@@ -151,8 +167,9 @@ export class FileBackend implements StorageBackendAdapter {
       const body = fs.createReadStream(file)
       return {
         metadata: {
-          cacheControl: cacheControl || 'no-cache',
-          mimetype: contentType || 'application/octet-stream',
+          cacheControl,
+          contentEncoding,
+          mimetype,
           lastModified,
           httpStatusCode: 200,
           size: data.size,
@@ -177,12 +194,13 @@ export class FileBackend implements StorageBackendAdapter {
   async uploadObject(
     bucketName: string,
     key: string,
-    version: string | undefined,
+    version: string | null | undefined,
     body: NodeJS.ReadableStream,
     contentType: string,
     cacheControl: string,
     signal?: AbortSignal,
-    contentLength?: number
+    contentLength?: number,
+    contentEncoding?: string
   ): Promise<ObjectMetadata> {
     try {
       const file = this.resolveSecurePath(withOptionalVersion(`${bucketName}/${key}`, version))
@@ -193,6 +211,7 @@ export class FileBackend implements StorageBackendAdapter {
       await this.setFileMetadata(file, {
         contentType: contentType || 'application/octet-stream',
         cacheControl: cacheControl || 'no-cache',
+        contentEncoding,
       })
 
       const metadata = await this.headObject(bucketName, key, version)
@@ -215,7 +234,11 @@ export class FileBackend implements StorageBackendAdapter {
    * @param key
    * @param version
    */
-  async deleteObject(bucket: string, key: string, version: string | undefined): Promise<void> {
+  async deleteObject(
+    bucket: string,
+    key: string,
+    version: string | null | undefined
+  ): Promise<void> {
     try {
       const file = this.resolveSecurePath(withOptionalVersion(`${bucket}/${key}`, version))
       await removePath(file)
@@ -242,21 +265,53 @@ export class FileBackend implements StorageBackendAdapter {
   async copyObject(
     bucket: string,
     source: string,
-    version: string | undefined,
+    version: string | null | undefined,
     destination: string,
-    destinationVersion: string,
-    metadata: { cacheControl?: string; contentType?: string }
+    destinationVersion: string | null | undefined,
+    metadata?: {
+      cacheControl?: string
+      contentEncoding?: string
+      contentType?: string
+      mimetype?: string
+    },
+    conditions?: {
+      ifMatch?: string
+      ifNoneMatch?: string
+      ifModifiedSince?: Date
+      ifUnmodifiedSince?: Date
+    },
+    options?: CopyObjectOptions
   ): Promise<Pick<ObjectMetadata, 'httpStatusCode' | 'eTag' | 'lastModified'>> {
     const srcFile = this.resolveSecurePath(withOptionalVersion(`${bucket}/${source}`, version))
     const destFile = this.resolveSecurePath(
       withOptionalVersion(`${bucket}/${destination}`, destinationVersion)
     )
 
+    // Only stat the source when a precondition is actually set (the S3 handler
+    // always passes a conditions object) and only hash it for the etag
+    // conditions: md5 etags read the whole file.
+    if (conditions && Object.values(conditions).some((value) => value !== undefined)) {
+      const srcStat = await fsp.stat(srcFile)
+      const eTag =
+        conditions.ifMatch !== undefined || conditions.ifNoneMatch !== undefined
+          ? await this.etag(srcFile, srcStat)
+          : ''
+      assertCopySourcePreconditions(conditions, eTag, srcStat.mtime)
+    }
+
     await ensureFile(destFile)
     await fsp.copyFile(srcFile, destFile)
 
-    const originalMetadata = await this.getFileMetadata(srcFile)
-    await this.setFileMetadata(destFile, Object.assign({}, originalMetadata, metadata))
+    // Moves call backend copy without metadata; preserve source metadata for that path.
+    const copyMetadata = options?.copyMetadata ?? !metadata
+    const destinationMetadata = copyMetadata
+      ? await this.getStoredFileMetadata(srcFile)
+      : {
+          cacheControl: metadata?.cacheControl,
+          contentEncoding: metadata?.contentEncoding,
+          contentType: metadata?.contentType ?? metadata?.mimetype,
+        }
+    await this.setFileMetadata(destFile, destinationMetadata)
 
     const fileStat = await fsp.lstat(destFile)
     const eTag = await this.etag(destFile, fileStat)
@@ -274,22 +329,39 @@ export class FileBackend implements StorageBackendAdapter {
    * @param prefixes
    */
   async deleteObjects(bucket: string, prefixes: string[]): Promise<void> {
-    const promises = prefixes.map((prefix) => {
-      return removePath(this.resolveSecurePath(`${bucket}/${prefix}`))
-    })
-    const results = await Promise.allSettled(promises)
+    const results = await this.deleteObjectPaths(bucket, prefixes)
+    const failure = results.find((result) => result.status === 'rejected')
+    if (failure?.status === 'rejected') throw failure.reason
+  }
 
-    // Collect unique parent directories for cleanup
-    const parentDirs = new Set<string>()
-
-    results.forEach((result, index) => {
-      if (result.status === 'rejected') {
-        throw result.reason
-      } else {
-        // Add parent directory of successfully deleted file
-        const filePath = this.resolveSecurePath(`${bucket}/${prefixes[index]}`)
-        parentDirs.add(path.dirname(filePath))
+  async deleteObjectsDetailed(
+    bucket: string,
+    keys: string[]
+  ): Promise<DeleteObjectDetailedResult[]> {
+    const results = await this.deleteObjectPaths(bucket, keys)
+    return results.map((result, index): DeleteObjectDetailedResult => {
+      if (result.status === 'fulfilled') {
+        return { key: keys[index], outcome: 'DELETED' }
       }
+      // Recursive removal can reject after deleting part of a directory.
+      return {
+        key: keys[index],
+        outcome: 'UNKNOWN',
+        error: {
+          code: (result.reason as NodeJS.ErrnoException | undefined)?.code,
+          message: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        },
+      }
+    })
+  }
+
+  private async deleteObjectPaths(bucket: string, keys: string[]) {
+    const paths = keys.map((key) => this.resolveSecurePath(`${bucket}/${key}`))
+    const results = await Promise.allSettled(paths.map((filePath) => removePath(filePath)))
+
+    const parentDirs = new Set<string>()
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') parentDirs.add(path.dirname(paths[index]))
     })
 
     // Clean up empty directories
@@ -300,6 +372,8 @@ export class FileBackend implements StorageBackendAdapter {
         // Ignore cleanup errors to not affect the main deletion operation
       }
     }
+
+    return results
   }
 
   /**
@@ -311,20 +385,21 @@ export class FileBackend implements StorageBackendAdapter {
   async headObject(
     bucket: string,
     key: string,
-    version: string | undefined
+    version: string | null | undefined
   ): Promise<ObjectMetadata> {
     const file = this.resolveSecurePath(withOptionalVersion(`${bucket}/${key}`, version))
 
     const data = await fsp.stat(file)
-    const { cacheControl, contentType } = await this.getFileMetadata(file)
+    const { cacheControl, contentEncoding, mimetype } = await this.getFileMetadata(file)
     const lastModified = data.mtime
     const eTag = await this.etag(file, data)
 
     return {
       httpStatusCode: 200,
       size: data.size,
-      cacheControl: cacheControl || 'no-cache',
-      mimetype: contentType || 'application/octet-stream',
+      cacheControl,
+      contentEncoding,
+      mimetype,
       eTag,
       lastModified,
       contentLength: data.size,
@@ -334,9 +409,11 @@ export class FileBackend implements StorageBackendAdapter {
   async createMultiPartUpload(
     bucketName: string,
     key: string,
-    version: string | undefined,
+    version: string | null | undefined,
     contentType: string,
-    cacheControl: string
+    cacheControl: string,
+    metadata?: Record<string, string>,
+    contentEncoding?: string
   ): Promise<string | undefined> {
     const uploadId = randomUUID()
     const multiPartFolder = this.resolveSecurePath(
@@ -352,7 +429,10 @@ export class FileBackend implements StorageBackendAdapter {
       )
     )
     await ensureDir(multiPartFolder)
-    await fsp.writeFile(multipartFile, JSON.stringify({ contentType, cacheControl }))
+    await fsp.writeFile(
+      multipartFile,
+      JSON.stringify({ contentType, cacheControl, contentEncoding })
+    )
 
     return uploadId
   }
@@ -400,7 +480,8 @@ export class FileBackend implements StorageBackendAdapter {
       version: string
     }
   > {
-    const partsByEtags = parts.map(async (part) => {
+    const orderedParts = [...parts].sort((a, b) => (a.PartNumber ?? 0) - (b.PartNumber ?? 0))
+    const partsByEtags = orderedParts.map(async (part) => {
       const partFilePath = this.resolveSecurePath(
         path.join(
           'multiparts',
@@ -425,7 +506,6 @@ export class FileBackend implements StorageBackendAdapter {
     })
 
     const finalParts = await Promise.all(partsByEtags)
-    finalParts.sort((a, b) => parseInt(a.split('-')[1]) - parseInt(b.split('-')[1]))
 
     const multipartStream = this.mergePartStreams(finalParts)
     const metadataContent = await fsp.readFile(
@@ -449,7 +529,10 @@ export class FileBackend implements StorageBackendAdapter {
       version,
       multipartStream,
       metadata.contentType,
-      metadata.cacheControl
+      metadata.cacheControl,
+      undefined,
+      undefined,
+      metadata.contentEncoding
     )
 
     removePath(this.resolveSecurePath(path.join('multiparts', uploadId))).catch(() => {
@@ -468,7 +551,7 @@ export class FileBackend implements StorageBackendAdapter {
     bucketName: string,
     key: string,
     uploadId: string,
-    version?: string
+    version?: string | null
   ): Promise<void> {
     const multiPartFolder = this.resolveSecurePath(path.join('multiparts', uploadId))
 
@@ -489,7 +572,7 @@ export class FileBackend implements StorageBackendAdapter {
     UploadId: string,
     PartNumber: number,
     sourceKey: string,
-    sourceVersion?: string,
+    sourceVersion?: string | null,
     rangeBytes?: { fromByte: number; toByte: number }
   ): Promise<{ eTag?: string; lastModified?: Date }> {
     const partFilePath = this.resolveSecurePath(
@@ -556,15 +639,31 @@ export class FileBackend implements StorageBackendAdapter {
    * @param key
    * @param version
    */
-  async privateAssetUrl(bucket: string, key: string, version: string | undefined): Promise<string> {
+  async privateAssetUrl(
+    bucket: string,
+    key: string,
+    version: string | null | undefined
+  ): Promise<string> {
     return 'local:///' + this.resolveSecurePath(withOptionalVersion(`${bucket}/${key}`, version))
   }
 
-  async setFileMetadata(file: string, { contentType, cacheControl }: FileMetadata) {
+  async setFileMetadata(
+    file: string,
+    { contentType, cacheControl, contentEncoding }: FileMetadata
+  ) {
     const platform = process.platform === 'darwin' ? 'darwin' : 'linux'
     await Promise.all([
-      this.setMetadataAttr(file, METADATA_ATTR_KEYS[platform]['cache-control'], cacheControl),
-      this.setMetadataAttr(file, METADATA_ATTR_KEYS[platform]['content-type'], contentType),
+      this.setOrRemoveMetadataAttr(
+        file,
+        METADATA_ATTR_KEYS[platform]['cache-control'],
+        cacheControl
+      ),
+      this.setOrRemoveMetadataAttr(file, METADATA_ATTR_KEYS[platform]['content-type'], contentType),
+      this.setOrRemoveMetadataAttr(
+        file,
+        METADATA_ATTR_KEYS[platform]['content-encoding'],
+        contentEncoding
+      ),
     ])
   }
 
@@ -573,42 +672,61 @@ export class FileBackend implements StorageBackendAdapter {
   }
 
   protected async getFileMetadata(file: string) {
+    const { cacheControl, contentEncoding, contentType } = await this.getStoredFileMetadata(file)
+    return {
+      cacheControl: cacheControl || 'no-cache',
+      contentEncoding,
+      mimetype: contentType || 'application/octet-stream',
+    }
+  }
+
+  protected async getStoredFileMetadata(file: string): Promise<FileMetadata> {
     const platform = process.platform === 'darwin' ? 'darwin' : 'linux'
-    const [cacheControl, contentType] = await Promise.all([
+    const [cacheControl, contentEncoding, contentType] = await Promise.all([
       this.getMetadataAttr(file, METADATA_ATTR_KEYS[platform]['cache-control']),
+      this.getMetadataAttr(file, METADATA_ATTR_KEYS[platform]['content-encoding']),
       this.getMetadataAttr(file, METADATA_ATTR_KEYS[platform]['content-type']),
     ])
 
-    return {
-      cacheControl,
-      contentType,
-    } as FileMetadata
+    return { cacheControl, contentEncoding, contentType }
   }
 
-  protected getMetadataAttr(file: string, attribute: string): Promise<string | undefined> {
-    return xattr.get(file, attribute).then((value) => {
-      return value?.toString() ?? undefined
-    })
-  }
-
-  protected setMetadataAttr(file: string, attribute: string, value: string): Promise<void> {
-    return xattr.set(file, attribute, value)
-  }
-
-  /**
-   * Efficiently checks if a directory is empty by reading only the first entry
-   * @param dirPath The directory path to check
-   * @returns Promise<boolean> true if directory is empty, false otherwise
-   */
-  protected async isEmptyDirectory(dirPath: string): Promise<boolean> {
+  protected async getMetadataAttr(file: string, attribute: string): Promise<string | undefined> {
     try {
-      const directory = await fsp.opendir(dirPath)
-      const entry = await directory.read()
-      await directory.close()
+      // fs-xattr's async path leaks about 0.5 kB per call (fs-xattr#47, reported
+      // for this backend in #1349). The sync path does not leak and the reads
+      // are small, so it is used until an upstream release ships the fix.
+      const value = xattr.getAttributeSync(file, attribute)
+      return value?.toString() ?? undefined
+    } catch (error) {
+      if (isMissingXattrError(error)) {
+        return undefined
+      }
+      throw error
+    }
+  }
 
-      return entry === null
-    } catch {
-      return false
+  protected async setMetadataAttr(file: string, attribute: string, value: string): Promise<void> {
+    // see getMetadataAttr: sync xattr calls until fs-xattr ships a fixed release
+    xattr.setAttributeSync(file, attribute, value)
+  }
+
+  protected async setOrRemoveMetadataAttr(
+    file: string,
+    attribute: string,
+    value: string | undefined
+  ): Promise<void> {
+    if (value !== undefined) {
+      await this.setMetadataAttr(file, attribute, value)
+      return
+    }
+
+    try {
+      xattr.removeAttributeSync(file, attribute)
+    } catch (error) {
+      if (!isMissingXattrError(error)) {
+        throw error
+      }
     }
   }
 
@@ -618,27 +736,30 @@ export class FileBackend implements StorageBackendAdapter {
    */
   protected async cleanupEmptyDirectories(dirPath: string): Promise<void> {
     try {
-      // Don't cleanup beyond the storage root path
-      if (!dirPath.startsWith(this.filePath) || dirPath === this.filePath) {
+      const relativePath = path.relative(this.filePath, dirPath)
+      const isOutsideStorageRoot =
+        relativePath === '..' ||
+        relativePath.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relativePath)
+
+      // Do not remove the storage root or directories outside it.
+      if (relativePath === '' || isOutsideStorageRoot) {
         return
       }
 
-      // Check if directory exists
-      const exists = await pathExists(dirPath)
-      if (!exists) {
-        return
+      try {
+        // Atomically removes an empty directory and fails if a concurrent upload repopulated it.
+        await fsp.rmdir(dirPath)
+      } catch (error) {
+        // If another cleanup removed this directory, its parents may still need cleanup.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          return
+        }
       }
 
-      // Check if directory is empty - using opendir for better performance with large directories
-      const isEmpty = await this.isEmptyDirectory(dirPath)
-      if (isEmpty) {
-        // Remove empty directory - using fs.remove for better cross-platform compatibility
-        await removePath(dirPath)
-
-        // Recursively check parent directory
-        const parentDir = path.dirname(dirPath)
-        await this.cleanupEmptyDirectories(parentDir)
-      }
+      // Recursively check the parent after this directory was removed or was already absent.
+      const parentDir = path.dirname(dirPath)
+      await this.cleanupEmptyDirectories(parentDir)
     } catch {
       // Ignore errors during cleanup to not affect main operations
       // Could be permission issues, concurrent access, directory not empty due to race conditions, etc.
@@ -665,4 +786,67 @@ export class FileBackend implements StorageBackendAdapter {
     }
     throw new Error('FILE_STORAGE_ETAG_ALGORITHM env variable must be either "mtime" or "md5"')
   }
+}
+
+/**
+ * Evaluates the x-amz-copy-source-if-* preconditions the way S3 CopyObject does,
+ * so the file backend rejects a copy with 412 in the same cases as the S3 backend:
+ * if-match takes precedence over if-unmodified-since, and if-none-match takes
+ * precedence over if-modified-since. Invalid dates are ignored (RFC 9110 13.1).
+ */
+function assertCopySourcePreconditions(
+  conditions: {
+    ifMatch?: string
+    ifNoneMatch?: string
+    ifModifiedSince?: Date
+    ifUnmodifiedSince?: Date
+  },
+  eTag: string,
+  lastModified: Date
+) {
+  let failed = false
+
+  if (conditions.ifMatch !== undefined) {
+    failed = !matchesETag(conditions.ifMatch, eTag)
+  } else if (conditions.ifUnmodifiedSince) {
+    failed = toSeconds(lastModified) > toSeconds(conditions.ifUnmodifiedSince)
+  }
+
+  if (!failed && conditions.ifNoneMatch !== undefined) {
+    failed = matchesETag(conditions.ifNoneMatch, eTag)
+  } else if (!failed && conditions.ifModifiedSince) {
+    failed = toSeconds(lastModified) <= toSeconds(conditions.ifModifiedSince)
+  }
+
+  if (failed) {
+    throw StorageBackendError.withStatusCode(412, {
+      error: 'PreconditionFailed',
+      code: ErrorCode.PreconditionFailed,
+      httpStatusCode: 412,
+      message: 'PreconditionFailed',
+    })
+  }
+}
+
+// HTTP dates have one-second precision, invalid is false.
+function toSeconds(date: Date) {
+  return Math.floor(date.getTime() / 1000)
+}
+
+function unquoteETag(value: string) {
+  return value
+    .trim()
+    .replace(/^W\//, '')
+    .replace(/^"(.*)"$/, '$1')
+}
+
+function matchesETag(condition: string, eTag: string) {
+  const target = unquoteETag(eTag)
+
+  // RFC 9110 8.8.3: commas are valid inside a quoted entity-tag
+  // so split on commas outside quotes only.
+  return (condition.match(/(?:"[^"]*"|[^,])+/g) ?? []).some((candidate) => {
+    const value = candidate.trim()
+    return value === '*' || unquoteETag(value) === target
+  })
 }

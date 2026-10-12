@@ -52,7 +52,6 @@ describe('pg store runtime selection', () => {
         data jsonb NOT NULL DEFAULT '{}'::jsonb
       )
     `)
-    vi.spyOn(migrate, 'runMigrationsOnTenant').mockResolvedValue()
     await adminApp.inject({
       method: 'DELETE',
       url: `/tenants/${tenantId}`,
@@ -60,6 +59,10 @@ describe('pg store runtime selection', () => {
         apikey: process.env.ADMIN_API_KEYS,
       },
     })
+  })
+
+  beforeEach(() => {
+    vi.spyOn(migrate, 'runMigrationsOnTenant').mockResolvedValue()
   })
 
   afterAll(async () => {
@@ -185,6 +188,7 @@ describe('pg store runtime selection', () => {
           },
         },
         disableEvents: ['ObjectCreated:*'],
+        subscriptionTier: 'tier_pro',
       },
       headers: {
         apikey: process.env.ADMIN_API_KEYS,
@@ -203,6 +207,7 @@ describe('pg store runtime selection', () => {
           enabled: true,
         },
       },
+      subscriptionTier: 'tier_pro',
     })
 
     const jwksConfig = await jwksManager.getJwksTenantConfig(tenantId)

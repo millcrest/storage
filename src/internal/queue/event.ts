@@ -1,12 +1,11 @@
-import { getTenantConfig } from '@internal/database'
-import { PgExecutor } from '@internal/database/pg-connection'
+import { type DatabaseExecutor, getTenantConfig } from '@internal/database'
 import { ERRORS } from '@internal/errors'
 import { logger, logSchema } from '@internal/monitoring'
 import { queueJobScheduled, queueJobSchedulingTime } from '@internal/monitoring/metrics'
 import { PgQueueDB } from '@internal/queue/database'
 import PgBoss, { Job, Queue as PgBossQueue, SendOptions, WorkOptions } from 'pg-boss'
 import { getConfig } from '../../config'
-import { SYSTEM_TENANT_REF } from './constants'
+import { SYNC_JOB_ID, SYSTEM_TENANT_REF } from './constants'
 import { PG_BOSS_SCHEMA, Queue } from './queue'
 
 export interface BasePayload {
@@ -22,7 +21,7 @@ export interface BasePayload {
 }
 
 const { pgQueueEnable, region, isMultitenant } = getConfig()
-type TransactionalQueueDb = PgExecutor
+type TransactionalQueueDb = DatabaseExecutor
 
 function withPayloadVersion<TPayload extends BasePayload>(
   payload: TPayload,
@@ -235,7 +234,7 @@ export class Event<T extends Omit<BasePayload, '$version'>> {
     }
 
     await eventClass.handle({
-      id: '__sync',
+      id: SYNC_JOB_ID,
       expireInSeconds: 0,
       name: eventClass.getQueueName(),
       data: {
@@ -260,7 +259,7 @@ export class Event<T extends Omit<BasePayload, '$version'>> {
     if (!pgQueueEnable) {
       if (eventClass.allowSync) {
         return eventClass.handle({
-          id: '__sync',
+          id: SYNC_JOB_ID,
           expireInSeconds: 0,
           name: eventClass.getQueueName(),
           data: {
@@ -281,7 +280,7 @@ export class Event<T extends Omit<BasePayload, '$version'>> {
       }
     }
 
-    const startTime = process.hrtime.bigint()
+    const startTime = performance.now()
     const sendOptions = eventClass.getSendOptions(this.payload) || {}
 
     if (this.payload.scheduleAt) {
@@ -311,6 +310,19 @@ export class Event<T extends Omit<BasePayload, '$version'>> {
         },
       })
 
+      // pg-boss returns null when the insert was dropped by a queue policy
+      // (e.g. an exactly_once job with the same singleton key is still queued or active).
+      if (res === null) {
+        logSchema.info(logger, `[Queue Sender] Job not queued, dropped by queue policy`, {
+          type: 'queue',
+          project: this.payload.tenant?.ref || SYSTEM_TENANT_REF,
+          metadata: JSON.stringify({ queue: eventClass.getQueueName() }),
+          sbReqId: this.payload.sbReqId,
+        })
+
+        return res
+      }
+
       queueJobScheduled.add(1, {
         name: eventClass.getQueueName(),
       })
@@ -337,7 +349,7 @@ export class Event<T extends Omit<BasePayload, '$version'>> {
       }
 
       return eventClass.handle({
-        id: '__sync',
+        id: SYNC_JOB_ID,
         expireInSeconds: 0,
         name: eventClass.getQueueName(),
         data: {
@@ -347,7 +359,7 @@ export class Event<T extends Omit<BasePayload, '$version'>> {
         },
       })
     } finally {
-      const duration = Number(process.hrtime.bigint() - startTime) / 1e9
+      const duration = (performance.now() - startTime) / 1000
       queueJobSchedulingTime.record(duration, {
         name: eventClass.getQueueName(),
       })

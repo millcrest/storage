@@ -1,5 +1,5 @@
 import { spyOnAbortSignalAny, spyOnAbortSignalTimeout } from '../../test/utils/abort-signal'
-import type { PgExecutor, PgStatement } from './pg-connection'
+import type { DatabaseExecutor, DatabaseStatement } from './connection'
 import { TenantConfigStorePg } from './tenant-store-pg'
 
 function createTenantStore() {
@@ -7,16 +7,16 @@ function createTenantStore() {
     rows: [],
     rowCount: 1,
   })
-  const store = new TenantConfigStorePg({ query } as unknown as PgExecutor)
+  const store = new TenantConfigStorePg({ query } as unknown as DatabaseExecutor)
 
   return { query, store }
 }
 
-function getLastStatement(query: ReturnType<typeof vi.fn>): PgStatement {
+function getLastStatement(query: ReturnType<typeof vi.fn>): DatabaseStatement {
   const [statement] = query.mock.calls.at(-1) || []
 
   if (!statement || typeof statement === 'string') {
-    throw new Error('Expected a PgStatement query')
+    throw new Error('Expected a DatabaseStatement query')
   }
 
   return statement
@@ -72,6 +72,40 @@ describe('TenantConfigStorePg', () => {
     expect(statement.values).toEqual(['postgres://tenant', 10, 'tenant-id'])
   })
 
+  it('only updates migration state while the recorded version is known', async () => {
+    const { query, store } = createTenantStore()
+
+    await store.updateMigrationsState('tenant-id', {
+      migrations_version: 'storage-schema',
+      migrations_status: 'COMPLETED',
+    })
+
+    const statement = getLastStatement(query)
+    expect(statement.text).toContain('SET migrations_version = COALESCE($2, migrations_version)')
+    expect(statement.text).toContain('OR migrations_version = ANY($4::text[])')
+    expect(statement.values?.slice(0, 3)).toEqual(['tenant-id', 'storage-schema', 'COMPLETED'])
+    expect(statement.values?.[3]).toEqual(expect.arrayContaining(['storage-schema']))
+    expect(statement.values?.[3]).not.toContain('future-migration')
+  })
+
+  it('keeps the recorded version when only the migration status changes', async () => {
+    const { query, store } = createTenantStore()
+
+    await store.updateMigrationsState('tenant-id', { migrations_status: 'FAILED' })
+
+    expect(getLastStatement(query).values?.slice(0, 3)).toEqual(['tenant-id', null, 'FAILED'])
+  })
+
+  it('skips tenants recorded with an unknown version when listing migrations', async () => {
+    const { query, store } = createTenantStore()
+
+    await store.listTenantsToMigrateBatch('storage-schema', 0, ['FAILED'], 200)
+
+    const statement = getLastStatement(query)
+    expect(statement.text).toContain('OR migrations_version = ANY($5::text[])')
+    expect(statement.values?.[4]).toEqual(expect.arrayContaining(['storage-schema']))
+  })
+
   it('adds the default internal timeout to normal tenant queries', async () => {
     const { query, store } = createTenantStore()
     const { timeoutSignal, timeoutSpy } = spyOnAbortSignalTimeout()
@@ -113,7 +147,7 @@ describe('TenantConfigStorePg', () => {
     await (
       store as unknown as {
         query(
-          statement: PgStatement,
+          statement: DatabaseStatement,
           options: { signal: AbortSignal; timeoutMs: number }
         ): Promise<unknown>
       }
@@ -133,7 +167,9 @@ describe('TenantConfigStorePg', () => {
       rows: [],
       rowCount: 1,
     })
-    const store = new ConfiguredTenantConfigStorePg({ query } as unknown as PgExecutor)
+    const store = new ConfiguredTenantConfigStorePg({
+      query,
+    } as unknown as DatabaseExecutor)
     const { timeoutSignal, timeoutSpy } = spyOnAbortSignalTimeout()
 
     try {

@@ -1,6 +1,7 @@
 import { ERRORS } from '@internal/errors'
 import { FastifyInstance } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
+import { sharedErrorResponseSchemas } from '../../schemas/error'
 import { AuthenticatedRequest } from '../../types'
 import { ROUTE_OPERATIONS } from '../operations'
 import { compileNoCoercionValidator } from './validation'
@@ -29,10 +30,11 @@ export default async function routes(fastify: FastifyInstance) {
     {
       validatorCompiler: deleteVectorBucketValidator,
       config: {
-        operation: { type: ROUTE_OPERATIONS.DELETE_VECTOR_BUCKET },
+        operation: ROUTE_OPERATIONS.DELETE_VECTOR_BUCKET,
       },
       schema: {
         ...deleteVectorBucket,
+        response: sharedErrorResponseSchemas,
         tags: ['vector'],
       },
     },

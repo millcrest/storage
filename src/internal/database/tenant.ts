@@ -1,11 +1,15 @@
 import {
-  calculateMaxCacheSizeBytes,
-  createConstantSizeCalculation,
+  CACHE_LOOKUP_WITHOUT_METRICS,
   createLruCache,
   DEFAULT_CACHE_PURGE_STALE_INTERVAL_MS,
+  DEFAULT_CACHE_TTL_JITTER_RATIO,
   TENANT_CONFIG_CACHE_NAME,
 } from '@internal/cache'
 import { lastLocalMigrationName } from '@internal/database/migrations/files'
+import {
+  highestKnownMigrationName,
+  isUnrecognizedMigration,
+} from '@internal/database/migrations/guards'
 import { ERRORS } from '@internal/errors'
 import { logger, logSchema } from '@internal/monitoring'
 import {
@@ -13,14 +17,19 @@ import {
   S3CredentialsManagerStorePg,
 } from '@storage/protocols/s3/credentials'
 import { JWTPayload } from 'jose'
-import { getConfig, JwksConfig, JwksConfigKey, JwksConfigKeyOCT } from '../../config'
-import { decrypt } from '../auth'
+import {
+  freezeJwksConfig,
+  getConfig,
+  JwksConfig,
+  JwksConfigKey,
+  UrlSigningJwksConfigKey,
+} from '../../config'
+import { decrypt, jwkSupportsPublic, toPublicJwk } from '../auth'
 import { JWKSManager, JWKSManagerStorePg } from '../auth/jwks'
-import { createMutexByKey } from '../concurrency'
+import { createInvalidatableSingleFlightByKey } from '../concurrency'
 import { isStringMessage, PubSubAdapter } from '../pubsub'
 import { DBMigration } from './migrations/types'
 import { multitenantPgExecutor } from './multitenant-pg'
-import { PgTenantConnection } from './pg-connection'
 import { TenantConfigStorePg } from './tenant-store-pg'
 
 interface TenantConfig {
@@ -38,10 +47,13 @@ interface TenantConfig {
   }
   deleteObjectsLimit?: number
   migrationVersion?: keyof typeof DBMigration
+  /** The recorded version is unknown to this binary, so a newer release already migrated past it. */
+  migrationVersionAhead?: boolean
   migrationStatus?: TenantMigrationStatus
   syncMigrationsDone?: boolean
   tracingMode?: string
   disableEvents?: string[]
+  subscriptionTier?: string
 }
 
 type GetTenantConfigOptions = {
@@ -72,6 +84,9 @@ export interface Features {
     maxTables: number
     maxCatalogs: number
   }
+  objectVersioning: {
+    enabled: boolean
+  }
 }
 
 export enum TenantMigrationStatus {
@@ -80,30 +95,22 @@ export enum TenantMigrationStatus {
   FAILED_STALE = 'FAILED_STALE',
 }
 
-const { isMultitenant, dbServiceRole, dbMigrationFreezeAt, databaseMaxConnections } = getConfig()
+const { isMultitenant, dbServiceRole, dbMigrationFreezeAt, storageVersioningEnabled } = getConfig()
 
 // Max 16,384 items. At ~2KB per config, this uses roughly ~32MB of heap memory worst-case.
 export const TENANT_CONFIG_CACHE_MAX_ITEMS = 16384
-export const TENANT_CONFIG_CACHE_ESTIMATED_ENTRY_SIZE_BYTES = 2 * 1024
-export const TENANT_CONFIG_CACHE_MAX_SIZE_BYTES = calculateMaxCacheSizeBytes(
-  TENANT_CONFIG_CACHE_MAX_ITEMS,
-  TENANT_CONFIG_CACHE_ESTIMATED_ENTRY_SIZE_BYTES
-)
 export const TENANT_CONFIG_CACHE_TTL_MS = 1000 * 60 * 60 // 1h
 
 const tenantConfigCache = createLruCache<string, TenantConfig>(TENANT_CONFIG_CACHE_NAME, {
   max: TENANT_CONFIG_CACHE_MAX_ITEMS,
-  maxSize: TENANT_CONFIG_CACHE_MAX_SIZE_BYTES,
   ttl: TENANT_CONFIG_CACHE_TTL_MS,
-  sizeCalculation: createConstantSizeCalculation<TenantConfig, string>(
-    TENANT_CONFIG_CACHE_ESTIMATED_ENTRY_SIZE_BYTES
-  ),
-  updateAgeOnGet: true,
+  ttlJitterRatio: DEFAULT_CACHE_TTL_JITTER_RATIO,
   allowStale: false,
   purgeStaleIntervalMs: DEFAULT_CACHE_PURGE_STALE_INTERVAL_MS,
 })
 
-const tenantMutex = createMutexByKey<TenantConfig>()
+const tenantConfigSingleFlight = createInvalidatableSingleFlightByKey<TenantConfig>()
+const EMPTY_JWKS_CONFIG = freezeJwksConfig({ keys: [] })
 
 export const jwksManager = new JWKSManager(new JWKSManagerStorePg(multitenantPgExecutor))
 
@@ -122,7 +129,7 @@ function getSingleTenantJwtConfig(): {
   jwks: JwksConfig
 } {
   const { jwtSecret, jwtJWKS } = getConfig()
-  const jwks = (jwtJWKS || { keys: [] }) as JwksConfig
+  const jwks = jwtJWKS || EMPTY_JWKS_CONFIG
 
   return {
     secret: jwtSecret,
@@ -160,10 +167,10 @@ function mergeTenantJwksWithLegacyKeys(
     return cachedMergedJwks
   }
 
-  const mergedJwks: JwksConfig = {
+  const mergedJwks = freezeJwksConfig({
     ...tenantJwks,
     keys: [...tenantJwks.keys, ...legacyJwks.keys],
-  }
+  })
 
   mergedByLegacyJwks.set(legacyJwks, mergedJwks)
 
@@ -175,6 +182,7 @@ function mergeTenantJwksWithLegacyKeys(
  * @param tenantId
  */
 export function deleteTenantConfig(tenantId: string): void {
+  tenantConfigSingleFlight.invalidate(tenantId)
   tenantConfigCache.delete(tenantId)
 }
 
@@ -191,100 +199,119 @@ export async function getTenantConfig(
     throw ERRORS.InvalidTenantId()
   }
 
-  const cachedConfig = tenantConfigCache.get(tenantId, {
-    recordMetrics: options?.recordMetrics,
-  })
+  const cachedConfig = tenantConfigCache.get(tenantId, options)
   if (cachedConfig !== undefined) {
     return cachedConfig
   }
 
-  return tenantMutex(tenantId, async () => {
-    const cachedConfig = tenantConfigCache.get(tenantId, { recordMetrics: false })
-    if (cachedConfig !== undefined) {
-      return cachedConfig
-    }
+  return tenantConfigSingleFlight(tenantId, {
+    load: async () => {
+      const tenant = await getTenantConfigRow(tenantId)
 
-    const tenant = await getTenantConfigRow(tenantId)
+      if (!tenant) {
+        throw ERRORS.MissingTenantConfig(tenantId)
+      }
+      const {
+        anon_key,
+        database_url,
+        file_size_limit,
+        jwt_secret,
+        jwks,
+        service_key,
+        feature_purge_cache,
+        feature_image_transformation,
+        feature_s3_protocol,
+        feature_iceberg_catalog,
+        feature_iceberg_catalog_max_catalogs,
+        feature_iceberg_catalog_max_namespaces,
+        feature_iceberg_catalog_max_tables,
+        feature_vector_buckets,
+        feature_vector_buckets_max_buckets,
+        feature_vector_buckets_max_indexes,
+        feature_object_versioning,
+        image_transformation_max_resolution,
+        database_pool_url,
+        max_connections,
+        delete_objects_limit,
+        migrations_version,
+        migrations_status,
+        tracing_mode,
+        disable_events,
+        subscription_tier,
+      } = tenant
 
-    if (!tenant) {
-      throw ERRORS.MissingTenantConfig(tenantId)
-    }
-    const {
-      anon_key,
-      database_url,
-      file_size_limit,
-      jwt_secret,
-      jwks,
-      service_key,
-      feature_purge_cache,
-      feature_image_transformation,
-      feature_s3_protocol,
-      feature_iceberg_catalog,
-      feature_iceberg_catalog_max_catalogs,
-      feature_iceberg_catalog_max_namespaces,
-      feature_iceberg_catalog_max_tables,
-      feature_vector_buckets,
-      feature_vector_buckets_max_buckets,
-      feature_vector_buckets_max_indexes,
-      image_transformation_max_resolution,
-      database_pool_url,
-      max_connections,
-      delete_objects_limit,
-      migrations_version,
-      migrations_status,
-      tracing_mode,
-      disable_events,
-    } = tenant
+      const serviceKey = decrypt(service_key)
+      const jwtSecret = decrypt(jwt_secret)
 
-    const serviceKey = decrypt(service_key)
-    const jwtSecret = decrypt(jwt_secret)
+      const migrationVersionAhead = isUnrecognizedMigration(migrations_version)
+      if (migrationVersionAhead) {
+        logSchema.warning(logger, '[Migrations] Tenant migration unrecognized by this binary', {
+          type: 'migrations',
+          project: tenantId,
+          metadata: JSON.stringify({
+            recordedMigration: migrations_version,
+            highestKnownMigration: highestKnownMigrationName(),
+          }),
+        })
+      }
 
-    const config = {
-      anonKey: decrypt(anon_key),
-      databaseUrl: decrypt(database_url),
-      databasePoolUrl: database_pool_url ? decrypt(database_pool_url) : undefined,
-      fileSizeLimit: Number(file_size_limit),
-      jwtSecret,
-      jwks: jwks ? { keys: jwks.keys ?? [] } : jwks,
-      serviceKey,
-      serviceKeyPayload: { role: dbServiceRole },
-      maxConnections: max_connections ? Number(max_connections) : undefined,
-      deleteObjectsLimit:
-        delete_objects_limit === null || delete_objects_limit === undefined
-          ? undefined
-          : Number(delete_objects_limit),
-      features: {
-        imageTransformation: {
-          enabled: Boolean(feature_image_transformation),
-          maxResolution: image_transformation_max_resolution,
+      const config = {
+        anonKey: decrypt(anon_key),
+        databaseUrl: decrypt(database_url),
+        databasePoolUrl: database_pool_url ? decrypt(database_pool_url) : undefined,
+        fileSizeLimit: Number(file_size_limit),
+        jwtSecret,
+        jwks: jwks ? { keys: jwks.keys ?? [] } : jwks,
+        serviceKey,
+        serviceKeyPayload: { role: dbServiceRole },
+        maxConnections: max_connections ? Number(max_connections) : undefined,
+        deleteObjectsLimit:
+          delete_objects_limit === null ||
+          delete_objects_limit === undefined ||
+          delete_objects_limit <= 0
+            ? undefined
+            : Number(delete_objects_limit),
+        features: {
+          imageTransformation: {
+            enabled: Boolean(feature_image_transformation),
+            maxResolution: image_transformation_max_resolution,
+          },
+          s3Protocol: {
+            enabled: Boolean(feature_s3_protocol),
+          },
+          purgeCache: {
+            enabled: Boolean(feature_purge_cache),
+          },
+          icebergCatalog: {
+            enabled: Boolean(feature_iceberg_catalog),
+            maxNamespaces: feature_iceberg_catalog_max_namespaces ?? 0,
+            maxTables: feature_iceberg_catalog_max_tables ?? 0,
+            maxCatalogs: feature_iceberg_catalog_max_catalogs ?? 0,
+          },
+          vectorBuckets: {
+            enabled: Boolean(feature_vector_buckets),
+            maxBuckets: feature_vector_buckets_max_buckets ?? 0,
+            maxIndexes: feature_vector_buckets_max_indexes ?? 0,
+          },
+          objectVersioning: {
+            enabled: Boolean(feature_object_versioning),
+          },
         },
-        s3Protocol: {
-          enabled: Boolean(feature_s3_protocol),
-        },
-        purgeCache: {
-          enabled: Boolean(feature_purge_cache),
-        },
-        icebergCatalog: {
-          enabled: Boolean(feature_iceberg_catalog),
-          maxNamespaces: feature_iceberg_catalog_max_namespaces ?? 0,
-          maxTables: feature_iceberg_catalog_max_tables ?? 0,
-          maxCatalogs: feature_iceberg_catalog_max_catalogs ?? 0,
-        },
-        vectorBuckets: {
-          enabled: Boolean(feature_vector_buckets),
-          maxBuckets: feature_vector_buckets_max_buckets ?? 0,
-          maxIndexes: feature_vector_buckets_max_indexes ?? 0,
-        },
-      },
-      migrationVersion: migrations_version as keyof typeof DBMigration | undefined,
-      migrationStatus: migrations_status as TenantMigrationStatus | undefined,
-      migrationsRun: false,
-      tracingMode: tracing_mode ?? undefined,
-      disableEvents: disable_events ?? undefined,
-    }
-    tenantConfigCache.set(tenantId, config)
-
-    return config
+        // Present an ahead version as the newest one this binary understands.
+        migrationVersion: migrationVersionAhead
+          ? highestKnownMigrationName()
+          : (migrations_version as keyof typeof DBMigration | undefined),
+        migrationVersionAhead,
+        migrationStatus: migrations_status as TenantMigrationStatus | undefined,
+        migrationsRun: false,
+        tracingMode: tracing_mode ?? undefined,
+        disableEvents: disable_events ?? undefined,
+        subscriptionTier: subscription_tier ?? undefined,
+      }
+      return config
+    },
+    retry: () => getTenantConfig(tenantId, CACHE_LOOKUP_WITHOUT_METRICS),
+    commit: (config) => tenantConfigCache.set(tenantId, config),
   })
 }
 
@@ -317,6 +344,7 @@ export async function getServiceKey(tenantId: string): Promise<string> {
 enum Capability {
   LIST_V2 = 'list_V2',
   ICEBERG_CATALOG = 'iceberg_catalog',
+  OBJECT_VERSIONING = 'object_versioning',
 }
 
 /**
@@ -327,13 +355,16 @@ export async function getTenantCapabilities(tenantId: string) {
   const capabilities: Record<Capability, boolean> = {
     [Capability.LIST_V2]: false,
     [Capability.ICEBERG_CATALOG]: false,
+    [Capability.OBJECT_VERSIONING]: false,
   }
 
   let latestMigrationName = dbMigrationFreezeAt || (await lastLocalMigrationName())
+  let objectVersioningEnabled = storageVersioningEnabled
 
   if (isMultitenant) {
-    const { migrationVersion } = await getTenantConfig(tenantId)
+    const { migrationVersion, features } = await getTenantConfig(tenantId)
     latestMigrationName = migrationVersion || 'initialmigration'
+    objectVersioningEnabled = storageVersioningEnabled || features.objectVersioning.enabled
   }
 
   if (DBMigration[latestMigrationName] >= DBMigration['optimise-existing-functions']) {
@@ -342,6 +373,13 @@ export async function getTenantCapabilities(tenantId: string) {
 
   if (DBMigration[latestMigrationName] >= DBMigration['iceberg-catalog-flag-on-buckets']) {
     capabilities[Capability.ICEBERG_CATALOG] = true
+  }
+
+  if (
+    objectVersioningEnabled &&
+    DBMigration[latestMigrationName] >= DBMigration['unlock-object-versioning']
+  ) {
+    capabilities[Capability.OBJECT_VERSIONING] = true
   }
 
   return capabilities
@@ -365,13 +403,8 @@ export async function tenantHasFeature(
   return features ? features[feature].enabled : false
 }
 
-/**
- * Get the jwt key from the tenant config
- * @param tenantId
- */
-export async function getJwtSecret(tenantId: string): Promise<{
+async function getTenantJwks(tenantId: string): Promise<{
   secret: string
-  urlSigningKey: string | JwksConfigKeyOCT
   jwks: JwksConfig
 }> {
   let { secret, jwks } = getSingleTenantJwtConfig()
@@ -383,8 +416,39 @@ export async function getJwtSecret(tenantId: string): Promise<{
     jwks = config.jwks?.keys ? mergeTenantJwksWithLegacyKeys(tenantJwks, config.jwks) : tenantJwks
   }
 
+  return { secret, jwks }
+}
+
+/**
+ * Get the jwt key from the tenant config
+ * @param tenantId
+ */
+export async function getJwtSecret(tenantId: string): Promise<{
+  secret: string
+  urlSigningKey: string | UrlSigningJwksConfigKey
+  jwks: JwksConfig
+}> {
+  const { secret, jwks } = await getTenantJwks(tenantId)
   const urlSigningKey = jwks.urlSigningKey || secret
   return { secret, urlSigningKey, jwks }
+}
+
+/**
+ * Get the public jwks for a tenant, suitable for exposing on a public jwks endpoint.
+ * Symmetric (oct) keys have no public form and are excluded; asymmetric keys are reduced
+ * to their public components only.
+ * @param tenantId
+ */
+export async function getPublicJwks(tenantId: string): Promise<JwksConfigKey[]> {
+  const { jwks } = await getTenantJwks(tenantId)
+
+  const publicJwks: JwksConfigKey[] = []
+  for (const jwk of jwks.keys) {
+    if (jwkSupportsPublic(jwk)) {
+      publicJwks.push(toPublicJwk(jwk))
+    }
+  }
+  return publicJwks
 }
 
 /**
@@ -433,67 +497,9 @@ export async function listenForTenantUpdate(pubSub: PubSubAdapter): Promise<void
 }
 
 /**
- * Handles the tenant config change event
+ * Invalidates the tenant config so the next lookup loads current settings.
  * @param cacheKey
  */
-export async function onTenantConfigChange(cacheKey: string) {
-  const oldConfig = tenantConfigCache.get(cacheKey, { recordMetrics: false })
-  tenantConfigCache.delete(cacheKey)
-
-  if (!oldConfig) {
-    return
-  }
-
-  try {
-    const newConfig = await getTenantConfig(cacheKey, { recordMetrics: false })
-
-    // 1. DB endpoint changed: the cached pool's connection string is stale, and
-    //    so are its open sockets. Hard destroy so the next request rebuilds
-    //    against the new endpoint.
-    if (
-      newConfig.databaseUrl !== oldConfig.databaseUrl ||
-      newConfig.databasePoolUrl !== oldConfig.databasePoolUrl
-    ) {
-      return destroyTenantPool(cacheKey)
-    }
-
-    // 2. Max connections changed: endpoint is fine, only the budget moved.
-    //    Rebalance the cached pg pool in place so new acquire attempts observe
-    //    the new budget while in-flight queries keep their checked-out clients.
-    if (
-      normalizeMaxConnections(newConfig.maxConnections) !==
-      normalizeMaxConnections(oldConfig.maxConnections)
-    ) {
-      PgTenantConnection.poolManager.rebalance(cacheKey, {
-        maxConnections: resolveMaxConnections(newConfig.maxConnections),
-      })
-    }
-  } catch {
-    // if the tenant config is not found, we can ignore it
-    // this can happen if the tenant was deleted
-    // or if the tenant was updated and the cache was invalidated
-    // before we could get the new config
-  }
-}
-
-function normalizeMaxConnections(maxConnections: number | null | undefined): number | null {
-  return maxConnections ?? null
-}
-
-function resolveMaxConnections(maxConnections: number | null | undefined): number {
-  return maxConnections ?? databaseMaxConnections
-}
-
-async function destroyTenantPool(cacheKey: string): Promise<void> {
-  await Promise.allSettled([PgTenantConnection.poolManager.destroy(cacheKey)]).then((results) => {
-    for (const result of results) {
-      if (result.status === 'rejected') {
-        logSchema.error(logger, 'Error destroying the pool', {
-          type: 'pool',
-          error: result.reason as Error,
-          project: cacheKey,
-        })
-      }
-    }
-  })
+export function onTenantConfigChange(cacheKey: string): void {
+  deleteTenantConfig(cacheKey)
 }

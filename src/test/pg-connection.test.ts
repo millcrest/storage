@@ -4,6 +4,7 @@ import {
   PgPoolStrategy,
   PgTenantConnection,
 } from '@internal/database'
+import { searchPath, type TenantConnectionOptions } from '@internal/database/pool'
 import { getConfig } from '../config'
 
 const { databaseURL, databasePoolURL, tenantId } = getConfig()
@@ -11,8 +12,8 @@ const { databaseURL, databasePoolURL, tenantId } = getConfig()
 describe('Pg database foundation', () => {
   function createConnectionSettings(
     superUser: Awaited<ReturnType<typeof getServiceKeyUser>>,
-    overrides?: Partial<ConstructorParameters<typeof PgPoolStrategy>[0]>
-  ): ConstructorParameters<typeof PgPoolStrategy>[0] {
+    overrides?: Partial<TenantConnectionOptions>
+  ): TenantConnectionOptions {
     return {
       tenantId,
       isExternalPool: true,
@@ -33,29 +34,13 @@ describe('Pg database foundation', () => {
     const settings = createConnectionSettings(superUser)
 
     const pool = new PgPoolStrategy(settings)
-    const connection = new PgTenantConnection(pool, settings)
+    const connection = new PgTenantConnection({ value: pool, release: () => {} }, settings)
 
     return { connection, pool, superUser }
   }
 
   afterEach(async () => {
     await PgTenantConnection.stop()
-  })
-
-  it('executes queries and can reacquire after pool destroy', async () => {
-    const { pool } = await createConnection()
-
-    try {
-      const first = await pool.acquire().query<{ n: number }>('SELECT 1 as n')
-      expect(first.rows[0].n).toEqual(1)
-
-      await pool.destroy()
-
-      const second = await pool.acquire().query<{ n: number }>('SELECT 2 as n')
-      expect(second.rows[0].n).toEqual(2)
-    } finally {
-      await pool.destroy()
-    }
   })
 
   it('reports pool stats from the pg pool', async () => {
@@ -73,7 +58,7 @@ describe('Pg database foundation', () => {
         })
       )
     } finally {
-      await pool.destroy()
+      await pool.dispose('destroy')
     }
   })
 
@@ -95,7 +80,7 @@ describe('Pg database foundation', () => {
       const result = await pool.acquire().query<{ n: number }>('SELECT 1 AS n')
       expect(result.rows[0].n).toBe(1)
     } finally {
-      await pool.destroy()
+      await pool.dispose('destroy')
     }
   })
 
@@ -110,11 +95,11 @@ describe('Pg database foundation', () => {
 
       expect(connection.getAbortSignal()).toBe(controller.signal)
     } finally {
-      await pool.destroy()
+      await pool.dispose('destroy')
     }
   })
 
-  it('sets transaction-local request scope and statement timeout', async () => {
+  it('sets transaction-local search path, request scope, and statement timeout', async () => {
     const { connection, pool, superUser } = await createConnection()
     const transaction = await connection.transaction({ timeout: 1234 })
 
@@ -127,6 +112,7 @@ describe('Pg database foundation', () => {
         request_path: string
         storage_operation: string
         allow_delete: string
+        search_path: string
         statement_timeout: string
       }>({
         text: `
@@ -136,7 +122,8 @@ describe('Pg database foundation', () => {
             current_setting('request.path', true) as request_path,
             current_setting('storage.operation', true) as storage_operation,
             current_setting('storage.allow_delete_query', true) as allow_delete,
-            current_setting('statement_timeout', true) as statement_timeout
+            current_setting('search_path') as search_path,
+            current_setting('statement_timeout') as statement_timeout
         `,
       })
 
@@ -147,6 +134,7 @@ describe('Pg database foundation', () => {
           request_path: '/pg-foundation',
           storage_operation: 'pg-foundation-test',
           allow_delete: 'true',
+          search_path: searchPath.join(','),
           statement_timeout: '1234ms',
         })
       )
@@ -156,7 +144,7 @@ describe('Pg database foundation', () => {
       await transaction.rollback()
       throw e
     } finally {
-      await pool.destroy()
+      await pool.dispose('destroy')
     }
   })
 
@@ -181,7 +169,7 @@ describe('Pg database foundation', () => {
         clearTimeout(abortTimeout)
       }
     } finally {
-      await pool.destroy()
+      await pool.dispose('destroy')
     }
   })
 
@@ -201,7 +189,7 @@ describe('Pg database foundation', () => {
         message: 'Query was aborted',
       })
     } finally {
-      await pool.destroy()
+      await pool.dispose('destroy')
     }
   })
 
@@ -212,8 +200,8 @@ describe('Pg database foundation', () => {
       isExternalPool: false,
     })
 
-    const first = await PgTenantConnection.create(settings)
-    const second = await PgTenantConnection.create(settings)
+    const first = PgTenantConnection.create(settings)
+    const second = PgTenantConnection.create(settings)
 
     expect(second.pool).toBe(first.pool)
 
@@ -233,15 +221,15 @@ describe('Pg database foundation', () => {
       isExternalPool: true,
     })
 
-    const first = await PgTenantConnection.create(settings)
-    const second = await PgTenantConnection.create(settings)
+    const first = PgTenantConnection.create(settings)
+    const second = PgTenantConnection.create(settings)
 
     expect(second.pool).toBe(first.pool)
 
     await first.pool.acquire().query('SELECT 1')
     expect(first.pool.getPoolStats()).not.toBeNull()
 
-    await first.dispose()
+    first.dispose()
     expect(first.pool.getPoolStats()).not.toBeNull()
     await expect(first.query('SELECT 1')).rejects.toThrow(
       'Cannot use a disposed PgTenantConnection'
@@ -249,7 +237,7 @@ describe('Pg database foundation', () => {
 
     // The shared pool stays usable for connections that were not disposed.
     await second.pool.acquire().query('SELECT 1')
-    await second.dispose()
+    second.dispose()
     await PgTenantConnection.poolManager.destroy('pg-foundation-external-pool')
   })
 
@@ -266,7 +254,44 @@ describe('Pg database foundation', () => {
       const result = await connection.pool.acquire().query<{ n: number }>('SELECT 1 AS n')
       expect(result.rows[0].n).toBe(1)
     } finally {
-      await connection.dispose()
+      connection.dispose()
+    }
+  })
+
+  it('reuses the single-tenant pool after disposing a request-scoped connection', async () => {
+    expect(getConfig().isMultitenant).toBe(false)
+
+    const superUser = await getServiceKeyUser(tenantId)
+    const createRequestConnection = () =>
+      getPgPostgresConnection({
+        tenantId,
+        host: 'localhost',
+        user: superUser,
+        superUser,
+      })
+
+    const first = await createRequestConnection()
+    await first.query('SELECT 1')
+    expect(first.pool.getPoolStats()).toEqual({ total: 1, used: 0 })
+
+    first.dispose()
+    expect(first.pool.getPoolStats()).toEqual({ total: 1, used: 0 })
+
+    const second = await createRequestConnection()
+
+    try {
+      expect(second).not.toBe(first)
+      expect(second.pool).toBe(first.pool)
+      expect(second.pool.getPoolStats()).toEqual({ total: 1, used: 0 })
+      await expect(first.query('SELECT 1')).rejects.toThrow(
+        'Cannot use a disposed PgTenantConnection'
+      )
+      await expect(second.query<{ n: number }>('SELECT 2 AS n')).resolves.toMatchObject({
+        rows: [{ n: 2 }],
+      })
+      expect(second.pool.getPoolStats()).toEqual({ total: 1, used: 0 })
+    } finally {
+      second.dispose()
     }
   })
 })

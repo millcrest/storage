@@ -29,7 +29,7 @@ const PutObjectInput = {
       'x-amz-content-sha256': { type: 'string' },
       'x-amz-date': { type: 'string' },
       'content-type': { type: 'string' },
-      'content-length': { type: 'integer' },
+      'content-length': { type: 'integer', finite: true },
       'cache-control': { type: 'string' },
       'content-disposition': { type: 'string' },
       'content-encoding': { type: 'string' },
@@ -124,7 +124,8 @@ export default function PutObject(s3Router: S3Router) {
             uploadRequest.mimeType,
             uploadRequest.cacheControl,
             ctx.signals.body,
-            uploadRequest.contentLength
+            uploadRequest.contentLength,
+            uploadRequest.contentEncoding
           )
 
           return {
@@ -219,8 +220,13 @@ export default function PutObject(s3Router: S3Router) {
       const expiresField = fieldsObject.expires
 
       const maxFileSize = await getStandardMaxFileSizeLimit(ctx.tenantId, bucket.file_size_limit)
+      const sizeRange = ctx.req.postPolicyContentLengthRange
+      const byteLimit = new ByteLimitTransformStream(
+        Math.min(maxFileSize, sizeRange?.max ?? maxFileSize),
+        sizeRange?.min
+      )
 
-      return pipeline(file.file, new ByteLimitTransformStream(maxFileSize), async (fileStream) => {
+      return pipeline(file.file, byteLimit, async (fileStream) => {
         return s3Protocol.putObject(
           {
             Body: fileStream as stream.Readable,

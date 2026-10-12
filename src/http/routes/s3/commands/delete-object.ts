@@ -14,7 +14,12 @@ const DeleteObjectInput = {
     },
     required: ['Bucket', '*'],
   },
-  Querystring: {},
+  Querystring: {
+    type: 'object',
+    properties: {
+      versionId: { type: 'string' },
+    },
+  },
 } as const
 
 const DeleteObjectsInput = {
@@ -39,10 +44,12 @@ const DeleteObjectsInput = {
               type: 'object',
               properties: {
                 Key: { type: 'string' },
+                VersionId: { type: 'string' },
               },
               required: ['Key'],
             },
           },
+          Quiet: { type: 'boolean' },
         },
         required: ['Object'],
       },
@@ -74,6 +81,7 @@ export default function DeleteObject(s3Router: S3Router) {
         Bucket: req.Params.Bucket,
         Delete: {
           Objects: req.Body.Delete.Object,
+          Quiet: req.Body.Delete.Quiet,
         },
       })
     }
@@ -89,6 +97,7 @@ export default function DeleteObject(s3Router: S3Router) {
       return s3Protocol.deleteObject({
         Bucket: req.Params.Bucket,
         Key: req.Params['*'],
+        VersionId: req.Querystring?.versionId,
       })
     }
   )

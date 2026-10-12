@@ -1,8 +1,7 @@
 import { tenantHasFeature } from '@internal/database'
-import { tenantHasMigrations } from '@internal/database/migrations'
 import { ERRORS, StorageBackendError } from '@internal/errors'
 import { logger, logSchema } from '@internal/monitoring'
-import { BucketCreatedEvent, BucketDeleted } from '@storage/events'
+import { BucketCreatedEvent, BucketDeleted, PurgeCdnCache } from '@storage/events'
 import { StorageObjectLocator } from '@storage/locator'
 import { InfoRenderer } from '@storage/renderer/info'
 import { getConfig } from '../config'
@@ -18,8 +17,15 @@ import {
 } from './limits'
 import { ObjectStorage } from './object'
 import { AssetRenderer, HeadRenderer, ImageRenderer } from './renderer'
+import type { BucketLifecycleConfiguration } from './schemas'
+import { normalizeAllowedMimeTypes } from './validators/mime-type'
+import { assertVersioningEnabled } from './versioning/guards'
 
 const { emptyBucketMax } = getConfig()
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected renderer type: ${String(value)}`)
+}
 
 /**
  * Storage
@@ -56,14 +62,18 @@ export class Storage {
    * @param type
    */
   renderer(type: 'asset' | 'head' | 'image' | 'info') {
-    const renderers = {
-      asset: () => new AssetRenderer(this.backend),
-      head: () => new HeadRenderer(),
-      image: () => new ImageRenderer(this.backend),
-      info: () => new InfoRenderer(),
+    switch (type) {
+      case 'asset':
+        return new AssetRenderer(this.backend)
+      case 'head':
+        return new HeadRenderer()
+      case 'image':
+        return new ImageRenderer(this.backend)
+      case 'info':
+        return new InfoRenderer()
+      default:
+        return assertNever(type)
     }
-
-    return renderers[type]()
   }
 
   /**
@@ -74,6 +84,20 @@ export class Storage {
    */
   findBucket(id: string, columns = 'id', filters?: FindBucketFilters) {
     return this.db.findBucketById(id, columns, filters)
+  }
+
+  async getBucketLifecycle(bucketId: string) {
+    const bucket = await this.db.findLifecycleBucket(bucketId)
+    return bucket.lifecycle_configuration
+  }
+
+  async putBucketLifecycle(id: string, config: BucketLifecycleConfiguration) {
+    const bucket = await this.db.putLifecycleConfiguration(id, config)
+    return bucket.lifecycle_configuration
+  }
+
+  async deleteBucketLifecycle(bucketId: string) {
+    await this.db.deleteLifecycleConfiguration(bucketId)
   }
 
   /**
@@ -111,9 +135,13 @@ export class Storage {
     mustBeValidBucketName(data.name)
     mustBeNotReservedBucketName(data.name)
 
+    if (data.versioning_status !== undefined && data.versioning_status !== 'DISABLED') {
+      await assertVersioningEnabled(this, data.id ?? data.name, data.type ?? 'STANDARD')
+    }
+
     if (data.type === 'ANALYTICS') {
       if (
-        !(await tenantHasMigrations(this.db.tenantId, 'iceberg-catalog-flag-on-buckets')) ||
+        !(await this.db.hasMigration('iceberg-catalog-flag-on-buckets')) ||
         !(await tenantHasFeature(this.db.tenantId, 'icebergCatalog'))
       ) {
         throw ERRORS.FeatureNotEnabled(
@@ -141,10 +169,9 @@ export class Storage {
       bucketData.file_size_limit = null
     }
 
-    if (data.allowedMimeTypes) {
-      this.validateMimeType(data.allowedMimeTypes)
-    }
     bucketData.allowed_mime_types = data.allowedMimeTypes
+      ? normalizeAllowedMimeTypes(data.allowedMimeTypes)
+      : data.allowedMimeTypes
 
     return this.db.createBucket(bucketData)
   }
@@ -205,6 +232,11 @@ export class Storage {
       throw ERRORS.NoContentProvided()
     }
 
+    if (data.versioning_status !== undefined && data.versioning_status !== 'DISABLED') {
+      const bucket = await this.findBucket(id, 'type')
+      await assertVersioningEnabled(this, id, bucket.type ?? 'STANDARD')
+    }
+
     const bucketData = { ...data } as Parameters<Database['updateBucket']>[1] & {
       fileSizeLimit?: unknown
       allowedMimeTypes?: unknown
@@ -220,12 +252,16 @@ export class Storage {
       bucketData.file_size_limit = null
     }
 
-    if (data.allowedMimeTypes) {
-      this.validateMimeType(data.allowedMimeTypes)
-    }
     bucketData.allowed_mime_types = data.allowedMimeTypes
+      ? normalizeAllowedMimeTypes(data.allowedMimeTypes)
+      : data.allowedMimeTypes
 
-    return this.db.updateBucket(id, bucketData)
+    const result = await this.db.updateBucket(id, bucketData)
+
+    // purge cache if a bucket is changing from public to private
+    if (data.public === false && result?.previous.public === true) {
+      await this.purgeBucketCache(id)
+    }
   }
 
   /**
@@ -233,7 +269,7 @@ export class Storage {
    * @param id
    */
   async deleteBucket(id: string) {
-    return this.db.withTransaction(async (db) => {
+    const deleted = await this.db.withTransaction(async (db) => {
       await db.asSuperUser().findBucketById(id, 'id', {
         forUpdate: true,
       })
@@ -252,11 +288,39 @@ export class Storage {
 
       return deleted
     })
+
+    await this.purgeBucketCache(id)
+
+    return deleted
+  }
+
+  private async purgeBucketCache(bucketId: string) {
+    try {
+      await PurgeCdnCache.send({
+        tenant: {
+          ref: this.db.tenantId,
+          host: this.db.tenantHost,
+        },
+        sbReqId: this.db.sbReqId,
+        purgeOptions: {
+          type: 'bucket',
+          bucket: bucketId,
+          tenant: this.db.tenantId,
+        },
+      })
+    } catch (error) {
+      logSchema.error(logger, 'Failed to purge bucket cache', {
+        type: 'cdn',
+        project: this.db.tenantId,
+        sbReqId: this.db.sbReqId,
+        error,
+      })
+    }
   }
 
   async deleteIcebergBucket(name: string) {
     if (
-      !(await tenantHasMigrations(this.db.tenantId, 'iceberg-catalog-flag-on-buckets')) ||
+      !(await this.db.hasMigration('iceberg-catalog-flag-on-buckets')) ||
       !(await tenantHasFeature(this.db.tenantId, 'icebergCatalog'))
     ) {
       throw ERRORS.FeatureNotEnabled(
@@ -294,20 +358,11 @@ export class Storage {
       )
     }
 
-    const objects = await this.db.listObjects(bucketId, 'id, name', 1, before)
+    const objects = await this.db.listObjects(bucketId, 'id', 1, before)
     if (!objects || objects.length < 1) {
       // the bucket is already empty
       return
     }
-
-    // ensure delete permissions
-    await this.db.testPermission(async (db) => {
-      const deleted = await db.deleteObject(bucketId, objects[0].name)
-
-      if (!deleted) {
-        throw ERRORS.NoSuchKey(objects[0].name)
-      }
-    })
 
     // use queue to recursively delete all objects created before the specified time
     await ObjectAdminDeleteAllBefore.send({
@@ -317,21 +372,6 @@ export class Storage {
       reqId: this.db.reqId,
       sbReqId: this.db.sbReqId,
     })
-  }
-
-  validateMimeType(mimeType: string[]) {
-    for (const type of mimeType) {
-      if (type.length > 1000) {
-        throw ERRORS.InvalidMimeType(type)
-      }
-
-      if (
-        !type.match(/^([a-zA-Z0-9\-+.]+)\/([a-zA-Z0-9\-+.]+)(;\s*charset=[a-zA-Z0-9\-]+)?$|\*$/)
-      ) {
-        throw ERRORS.InvalidMimeType(type)
-      }
-    }
-    return true
   }
 
   healthcheck() {

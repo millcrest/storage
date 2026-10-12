@@ -1,5 +1,5 @@
 import { ERRORS } from '@internal/errors'
-import { S3ProtocolHandler } from '@storage/protocols/s3/s3-handler'
+import { assertPartsAscending, S3ProtocolHandler } from '@storage/protocols/s3/s3-handler'
 import { ROUTE_OPERATIONS } from '../../operations'
 import { S3Router } from '../router'
 
@@ -26,7 +26,6 @@ const CompletedMultipartUpload = {
       authorization: { type: 'string' },
     },
     additionalProperties: true,
-    required: ['authorization'],
   },
   Body: {
     nullable: true,
@@ -40,7 +39,7 @@ const CompletedMultipartUpload = {
             items: {
               type: 'object',
               properties: {
-                PartNumber: { type: 'integer' },
+                PartNumber: { type: 'integer', minimum: 1, maximum: 10000, finite: true },
                 ETag: { type: 'string' },
               },
               required: ['PartNumber', 'ETag'],
@@ -67,12 +66,15 @@ export default function CompleteMultipartUpload(s3Router: S3Router) {
         throw ERRORS.InvalidParameter('internalIcebergBucketName')
       }
 
+      const parts = req.Body?.CompleteMultipartUpload?.Part || []
+      assertPartsAscending(parts)
+
       const resp = await ctx.req.storage.backend.completeMultipartUpload(
         icebergBucketName,
         req.Params['*'],
         req.Querystring.uploadId,
         '',
-        req.Body?.CompleteMultipartUpload?.Part || []
+        parts
       )
 
       return {

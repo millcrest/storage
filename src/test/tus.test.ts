@@ -1,6 +1,9 @@
+import { once } from 'node:events'
 import { mkdtemp } from 'node:fs/promises'
+import { request as httpRequest, type IncomingMessage } from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { text } from 'node:stream/consumers'
 import {
   CreateBucketCommand,
   HeadObjectCommand,
@@ -19,7 +22,7 @@ import type { StorageBackendAdapter } from '../storage/backend'
 import type { StoragePgDB as StoragePgDBType } from '../storage/database/pg'
 import type { TenantLocation as TenantLocationType } from '../storage/locator'
 import type { Storage as StorageType } from '../storage/storage'
-import { checkBucketExists } from './common'
+import { checkBucketExists } from './utils/storage'
 
 const assetPath = path.resolve(__dirname, 'assets', 'sadcat.jpg')
 const assetSize = fs.statSync(assetPath).size
@@ -56,6 +59,34 @@ function encodeTusMetadata(metadata: Record<string, string>): string {
   return Object.entries(metadata)
     .map(([key, value]) => `${key} ${Buffer.from(value).toString('base64')}`)
     .join(',')
+}
+
+async function postRawTusUpload(
+  baseUrl: string,
+  target: string,
+  metadata: Record<string, string>,
+  signature?: string
+) {
+  const { hostname, port } = new URL(baseUrl)
+  const request = httpRequest({
+    hostname,
+    port,
+    method: 'POST',
+    path: target,
+    headers: {
+      'tus-resumable': '1.0.0',
+      'upload-length': '1',
+      'content-type': 'application/offset+octet-stream',
+      'upload-metadata': encodeTusMetadata(metadata),
+      ...(signature ? { 'x-signature': signature } : {}),
+    },
+  }).end('x')
+  const [response]: IncomingMessage[] = await once(request, 'response')
+  return {
+    status: response.statusCode,
+    body: await text(response),
+    location: response.headers.location,
+  }
 }
 
 function decodeTusUploadId(location: string): string {
@@ -252,7 +283,7 @@ describe.each([
 
   afterEach(async () => {
     vi.useRealTimers()
-    await connection?.dispose()
+    connection?.dispose()
   })
 
   it('advertises TUS protocol headers on OPTIONS preflight', async () => {
@@ -312,9 +343,12 @@ describe.each([
 
     const dbAsset = await storage.from(bucket.id).findObject(objectName, '*')
     expect(dbAsset).toEqual({
+      archived_at: null,
       bucket_id: bucket.id,
       created_at: expect.any(Date),
       id: expect.any(String),
+      is_delete_marker: false,
+      is_versioned: false,
       last_accessed_at: expect.any(Date),
       metadata: {
         cacheControl: 'max-age=3600',
@@ -407,9 +441,12 @@ describe.each([
 
     const dbAsset = await storage.from(bucket.id).findObject(objectName, '*')
     expect(dbAsset).toEqual({
+      archived_at: null,
       bucket_id: bucket.id,
       created_at: expect.any(Date),
       id: expect.any(String),
+      is_delete_marker: false,
+      is_versioned: false,
       last_accessed_at: expect.any(Date),
       metadata: {
         cacheControl: 'max-age=3600',
@@ -562,9 +599,12 @@ describe.each([
 
     const dbAsset = await storage.from(bucket.id).findObject(objectName, '*')
     expect(dbAsset).toEqual({
+      archived_at: null,
       bucket_id: bucket.id,
       created_at: expect.any(Date),
       id: expect.any(String),
+      is_delete_marker: false,
+      is_versioned: false,
       last_accessed_at: expect.any(Date),
       metadata: {
         cacheControl: 'max-age=3600',
@@ -832,9 +872,12 @@ describe.each([
 
       const dbAsset = await storage.from(bucket.id).findObject(objectName, '*')
       expect(dbAsset).toEqual({
+        archived_at: null,
         bucket_id: bucket.id,
         created_at: expect.any(Date),
         id: expect.any(String),
+        is_delete_marker: false,
+        is_versioned: false,
         last_accessed_at: expect.any(Date),
         metadata: {
           cacheControl: 'max-age=3600',
@@ -901,9 +944,12 @@ describe.each([
 
       const dbAsset = await storage.from(bucket.id).findObject(objectName, '*')
       expect(dbAsset).toEqual({
+        archived_at: null,
         bucket_id: bucket.id,
         created_at: expect.any(Date),
         id: expect.any(String),
+        is_delete_marker: false,
+        is_versioned: false,
         last_accessed_at: expect.any(Date),
         metadata: {
           cacheControl: 'max-age=3600',
@@ -1067,6 +1113,43 @@ describe.each([
         expect(response.getStatus()).toEqual(400)
       }
     })
+
+    it('requires a signature for every request target routed to the signed upload scope', async () => {
+      await storage.createBucket({ id: bucketName, name: bucketName, public: false })
+
+      const { tusPath } = context.config
+      const objectName = 'private.txt'
+      const metadata = { bucketName, objectName, contentType: 'text/plain' }
+      const targets = [
+        `${tusPath}/sign/`,
+        `${tusPath}/%73ign/`,
+        `${tusPath}/sig%6E/`,
+        '/upload/%72esumable/%73ign/',
+        `${context.baseUrl}${tusPath}/sign/`,
+      ]
+      const unsigned = await Promise.all([
+        ...targets.map((target) => postRawTusUpload(context.baseUrl, target, metadata)),
+        postRawTusUpload(context.baseUrl, targets[0], { ...metadata, bucketName: randomUUID() }),
+      ])
+      expect(unsigned.map(({ status, body }) => ({ status, body }))).toEqual(
+        unsigned.map(() => ({ status: 400, body: 'Missing x-signature header' }))
+      )
+      expect(
+        await db.findObject(bucketName, objectName, 'id', { dontErrorOnEmpty: true })
+      ).toBeUndefined()
+
+      const { token } = await storage
+        .from(bucketName)
+        .signUploadObjectUrl(objectName, `${bucketName}/${objectName}`, 3600, undefined, {
+          upsert: true,
+        })
+      for (const target of [targets[1], targets[4]]) {
+        const signed = await postRawTusUpload(context.baseUrl, target, metadata, token)
+        expect(signed.status).toBe(201)
+        expect(signed.location).toContain(`${tusPath}/sign/`)
+      }
+      expect(await db.findObject(bucketName, objectName, 'id')).toBeDefined()
+    })
   })
 })
 
@@ -1112,7 +1195,7 @@ describe('File-backed TUS — path traversal', () => {
   })
 
   afterEach(async () => {
-    await connection.dispose()
+    connection.dispose()
   })
 
   it('rejects traversal object names and does not write outside the file-backed TUS root', async () => {
@@ -1149,5 +1232,99 @@ describe('File-backed TUS — path traversal', () => {
     expect(createResponse.headers.get('location')).toBeNull()
     expect(await pathExists(bucketRoot)).toBe(false)
     expect(await pathExists(escapedPath)).toBe(false)
+  })
+})
+
+describe('File-backed TUS — TUS_USE_FILE_VERSION_SEPARATOR', () => {
+  let context: TusTestContext
+  let connection: Awaited<ReturnType<typeof getPostgresConnection>>
+  let fileBackendPath: string
+  let storage: StorageType
+
+  beforeAll(async () => {
+    process.env.TUS_USE_FILE_VERSION_SEPARATOR = 'true'
+    fileBackendPath = await mkdtemp(path.join(tmpdir(), 'storage-tus-file-separator-'))
+    context = await createTusTestContext('file', { fileBackendPath })
+  })
+
+  afterAll(async () => {
+    await context?.server?.close()
+    delete process.env.TUS_USE_FILE_VERSION_SEPARATOR
+    vi.resetModules()
+    if (fileBackendPath) {
+      await removePath(fileBackendPath)
+    }
+  })
+
+  beforeEach(async () => {
+    const superUser = await getServiceKeyUser(context.config.tenantId)
+    connection = await getPostgresConnection({
+      tenantId: context.config.tenantId,
+      user: superUser,
+      superUser,
+      host: 'localhost',
+      disableHostCheck: true,
+    })
+
+    const db = new context.StoragePgDB(connection, {
+      tenantId: context.config.tenantId,
+      host: 'localhost',
+    })
+
+    storage = new context.Storage(
+      context.backend,
+      db,
+      new context.TenantLocation(context.config.storageS3Bucket)
+    )
+  })
+
+  afterEach(async () => {
+    connection.dispose()
+  })
+
+  it('uploads an object inside a folder', async () => {
+    const bucketName = randomUUID()
+    const objectName = `folder/sub/${randomUUID()}-cat.jpeg`
+
+    await storage.createBucket({
+      id: bucketName,
+      name: bucketName,
+      public: true,
+    })
+
+    const authorization = `Bearer ${await context.config.serviceKeyAsync}`
+
+    await new Promise((resolve, reject) => {
+      const upload = new tus.Upload(openAssetStream(), {
+        endpoint: `${context.baseUrl}${context.config.tusPath}`,
+        onShouldRetry: () => false,
+        uploadDataDuringCreation: false,
+        headers: {
+          authorization,
+          'x-upsert': 'true',
+        },
+        metadata: {
+          bucketName,
+          objectName,
+          contentType: 'image/jpeg',
+        },
+        onError: reject,
+        onSuccess: () => resolve(true),
+      })
+
+      upload.start()
+    })
+
+    const dbAsset = await storage.from(bucketName).findObject(objectName, '*')
+    expect(dbAsset.name).toBe(objectName)
+    expect(dbAsset.metadata?.size).toBe(assetSize)
+
+    if (!dbAsset.version) {
+      throw new Error('expected uploaded object version')
+    }
+
+    const storedObjectPath = getStoredObjectPath(context, bucketName, objectName, dbAsset.version)
+    expect(storedObjectPath.endsWith(`-$v-${dbAsset.version}`)).toBe(true)
+    expect(await pathExists(storedObjectPath)).toBe(true)
   })
 })

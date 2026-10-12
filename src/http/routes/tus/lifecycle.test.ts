@@ -1,5 +1,3 @@
-import { EventEmitter } from 'node:events'
-import type { ServerResponse } from 'node:http'
 import { logSchema } from '@internal/monitoring'
 import { Uploader } from '@storage/uploader'
 import type { DataStore } from '@tus/server'
@@ -16,21 +14,16 @@ function createRawTusRequest({
   method?: string
   sbReqId?: string
 } = {}) {
-  const response = new EventEmitter()
   const reqLog = {
     error: vi.fn(),
     warn: vi.fn(),
   }
-  const dispose = vi.fn().mockResolvedValue(undefined)
 
   const request = {
     headers,
     log: reqLog,
     method,
     upload: {
-      db: {
-        dispose,
-      },
       isUpsert: false,
       owner: 'owner-123',
       storage: {
@@ -46,49 +39,20 @@ function createRawTusRequest({
   } as unknown as MultiPartRequest
 
   return {
-    dispose,
     rawReq: {
       method,
-      node: {
-        req: request,
-        res: response as unknown as ServerResponse,
+      runtime: {
+        name: 'node',
+        node: {
+          req: request,
+        },
       },
     } as unknown as Parameters<typeof onIncomingRequest>[0],
     reqLog,
-    response,
   }
 }
 
 describe('tus lifecycle logging', () => {
-  afterEach(() => {
-    vi.restoreAllMocks()
-  })
-
-  it('logs db dispose failures with sbReqId through logSchema', async () => {
-    const error = new Error('dispose failed')
-    const errorSpy = vi.spyOn(logSchema, 'error').mockImplementation(() => undefined)
-    const { dispose, rawReq, reqLog, response } = createRawTusRequest({
-      method: 'HEAD',
-    })
-
-    dispose.mockRejectedValueOnce(error)
-
-    await onIncomingRequest(rawReq, uploadId, {} as DataStore)
-
-    response.emit('finish')
-    await new Promise((resolve) => setImmediate(resolve))
-
-    expect(errorSpy).toHaveBeenCalledWith(reqLog, 'Error disposing db connection', {
-      type: 'db-connection',
-      tenantId: 'tenant-123',
-      project: 'tenant-123',
-      reqId: 'req-123',
-      error,
-      sbReqId: 'sb-req-123',
-    })
-    expect(reqLog.error).not.toHaveBeenCalled()
-  })
-
   it('logs upload metadata parse failures with sbReqId through logSchema', async () => {
     const warningSpy = vi.spyOn(logSchema, 'warning').mockImplementation(() => undefined)
     const { rawReq, reqLog } = createRawTusRequest({
@@ -131,5 +95,34 @@ describe('tus lifecycle logging', () => {
       sbReqId: 'sb-req-123',
     })
     expect(reqLog.warn).not.toHaveBeenCalled()
+  })
+
+  it('passes the validated content encoding to canUpload on create', async () => {
+    const canUploadSpy = vi.spyOn(Uploader.prototype, 'canUpload').mockResolvedValue(undefined)
+    const { rawReq } = createRawTusRequest({
+      headers: {
+        'upload-metadata': `contentEncoding ${Buffer.from('gzip, aws-chunked').toString('base64')}`,
+      },
+    })
+
+    await onIncomingRequest(rawReq, uploadId, {} as DataStore)
+
+    expect(canUploadSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ metadata: expect.objectContaining({ contentEncoding: 'gzip' }) })
+    )
+  })
+
+  it('passes the stored content encoding to canUpload on patch', async () => {
+    const canUploadSpy = vi.spyOn(Uploader.prototype, 'canUpload').mockResolvedValue(undefined)
+    const { rawReq } = createRawTusRequest({ method: 'PATCH' })
+    const datastore = {
+      getUpload: vi.fn().mockResolvedValue({ metadata: { contentEncoding: 'br' }, size: 3 }),
+    } as unknown as DataStore
+
+    await onIncomingRequest(rawReq, uploadId, datastore)
+
+    expect(canUploadSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ metadata: expect.objectContaining({ contentEncoding: 'br' }) })
+    )
   })
 })

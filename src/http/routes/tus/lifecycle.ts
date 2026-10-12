@@ -1,10 +1,12 @@
 import { SIGNED_URL_SCOPE_UPLOAD } from '@internal/auth'
-import { PgTenantConnection } from '@internal/database'
+import type { TenantConnection } from '@internal/database'
 import { ERRORS, isRenderableError } from '@internal/errors'
 import { logSchema, RequestLogContext } from '@internal/monitoring'
 import { UploadId } from '@storage/protocols/tus'
 import { Storage } from '@storage/storage'
-import { Uploader, validateMimeType } from '@storage/uploader'
+import { Uploader } from '@storage/uploader'
+import { validateContentEncoding } from '@storage/validators/content-encoding'
+import { validateMimeType } from '@storage/validators/mime-type'
 import { DataStore, Metadata, Upload } from '@tus/server'
 import { randomUUID } from 'crypto'
 import type { FastifyBaseLogger } from 'fastify'
@@ -24,7 +26,7 @@ export const SIGNED_URL_SUFFIX = '/sign'
  * @throws {Error} If the request object is missing
  */
 function getNodeRequest(rawReq: Request): MultiPartRequest {
-  const req = rawReq.node?.req as MultiPartRequest
+  const req = rawReq.runtime?.node?.req as MultiPartRequest
 
   if (!req) {
     throw ERRORS.InternalError(undefined, 'Request object is missing')
@@ -32,15 +34,18 @@ function getNodeRequest(rawReq: Request): MultiPartRequest {
 
   return req
 }
+
 export type MultiPartRequest = http.IncomingMessage & {
   executionError?: Error
   log: FastifyBaseLogger
   upload: RequestLogContext & {
     tenantId: string
     storage: Storage
-    db: PgTenantConnection
+    db: TenantConnection
     owner?: string
     isUpsert: boolean
+    isSigned: boolean
+    signatureVerified?: boolean
     resources?: string[]
   }
 }
@@ -55,47 +60,40 @@ function getTusError(error: { render(): { statusCode: string; message: string } 
   }
 }
 
+export async function verifySignedUploadRequest(req: MultiPartRequest, uploadID: UploadId) {
+  if (!req.upload.isSigned) {
+    return false
+  }
+
+  if (req.upload.signatureVerified) {
+    return true
+  }
+
+  const signature = req.headers['x-signature']
+  if (!signature || typeof signature !== 'string') {
+    throw ERRORS.InvalidSignature('Missing x-signature header')
+  }
+
+  const payload = await req.upload.storage
+    .from(uploadID.bucket)
+    .verifyObjectSignature(signature, uploadID.objectName, SIGNED_URL_SCOPE_UPLOAD)
+
+  req.upload.owner = payload.owner
+  req.upload.isUpsert = payload.upsert
+  req.upload.signatureVerified = true
+  return true
+}
+
 /**
  * Runs on every TUS incoming request
  */
 export async function onIncomingRequest(rawReq: Request, id: string, datastore: DataStore) {
   const req = getNodeRequest(rawReq)
-  const res = rawReq.node?.res as http.ServerResponse
-
-  if (!res) {
-    throw ERRORS.InternalError(undefined, 'Response object is missing')
-  }
-
-  res.on('finish', () => {
-    req.upload.db.dispose().catch((e) => {
-      logSchema.error(req.log, 'Error disposing db connection', {
-        type: 'db-connection',
-        tenantId: req.upload.tenantId,
-        project: req.upload.tenantId,
-        reqId: req.upload.reqId,
-        sbReqId: req.upload.sbReqId,
-        error: e,
-      })
-    })
-  })
-
   const uploadID = UploadId.fromString(id)
 
   req.upload.resources = [`${uploadID.bucket}/${uploadID.objectName}`]
 
-  // Handle signed url requests
-  if (req.url?.startsWith(`/upload/resumable/sign`)) {
-    const signature = req.headers['x-signature']
-    if (!signature || (signature && typeof signature !== 'string')) {
-      throw ERRORS.InvalidSignature('Missing x-signature header')
-    }
-
-    const payload = await req.upload.storage
-      .from(uploadID.bucket)
-      .verifyObjectSignature(signature, uploadID.objectName, SIGNED_URL_SCOPE_UPLOAD)
-
-    req.upload.owner = payload.owner
-    req.upload.isUpsert = payload.upsert
+  if (await verifySignedUploadRequest(req, uploadID)) {
     return
   }
 
@@ -113,6 +111,7 @@ export async function onIncomingRequest(rawReq: Request, id: string, datastore: 
   )
 
   let contentType: string | undefined
+  let contentEncoding: string | undefined
   let contentLength: number | undefined
   let rawMetadata: string | null | undefined
 
@@ -122,6 +121,7 @@ export async function onIncomingRequest(rawReq: Request, id: string, datastore: 
       try {
         const parsedMetadata = Metadata.parse(uploadMetadataHeader)
         contentType = parsedMetadata?.contentType ?? undefined
+        contentEncoding = parsedMetadata?.contentEncoding ?? undefined
         rawMetadata = parsedMetadata?.metadata
       } catch (e) {
         logSchema.warning(req.log, 'Failed to parse upload metadata', {
@@ -140,9 +140,11 @@ export async function onIncomingRequest(rawReq: Request, id: string, datastore: 
     }
     const uploadLength = req.headers['upload-length']
     contentLength = uploadLength ? Number(uploadLength) : undefined
+    contentEncoding = validateContentEncoding(contentEncoding)
   } else {
     const upload = await datastore.getUpload(id)
     contentType = upload.metadata?.contentType ?? undefined
+    contentEncoding = upload.metadata?.contentEncoding ?? undefined
     contentLength = upload.size ?? undefined
     rawMetadata = upload.metadata?.metadata
   }
@@ -172,6 +174,7 @@ export async function onIncomingRequest(rawReq: Request, id: string, datastore: 
     metadata: {
       mimetype: contentType,
       contentLength,
+      contentEncoding,
     },
   })
 }
@@ -206,8 +209,7 @@ export function generateUrl(
     basePath = forwardedPath.replace(/\/+$/, '') + path
   }
 
-  const isSigned = req.url?.endsWith(SIGNED_URL_SUFFIX)
-  const fullPath = isSigned ? `${basePath}${SIGNED_URL_SUFFIX}` : basePath
+  const fullPath = req.upload.isSigned ? `${basePath}${SIGNED_URL_SUFFIX}` : basePath
 
   if (!parsedPublicUrl && req.headers['x-forwarded-host']) {
     const port = req.headers['x-forwarded-port']
@@ -295,8 +297,15 @@ export async function onCreate(
     metadata.cacheControl = 'no-cache'
   }
 
-  if (metadata?.contentType && bucket.allowed_mime_types) {
+  if (metadata?.contentType && bucket.allowed_mime_types?.length) {
     validateMimeType(metadata.contentType, bucket.allowed_mime_types)
+  }
+
+  const contentEncoding = validateContentEncoding(metadata.contentEncoding ?? undefined)
+  if (contentEncoding) {
+    metadata.contentEncoding = contentEncoding
+  } else {
+    delete metadata.contentEncoding
   }
 
   return { metadata }

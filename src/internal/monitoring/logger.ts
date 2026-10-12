@@ -84,17 +84,6 @@ export const baseLogger = pino({
     error(error) {
       return normalizeRawError(error, logLevel)
     },
-    reqMetadata(metadata?: Record<string, unknown>) {
-      if (!metadata) {
-        return undefined
-      }
-
-      try {
-        return JSON.stringify(metadata)
-      } catch {
-        // no-op
-      }
-    },
     // doRequestLog passes branded values from serializeRequestLog/serializeReplyLog,
     // so the common path is a passthrough. If Fastify's auto-logger ever emits raw
     // FastifyRequest/Reply values, fall back to the safe serializers.
@@ -102,7 +91,7 @@ export const baseLogger = pino({
     res: serializeReplyLogValue,
   },
   level: logLevel,
-  timestamp: pino.stdTimeFunctions.isoTime,
+  timestamp: pino.stdTimeFunctions.epochTime,
 })
 
 registerLogStringifiers(baseLogger)
@@ -149,9 +138,11 @@ export interface RequestLogContext {
 
 export interface RequestLog extends RequestLogContext {
   type: 'request'
+  traceId: string
+  spanId: string
   req: SerializedRequestLog
   res?: SerializedReplyLog
-  reqMetadata?: Record<string, unknown>
+  reqMetadata: string
   responseTime: number
   executionTime?: number
   error?: Error | unknown
@@ -263,6 +254,8 @@ const allowlistedHeaderKeys = new Map<string, string>(
     'content-type',
     'if-none-match',
     'if-modified-since',
+    'if-match',
+    'if-unmodified-since',
     'upload-metadata',
     'upload-length',
     'upload-offset',
