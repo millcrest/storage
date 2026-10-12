@@ -1,6 +1,6 @@
 import { JWT_CACHE_NAME } from '@internal/cache'
 import { ErrorCode } from '@internal/errors'
-import { cacheRequestsTotal } from '@internal/monitoring/metrics'
+import * as metrics from '@internal/monitoring/metrics'
 import * as crypto from 'crypto'
 import { SignJWT } from 'jose'
 import { vi } from 'vitest'
@@ -9,6 +9,10 @@ import {
   assertValidNumericJWTExpiration,
   generateHS512JWK,
   getMaxNumericJWTExpiration,
+  isDownloadScopedToken,
+  isUploadScopedToken,
+  SIGNED_URL_SCOPE_DOWNLOAD,
+  SIGNED_URL_SCOPE_UPLOAD,
   signJWT,
   verifyJWT,
   verifyJWTWithCache,
@@ -264,11 +268,11 @@ describe('JWT', () => {
       vi.useFakeTimers()
       vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'))
 
-      const addSpy = vi.spyOn(cacheRequestsTotal, 'add')
+      const recordSpy = vi.spyOn(metrics, 'recordCacheRequest')
       const secret = crypto.randomBytes(32).toString('base64url')
       const token = await signJWT({ sub: 'cached-user' }, secret, 2)
 
-      addSpy.mockClear()
+      recordSpy.mockClear()
 
       await expect(verifyJWTWithCache(token, secret)).resolves.toMatchObject({
         sub: 'cached-user',
@@ -277,9 +281,9 @@ describe('JWT', () => {
         sub: 'cached-user',
       })
 
-      expect(addSpy.mock.calls).toEqual([
-        [1, { cache: JWT_CACHE_NAME, outcome: 'miss' }],
-        [1, { cache: JWT_CACHE_NAME, outcome: 'hit' }],
+      expect(recordSpy.mock.calls).toEqual([
+        [JWT_CACHE_NAME, 'miss'],
+        [JWT_CACHE_NAME, 'hit'],
       ])
 
       vi.advanceTimersByTime(2200)
@@ -288,20 +292,20 @@ describe('JWT', () => {
     })
 
     test('it should not reuse cached JWT verifications when the secret changes', async () => {
-      const addSpy = vi.spyOn(cacheRequestsTotal, 'add')
+      const recordSpy = vi.spyOn(metrics, 'recordCacheRequest')
       const secret = crypto.randomBytes(32).toString('base64url')
       const token = await signJWT({ sub: 'cached-user' }, secret, 2)
 
-      addSpy.mockClear()
+      recordSpy.mockClear()
 
       await expect(verifyJWTWithCache(token, secret)).resolves.toMatchObject({
         sub: 'cached-user',
       })
       await expect(verifyJWTWithCache(token, 'definitely-the-wrong-secret')).rejects.toThrow()
 
-      expect(addSpy.mock.calls).toEqual([
-        [1, { cache: JWT_CACHE_NAME, outcome: 'miss' }],
-        [1, { cache: JWT_CACHE_NAME, outcome: 'miss' }],
+      expect(recordSpy.mock.calls).toEqual([
+        [JWT_CACHE_NAME, 'miss'],
+        [JWT_CACHE_NAME, 'miss'],
       ])
     })
 
@@ -359,13 +363,11 @@ describe('JWT', () => {
       }))
 
       try {
-        const { cacheRequestsTotal: isolatedCacheRequestsTotal } = await import(
-          '@internal/monitoring/metrics'
-        )
+        const isolatedMetrics = await import('@internal/monitoring/metrics')
         const { verifyJWTWithCache: isolatedVerifyJWTWithCache } = await import('./jwt')
-        const addSpy = vi.spyOn(isolatedCacheRequestsTotal, 'add')
+        const recordSpy = vi.spyOn(isolatedMetrics, 'recordCacheRequest')
 
-        addSpy.mockClear()
+        recordSpy.mockClear()
 
         await expect(isolatedVerifyJWTWithCache(token, secret)).resolves.toMatchObject({
           sub: 'cached-user',
@@ -381,15 +383,62 @@ describe('JWT', () => {
         })
 
         expect(jwtVerifyMock).toHaveBeenCalledTimes(2)
-        expect(addSpy.mock.calls).toEqual([
-          [1, { cache: JWT_CACHE_NAME, outcome: 'miss' }],
-          [1, { cache: JWT_CACHE_NAME, outcome: 'miss' }],
-          [1, { cache: JWT_CACHE_NAME, outcome: 'hit' }],
+        expect(recordSpy.mock.calls).toEqual([
+          [JWT_CACHE_NAME, 'miss'],
+          [JWT_CACHE_NAME, 'miss'],
+          [JWT_CACHE_NAME, 'hit'],
         ])
       } finally {
         vi.doUnmock('jose')
         vi.resetModules()
       }
+    })
+  })
+})
+
+describe('signed URL scope predicates', () => {
+  describe('isUploadScopedToken', () => {
+    it('accepts an explicit upload scope', () => {
+      expect(isUploadScopedToken({ scope: SIGNED_URL_SCOPE_UPLOAD })).toBe(true)
+    })
+
+    it('accepts a legacy upload token (no scope, with upsert)', () => {
+      expect(isUploadScopedToken({ upsert: false } as never)).toBe(true)
+      expect(isUploadScopedToken({ upsert: true } as never)).toBe(true)
+    })
+
+    it('rejects a legacy download-shaped token (no scope, no upsert)', () => {
+      expect(isUploadScopedToken({ url: 'b/o' } as never)).toBe(false)
+    })
+
+    it('rejects an explicit download scope', () => {
+      expect(isUploadScopedToken({ scope: SIGNED_URL_SCOPE_DOWNLOAD })).toBe(false)
+    })
+
+    it('rejects an unknown scope even when upsert is present', () => {
+      expect(isUploadScopedToken({ scope: 'something-else', upsert: true } as never)).toBe(false)
+    })
+  })
+
+  describe('isDownloadScopedToken', () => {
+    it('accepts an explicit download scope', () => {
+      expect(isDownloadScopedToken({ scope: SIGNED_URL_SCOPE_DOWNLOAD })).toBe(true)
+    })
+
+    it('accepts a legacy download token (no scope, no upsert)', () => {
+      expect(isDownloadScopedToken({ url: 'b/o' } as never)).toBe(true)
+    })
+
+    it('rejects a legacy upload-shaped token (no scope, with upsert)', () => {
+      expect(isDownloadScopedToken({ upsert: false } as never)).toBe(false)
+    })
+
+    it('rejects an explicit upload scope', () => {
+      expect(isDownloadScopedToken({ scope: SIGNED_URL_SCOPE_UPLOAD })).toBe(false)
+    })
+
+    it('rejects an unknown scope', () => {
+      expect(isDownloadScopedToken({ scope: 'something-else' } as never)).toBe(false)
     })
   })
 })

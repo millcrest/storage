@@ -6,9 +6,9 @@ import { Cluster } from '@internal/cluster/cluster'
 import { AsyncAbortController } from '@internal/concurrency'
 import {
   listenForTenantUpdate,
-  multitenantKnex,
+  multitenantPgExecutor,
+  PgTenantConnection,
   PubSub,
-  TenantConnection,
 } from '@internal/database'
 import {
   runMigrationsOnTenant,
@@ -16,8 +16,8 @@ import {
   startAsyncMigrations,
 } from '@internal/database/migrations'
 import { logger, logSchema } from '@internal/monitoring'
-import { Queue } from '@internal/queue'
-import { KnexShardStoreFactory, ShardCatalog } from '@internal/sharding'
+import { Queue, SYSTEM_TENANT } from '@internal/queue'
+import { PgShardStoreFactory, ShardCatalog } from '@internal/sharding'
 import { getGlobal } from '@platformatic/globals'
 import { registerWorkers } from '@storage/events'
 import { SyncCatalogIds } from '@storage/events/upgrades/sync-catalog-ids'
@@ -61,10 +61,32 @@ async function main() {
     isMultitenant,
     pgQueueEnable,
     dbMigrationFreezeAt,
+    vectorBucketProvider,
+    vectorDatabaseURL,
+    vectorEnabled,
+    vectorStoreMigrationsEnabled,
     vectorS3Buckets,
     icebergShards,
     numWorkers,
   } = getConfig()
+
+  // VECTOR_DATABASE_URL is only required when pgvector is actually going to
+  // be used: single-tenant mode (it's the maintenance URL used to CREATE
+  // DATABASE storage_vectors) AND either vector routes are enabled or the
+  // migration runner is going to materialise the DB. Multi-tenant pgvector
+  // mode keeps the vector schema in each tenant DB, so no global URL is
+  // needed. Gating on these flags avoids blocking startup in configs that
+  // intentionally keep vectors off.
+  if (
+    vectorBucketProvider === 'pgvector' &&
+    !isMultitenant &&
+    (vectorEnabled || vectorStoreMigrationsEnabled) &&
+    !vectorDatabaseURL
+  ) {
+    throw new Error(
+      'VECTOR_DATABASE_URL is required when VECTOR_BUCKET_PROVIDER=pgvector in single-tenant mode'
+    )
+  }
 
   // Queue
   if (pgQueueEnable) {
@@ -79,7 +101,7 @@ async function main() {
   }
 
   // Sharding for special buckets (vectors, analytics)
-  const sharding = new ShardCatalog(new KnexShardStoreFactory(multitenantKnex))
+  const sharding = new ShardCatalog(new PgShardStoreFactory(multitenantPgExecutor))
 
   // Migrations
   if (isMultitenant) {
@@ -107,6 +129,8 @@ async function main() {
       }))
     )
   } else {
+    // runMigrationsOnTenant internally handles vector_store migrations when
+    // VECTOR_BUCKET_PROVIDER=pgvector + VECTOR_STORE_MIGRATIONS_ENABLED=true.
     await runMigrationsOnTenant({
       databaseUrl: databaseURL,
       upToMigration: dbMigrationFreezeAt,
@@ -124,8 +148,8 @@ async function main() {
   }
 
   // PoolManager
-  TenantConnection.poolManager.setNumWorkers(numWorkers)
-  TenantConnection.poolManager.monitor()
+  PgTenantConnection.poolManager.setNumWorkers(numWorkers)
+  PgTenantConnection.poolManager.monitor()
 
   // Cluster information
   await Cluster.init(shutdownSignal.nextGroup.signal)
@@ -138,7 +162,7 @@ async function main() {
       },
       `[Cluster] Cluster size changed to ${data.size}`
     )
-    TenantConnection.poolManager.rebalanceAll({
+    PgTenantConnection.poolManager.rebalanceAll({
       clusterSize: data.size,
     })
   })
@@ -162,6 +186,9 @@ async function httpServer(signal: AbortSignal) {
   const app: FastifyInstance<Server, IncomingMessage, ServerResponse> = build({
     loggerInstance: logger,
     disableRequestLogging: true,
+    childLoggerFactory(logger) {
+      return logger
+    },
     exposeDocs,
     requestIdHeader: requestTraceHeader,
     routerOptions: { maxParamLength: 2500 },
@@ -211,6 +238,9 @@ async function httpAdminServer(
   const adminApp = buildAdmin({
     loggerInstance: logger,
     disableRequestLogging: true,
+    childLoggerFactory(logger) {
+      return logger
+    },
     exposeDocs,
     requestIdHeader: adminRequestIdHeader,
   })
@@ -236,7 +266,7 @@ async function httpAdminServer(
   try {
     await adminApp.listen({ port: adminPort, host, signal })
   } catch (err) {
-    logSchema.error(adminApp.log, 'Failed to start admin app', {
+    logSchema.error(logger, 'Failed to start admin app', {
       type: 'adminAppStartError',
       error: err,
     })
@@ -262,5 +292,9 @@ function registerPlatformaticCloseHandler() {
 }
 
 async function upgrades() {
-  return Promise.all([SyncCatalogIds.invoke({})])
+  return Promise.all([
+    SyncCatalogIds.invoke({
+      tenant: SYSTEM_TENANT,
+    }),
+  ])
 }
