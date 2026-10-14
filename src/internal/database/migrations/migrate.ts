@@ -8,13 +8,14 @@ import { validateMigrationHashes } from 'postgres-migrations/dist/validation'
 import SQL from 'sql-template-strings'
 import { getConfig, MultitenantMigrationStrategy } from '../../../config'
 import { logger, logSchema } from '../../monitoring'
+import type { DatabaseExecutor, DatabaseTransaction } from '../connection'
 import { multitenantPgExecutor } from '../multitenant-pg'
-import { PgExecutor, PgTransaction } from '../pg-connection'
 import { searchPath } from '../pool'
-import { getSslSettings } from '../ssl'
-import { getTenantConfig, TenantMigrationStatus } from '../tenant'
+import { getSslSettings } from '../postgres/ssl'
+import { deleteTenantConfig, getTenantConfig, TenantMigrationStatus } from '../tenant'
 import { TenantConfigStorePg } from '../tenant-store-pg'
 import { deriveVectorDatabaseUrl, VECTOR_DATABASE_NAME } from '../vector-store-url'
+import { repairInvalidConcurrentIndexes } from './concurrent-index-guard'
 import { lastLocalMigrationName, loadMigrationFilesCached, localMigrationFiles } from './files'
 import { ProgressiveMigrations } from './progressive'
 import { DisableConcurrentIndexTransformer, MigrationTransformer } from './transformers'
@@ -56,7 +57,6 @@ const backportMigrations = [
 export const progressiveMigrations = new ProgressiveMigrations({
   maxSize: 200,
   interval: 1000 * 5, // 5s
-  watch: pgQueueEnable,
 })
 
 /**
@@ -69,12 +69,12 @@ export function startAsyncMigrations(signal: AbortSignal) {
   }
   switch (dbMigrationStrategy) {
     case MultitenantMigrationStrategy.ON_REQUEST:
-      return
     case MultitenantMigrationStrategy.PROGRESSIVE:
       progressiveMigrations.start(signal)
       break
-    case MultitenantMigrationStrategy.FULL_FLEET:
-      runMigrationsOnAllTenants({ signal }).catch((e) => {
+    case MultitenantMigrationStrategy.FULL_FLEET: {
+      progressiveMigrations.start(signal)
+      const fullFleetMigrationRun = runMigrationsOnAllTenants({ signal }).catch((e) => {
         logger.error(
           {
             type: 'migrations',
@@ -83,7 +83,9 @@ export function startAsyncMigrations(signal: AbortSignal) {
           'migration error'
         )
       })
+      signal.addEventListener('abort', () => fullFleetMigrationRun, { once: true })
       break
+    }
     default:
       throw new Error(`Unknown migration strategy: ${dbMigrationStrategy}`)
   }
@@ -163,7 +165,7 @@ export async function updateTenantMigrationsState(
   options?: {
     migration?: keyof typeof DBMigration
     state: TenantMigrationStatus
-    tnx?: PgExecutor
+    tnx?: DatabaseExecutor
   }
 ) {
   const migrationVersion = options?.migration || (await lastLocalMigrationName())
@@ -177,7 +179,27 @@ export async function updateTenantMigrationsState(
     migrations_status: state,
   }
 
-  return tenantConfigStorePg.update(tenantId, migrationState, options?.tnx ?? multitenantPgExecutor)
+  const updated = await tenantConfigStorePg.updateMigrationsState(
+    tenantId,
+    migrationState,
+    options?.tnx ?? multitenantPgExecutor
+  )
+
+  if (updated === 0) {
+    // A newer release recorded this tenant; drop the stale local config so the next read sees it as ahead.
+    deleteTenantConfig(tenantId)
+    logSchema.info(
+      logger,
+      '[Migrations] Skipped state update for a tenant recorded by a newer release',
+      {
+        type: 'migrations',
+        project: tenantId,
+        metadata: JSON.stringify(migrationState),
+      }
+    )
+  }
+
+  return updated
 }
 
 /**
@@ -188,6 +210,11 @@ export async function areMigrationsUpToDate(tenantId: string) {
   const latestMigrationVersion = await lastLocalMigrationName()
   const tenant = await getTenantConfig(tenantId)
 
+  // A newer release already migrated this tenant past anything this binary can run.
+  if (tenant.migrationVersionAhead) {
+    return true
+  }
+
   return (
     tenant.migrationVersion &&
     DBMigration[latestMigrationVersion] <= DBMigration[tenant.migrationVersion] &&
@@ -196,7 +223,7 @@ export async function areMigrationsUpToDate(tenantId: string) {
 }
 
 export async function obtainLockOnMultitenantDB<T>(
-  fn: (tnx: PgTransaction) => Promise<T>,
+  fn: (tnx: DatabaseTransaction) => Promise<T>,
   options?: { sbReqId?: string }
 ) {
   const trx = await multitenantPgExecutor.beginTransaction()
@@ -563,9 +590,15 @@ export async function resetMigration(options: {
 
       const currentLastMigration = currentTenantMigrations[currentTenantMigrations.length - 1]
       const localMigration = DBMigration[options.untilMigration]
+      const markCompletedMigration = options.markCompletedTillMigration
+        ? DBMigration[options.markCompletedTillMigration]
+        : undefined
 
       // This tenant migration is already at the desired migration
-      if (currentLastMigration.id === localMigration) {
+      if (
+        currentLastMigration.id === localMigration &&
+        (markCompletedMigration === undefined || currentLastMigration.id >= markCompletedMigration)
+      ) {
         return false
       }
 
@@ -625,9 +658,10 @@ export async function resetMigration(options: {
         }
 
         if (options.tenantId) {
-          await updateTenantMigrationsState(options.tenantId, {
-            migration: latestRunMigration,
-            state: TenantMigrationStatus.COMPLETED,
+          // A reset is an explicit rewind, so it may overwrite a version this binary does not know.
+          await tenantConfigStorePg.update(options.tenantId, {
+            migrations_version: latestRunMigration,
+            migrations_status: TenantMigrationStatus.COMPLETED,
           })
         }
 
@@ -660,7 +694,13 @@ async function connect(options: {
   const dbConfig: ClientConfig = {
     connectionString,
     connectionTimeoutMillis: 60_000,
-    options: `-c search_path=${searchPath}`,
+    // Migrations run trusted dynamic PL/pgSQL that a multigres gateway
+    // rejects by default; only this connection opts into multigres
+    // per-connection bypass, instead of the whole gateway being unsafe.
+    // No-op against a plain postgres backend (accepted as a placeholder GUC).
+    // direct_connection is also accepted, but multigres.unsafe_connection is
+    // more explicit and less likely to be confused with a real connection mode.
+    options: `-c search_path=${searchPath} -c multigres.unsafe_connection=on`,
     ssl,
   }
 
@@ -873,7 +913,7 @@ function runMigrations({
       for (const migration of migrationsToRun) {
         try {
           const ignore = migration.sql.includes('-- postgres-migrations ignore')
-          const runnableMigration = ignore
+          let runnableMigration = ignore
             ? {
                 ...migration,
                 sql: 'SELECT 1;',
@@ -881,10 +921,32 @@ function runMigrations({
               }
             : migration
 
-          const result = await runMigration(
-            migrationTableName,
-            client
-          )(runMigrationTransformers(runnableMigration, transformers))
+          // Generate version-dependent SQL first, then run it at the top level so
+          // concurrent index creation and invalid-index repair remain supported.
+          if (runnableMigration.sql.includes('-- storage-migrations generate-sql')) {
+            const { rows } = await client.query(runnableMigration.sql)
+            const sql: unknown = rows[0]?.sql
+            if (rows.length !== 1 || typeof sql !== 'string' || sql.trim().length === 0) {
+              throw new Error('Generated migration must return exactly one non-empty sql string')
+            }
+            runnableMigration = { ...runnableMigration, sql }
+          }
+
+          const transformedMigration = runMigrationTransformers(runnableMigration, transformers)
+          const repairedIndexes = await repairInvalidConcurrentIndexes(client, transformedMigration)
+
+          if (repairedIndexes.length > 0) {
+            logSchema.warning(logger, '[Migrations] Removed invalid indexes before retry', {
+              type: 'migrations',
+              metadata: JSON.stringify({
+                migrationId: migration.id,
+                migrationName: migration.name,
+                indexes: repairedIndexes,
+              }),
+            })
+          }
+
+          const result = await runMigration(migrationTableName, client)(transformedMigration)
           completedMigrations.push(result)
         } catch (e) {
           throw ERRORS.DatabaseError(

@@ -1,5 +1,6 @@
 import { Readable } from 'node:stream'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { gzipSync } from 'node:zlib'
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
@@ -30,14 +31,15 @@ import { Upload } from '@aws-sdk/lib-storage'
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { wait } from '@internal/concurrency'
-import { getPostgresConnection, getServiceKeyUser, PgTenantConnection } from '@internal/database'
+import { getPostgresConnection, getServiceKeyUser, type TenantConnection } from '@internal/database'
 import { DBMigration } from '@internal/database/migrations'
 import { ERRORS } from '@internal/errors'
 import { StoragePgDB } from '@storage/database'
 import { Uploader } from '@storage/uploader'
 import { createHash, createHmac, randomUUID } from 'crypto'
 import { FastifyInstance } from 'fastify'
-import { vi } from 'vitest'
+import { fetch as undiciFetch } from 'undici'
+import { onTestFinished, vi } from 'vitest'
 import app from '../app'
 import { getConfig, mergeConfig } from '../config'
 import type { ObjectMetadata } from '../storage/backend'
@@ -62,9 +64,13 @@ const {
   s3ProtocolAccessKeyId,
   storageS3Region,
   tenantId,
+  serviceKeyAsync,
 } = getConfig()
 const STREAMING_PAYLOAD_ALGORITHM = 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD'
 const STREAMING_TRAILER_PAYLOAD_ALGORITHM = 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER'
+
+// Node 24's built-in fetch can duplicate Content-Length through npm Undici's dispatcher.
+// Keep byte-exact payload requests on npm Undici; FormData requests stay on native fetch.
 async function createBucket(client: S3Client, name?: string, publicRead = true) {
   let bucketName: string
   if (!name) {
@@ -167,6 +173,7 @@ async function sendAwsChunkedRequest(options: {
   path: string
   payload: Buffer
   query?: Record<string, string>
+  contentEncoding?: string
 }) {
   const signedRequest = await createSignedS3Request({
     baseUrl: options.baseUrl,
@@ -175,7 +182,7 @@ async function sendAwsChunkedRequest(options: {
     query: options.query,
     contentSha: STREAMING_PAYLOAD_ALGORITHM,
     headers: {
-      'content-encoding': 'aws-chunked',
+      'content-encoding': options.contentEncoding ?? 'aws-chunked',
       'x-amz-decoded-content-length': options.payload.length.toString(),
     },
   })
@@ -195,7 +202,7 @@ async function sendAwsChunkedRequest(options: {
   })
   const encodedBody = Buffer.concat([chunk.encoded, endChunk.encoded])
 
-  const response = await fetch(signedRequest.requestUrl, {
+  const response = await undiciFetch(signedRequest.requestUrl, {
     method: 'PUT',
     headers: {
       ...signedRequest.headers,
@@ -242,7 +249,7 @@ async function sendAwsChunkedTrailerModeWithoutTrailerRequest(options: {
   })
   const encodedBody = Buffer.concat([chunk.encoded, endChunk.encoded])
 
-  const response = await fetch(signedRequest.requestUrl, {
+  const response = await undiciFetch(signedRequest.requestUrl, {
     method: 'PUT',
     headers: {
       ...signedRequest.headers,
@@ -312,7 +319,9 @@ async function createSignedS3Request(options: {
     contentSha: payloadHash,
   }
 
-  const { signature } = await signer.sign(clientSignature, {
+  const {
+    signatures: [signature],
+  } = await signer.sign(clientSignature, {
     url: options.path,
     method: options.method,
     headers,
@@ -359,7 +368,7 @@ async function sendSignedS3Request(options: {
     includeContentLength: true,
   })
 
-  const response = await fetch(signedRequest.requestUrl, {
+  const response = await undiciFetch(signedRequest.requestUrl, {
     method: options.method,
     headers: signedRequest.headers,
     body: payload,
@@ -448,6 +457,26 @@ describe('S3 Protocol', () => {
         expect(Location).toBeTruthy()
       })
 
+      it('honors an ACL hoisted into a presigned url query', async () => {
+        const bucketName = `SomeBucket-${randomUUID()}`
+        const signedUrl = await getSignedUrl(
+          client,
+          new CreateBucketCommand({ Bucket: bucketName, ACL: 'public-read' }),
+          { expiresIn: 100 }
+        )
+        expect(new URL(signedUrl).searchParams.get('x-amz-acl')).toBe('public-read')
+
+        const resp = await undiciFetch(signedUrl, { method: 'PUT' })
+        expect(resp.status).toBe(200)
+
+        const bucket = await testApp.inject({
+          method: 'GET',
+          url: `/bucket/${bucketName}`,
+          headers: { authorization: `Bearer ${process.env.SERVICE_KEY}` },
+        })
+        expect(bucket.json().public).toBe(true)
+      })
+
       it('can get bucket versioning', async () => {
         const bucket = await createBucket(client)
         const bucketVersioningCommand = new GetBucketVersioningCommand({
@@ -455,18 +484,102 @@ describe('S3 Protocol', () => {
         })
 
         const resp = await client.send(bucketVersioningCommand)
-        expect(resp.Status).toEqual('Suspended')
+        expect(resp.Status).toBeUndefined()
         expect(resp.MFADelete).toEqual('Disabled')
+      })
+
+      it('reports Enabled status for a bucket with versioning enabled', async () => {
+        mergeConfig({ storageVersioningEnabled: true })
+        const bucketName = `VersionedBucket-${randomUUID()}`
+        const createResponse = await testApp.inject({
+          method: 'POST',
+          url: '/bucket',
+          headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+          payload: {
+            name: bucketName,
+            versioning_status: 'ENABLED',
+          },
+        })
+        expect(createResponse.statusCode).toBe(200)
+
+        const bucketVersioningCommand = new GetBucketVersioningCommand({
+          Bucket: bucketName,
+        })
+
+        const resp = await client.send(bucketVersioningCommand)
+        expect(resp.Status).toEqual('Enabled')
+        expect(resp.MFADelete).toEqual('Disabled')
+
+        const suspendResponse = await testApp.inject({
+          method: 'PUT',
+          url: `/bucket/${bucketName}`,
+          headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+          payload: { versioning_status: 'SUSPENDED' },
+        })
+        expect(suspendResponse.statusCode).toBe(200)
+
+        const suspended = await client.send(bucketVersioningCommand)
+        expect(suspended.Status).toEqual('Suspended')
+        expect(suspended.MFADelete).toEqual('Disabled')
+      })
+
+      it('returns not found from S3 GET and HEAD when the current row is a delete marker', async () => {
+        mergeConfig({ storageVersioningEnabled: true })
+        const bucketName = `marker-bucket-${randomUUID()}`
+        const objectName = `marker-${randomUUID()}.txt`
+        const createResponse = await testApp.inject({
+          method: 'POST',
+          url: '/bucket',
+          headers: { authorization: `Bearer ${await serviceKeyAsync}` },
+          payload: { name: bucketName, versioning_status: 'ENABLED' },
+        })
+        expect(createResponse.statusCode).toBe(200)
+
+        await client.send(
+          new PutObjectCommand({
+            Bucket: bucketName,
+            Key: objectName,
+            Body: Buffer.from('content'),
+          })
+        )
+        await client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: objectName }))
+
+        await expect(
+          client.send(new GetObjectCommand({ Bucket: bucketName, Key: objectName }))
+        ).rejects.toMatchObject({
+          name: 'NoSuchKey',
+          $metadata: expect.objectContaining({ httpStatusCode: 404 }),
+        })
+        // S3 HEAD responses have no XML error body from which the AWS SDK can
+        // recover NoSuchKey, so the SDK exposes its generic NotFound name.
+        await expect(
+          client.send(new HeadObjectCommand({ Bucket: bucketName, Key: objectName }))
+        ).rejects.toMatchObject({
+          name: 'NotFound',
+          $metadata: expect.objectContaining({ httpStatusCode: 404 }),
+        })
       })
 
       it('can get bucket location', async () => {
         const bucket = await createBucket(client)
-        const bucketVersioningCommand = new GetBucketLocationCommand({
+        const getBucketLocationCommand = new GetBucketLocationCommand({
           Bucket: bucket,
         })
 
-        const resp = await client.send(bucketVersioningCommand)
+        const resp = await client.send(getBucketLocationCommand)
         expect(resp.LocationConstraint).toEqual(storageS3Region)
+
+        const signedUrl = await getSignedUrl(client, getBucketLocationCommand, { expiresIn: 100 })
+        const rawResponse = await fetch(signedUrl, {
+          headers: { accept: 'application/xml' },
+        })
+        const rawBody = (await rawResponse.text()).replace(/^<\?xml[^>]*\?>/, '')
+
+        expect(rawResponse.status).toBe(200)
+        expect(rawBody).toBe(
+          '<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">' +
+            `${storageS3Region}</LocationConstraint>`
+        )
       })
     })
 
@@ -494,6 +607,7 @@ describe('S3 Protocol', () => {
         } catch (e) {
           expect((e as Error).message).not.toBe('Should not reach here')
           expect((e as S3ServiceException).$metadata.httpStatusCode).toBe(409)
+          expect((e as S3ServiceException).name).toBe('BucketNotEmpty')
           expect((e as S3ServiceException).message).toBe(
             'The bucket you tried to delete is not empty'
           )
@@ -587,9 +701,10 @@ describe('S3 Protocol', () => {
           Bucket: bucket,
           Delimiter: '/',
           MaxKeys: 3,
-          Marker: resp.Marker,
+          Marker: resp.NextMarker,
         })
         const resp2 = await client.send(listObjects2)
+        expect(resp2.Marker).toBe(resp.NextMarker)
         expect(resp2.CommonPrefixes?.length).toBe(2)
         expect(resp2.Contents?.length).toBe(1)
       })
@@ -713,6 +828,24 @@ describe('S3 Protocol', () => {
             Key: testObject2,
           }),
         ])
+
+        const encoded = await client.send(
+          new ListObjectsV2Command({
+            Bucket: bucket,
+            Prefix: `prefix-1/test-1!'(`,
+            Delimiter: '/',
+            StartAfter: `prefix-1/test-1!'`,
+            EncodingType: 'url',
+          })
+        )
+        expect(encoded.Prefix).toBe('prefix-1%2Ftest-1%21%27%28')
+        expect(encoded.Delimiter).toBe('%2F')
+        expect(encoded.StartAfter).toBe('prefix-1%2Ftest-1%21%27')
+        expect(encoded.Contents).toEqual([
+          expect.objectContaining({
+            Key: 'prefix-1%2Ftest-1%21%27%28123%29%2A.jpg',
+          }),
+        ])
       })
 
       it('list keys and common prefixes', async () => {
@@ -799,6 +932,7 @@ describe('S3 Protocol', () => {
         expect(objectsPage1.Contents?.length).toBe(undefined)
         expect(objectsPage1.CommonPrefixes?.length).toBe(1)
         expect(objectsPage1.CommonPrefixes?.[0].Prefix).toBe('prefix-3/')
+        expect(objectsPage1.StartAfter).toBe('prefix-1/test-1.jpg')
         expect(objectsPage1.IsTruncated).toBe(true)
 
         const listBucketsPage2 = new ListObjectsV2Command({
@@ -827,6 +961,42 @@ describe('S3 Protocol', () => {
         expect(objectsPage3.CommonPrefixes?.length).toBe(undefined)
         expect(objectsPage3.Contents?.[0].Key).toBe('test-1.jpg')
         expect(objectsPage3.IsTruncated).toBe(false)
+      })
+
+      it('accepts the legacy default sort order and rejects unsupported S3 token fields', async () => {
+        const bucket = await createBucket(client)
+
+        const legacyToken = Buffer.from('o:asc').toString('base64')
+        const legacyResponse = await client.send(
+          new ListObjectsV2Command({ Bucket: bucket, ContinuationToken: legacyToken })
+        )
+        expect(legacyResponse.$metadata.httpStatusCode).toBe(200)
+
+        for (const tokenPart of [
+          'o:desc',
+          'c:created_at',
+          'a:1970-01-01T00:00:00.000Z',
+          'v:version-id',
+          'r:infinity',
+          'n:include',
+          'd:include',
+          'e:true',
+        ]) {
+          const tamperedToken = Buffer.from(tokenPart).toString('base64')
+
+          try {
+            await client.send(
+              new ListObjectsV2Command({
+                Bucket: bucket,
+                ContinuationToken: tamperedToken,
+              })
+            )
+            throw new Error('Should not reach here')
+          } catch (e) {
+            expect((e as Error).message).not.toBe('Should not reach here')
+            expect((e as S3ServiceException).$metadata.httpStatusCode).toBe(400)
+          }
+        }
       })
 
       it('lists an entity-heavy first page without XML expansion failure', async () => {
@@ -931,52 +1101,92 @@ describe('S3 Protocol', () => {
     }
 
     describe('MultiPart Form Data Upload', () => {
+      // Hand-signs a POST policy with the server's S3 credentials, returning the
+      // form fields a client would submit. Lets us craft conditions the AWS SDK
+      // won't generate on its own
+      function signPostPolicy(policy: Record<string, unknown>) {
+        const shortDate = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+        const policyB64 = Buffer.from(JSON.stringify(policy)).toString('base64')
+        const hmac = (key: Buffer | string, data: string) =>
+          createHmac('sha256', key).update(data, 'utf-8').digest()
+        const kDate = hmac('AWS4' + s3ProtocolAccessKeySecret!, shortDate)
+        const kRegion = hmac(kDate, storageS3Region)
+        const kService = hmac(kRegion, 's3')
+        const kSigning = hmac(kService, 'aws4_request')
+        const signature = hmac(kSigning, policyB64).toString('hex')
+        const credential = `${s3ProtocolAccessKeyId}/${shortDate}/${storageS3Region}/s3/aws4_request`
+        return { policyB64, signature, credential }
+      }
+
       it('can upload using multipart/form-data', async () => {
         const webhookSpy = vi
           .spyOn(ObjectCreatedPostEvent, 'sendWebhook')
           .mockResolvedValue(undefined)
 
-        try {
-          const bucketName = await createBucket(client)
-          const signedURL = await createPresignedPost(client, {
-            Bucket: bucketName,
-            Key: 'test.jpg',
-            Expires: 5000,
-            Fields: {
-              'Content-Type': 'image/jpg',
-              'X-Amz-Meta-Custom': 'meta-field',
-            },
-          })
+        const bucketName = await createBucket(client)
+        const signedURL = await createPresignedPost(client, {
+          Bucket: bucketName,
+          Key: 'test.jpg',
+          Expires: 5000,
+          Fields: {
+            'Content-Type': 'image/jpg',
+            'X-Amz-Meta-Custom': 'meta-field',
+          },
+        })
 
-          const formData = new FormData()
-          Object.keys(signedURL.fields).forEach((key) => {
-            formData.set(key, signedURL.fields[key])
-          })
+        const formData = new FormData()
+        Object.keys(signedURL.fields).forEach((key) => {
+          formData.set(key, signedURL.fields[key])
+        })
 
-          const data = Buffer.alloc(1024)
-          formData.set('file', new Blob([data]), 'test.jpg')
+        const data = Buffer.alloc(1024)
+        formData.set('file', new Blob([data]), 'test.jpg')
 
-          const resp = await fetch(signedURL.url, { method: 'POST', body: formData })
+        const resp = await fetch(signedURL.url, { method: 'POST', body: formData })
 
-          expect(resp.status).toBe(200)
+        expect(resp.status).toBe(200)
 
-          // Verify webhook was called with correct data
-          expect(webhookSpy).toHaveBeenCalledTimes(1)
-          const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
-          expect(webhookCall).toMatchObject({
-            tenant: expect.objectContaining({ ref: tenantId }),
-            name: 'test.jpg',
-            version: expect.any(String),
-            bucketId: bucketName,
-            reqId: expect.any(String),
-            metadata: expect.any(Object),
-            uploadType: 's3',
-          })
-          expect(webhookCall.metadata).toBeDefined()
-          expect(webhookCall.metadata).toHaveProperty('size')
-        } finally {
-          webhookSpy.mockRestore()
-        }
+        // Verify webhook was called with correct data
+        expect(webhookSpy).toHaveBeenCalledTimes(1)
+        const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
+        expect(webhookCall).toMatchObject({
+          tenant: expect.objectContaining({ ref: tenantId }),
+          name: 'test.jpg',
+          version: expect.any(String),
+          bucketId: bucketName,
+          reqId: expect.any(String),
+          metadata: expect.any(Object),
+          uploadType: 's3',
+        })
+        expect(webhookCall.metadata).toBeDefined()
+        expect(webhookCall.metadata).toHaveProperty('size')
+      })
+
+      it('stores the Content-Encoding field of a multipart/form-data upload', async () => {
+        const bucketName = await createBucket(client)
+        const signedURL = await createPresignedPost(client, {
+          Bucket: bucketName,
+          Key: 'test.gz',
+          Expires: 5000,
+          Fields: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Encoding': 'gzip',
+          },
+        })
+
+        const formData = new FormData()
+        Object.keys(signedURL.fields).forEach((key) => {
+          formData.set(key, signedURL.fields[key])
+        })
+        formData.set('file', new Blob([gzipSync('payload')]), 'test.gz')
+
+        const resp = await fetch(signedURL.url, { method: 'POST', body: formData })
+
+        expect(resp.status).toBe(200)
+        const head = await client.send(
+          new HeadObjectCommand({ Bucket: bucketName, Key: 'test.gz' })
+        )
+        expect(head.ContentEncoding).toBe('gzip')
       })
 
       it('prevent uploading files larger than the maxFileSize limit', async () => {
@@ -1006,9 +1216,321 @@ describe('S3 Protocol', () => {
         expect(resp.status).toBe(413)
         expect(resp.statusText).toBe('Payload Too Large')
       })
+
+      describe('with a signed content-length-range', () => {
+        const uploadSized = async (
+          bucketName: string,
+          size: number,
+          [min, max]: [number, number] = [10, 100]
+        ) => {
+          const signedURL = await createPresignedPost(client, {
+            Bucket: bucketName,
+            Key: 'sized.bin',
+            Expires: 5000,
+            Conditions: [['content-length-range', min, max]],
+          })
+
+          const formData = new FormData()
+          Object.keys(signedURL.fields).forEach((key) => {
+            formData.set(key, signedURL.fields[key])
+          })
+          formData.set('file', new Blob([Buffer.alloc(size)]), 'sized.bin')
+
+          return fetch(signedURL.url, { method: 'POST', body: formData })
+        }
+
+        it('accepts a file within the range', async () => {
+          const bucketName = await createBucket(client)
+
+          const resp = await uploadSized(bucketName, 50)
+
+          expect(resp.status).toBe(200)
+        })
+
+        it.each([10, 100])('accepts a file of exactly %d bytes', async (size) => {
+          const bucketName = await createBucket(client)
+
+          const resp = await uploadSized(bucketName, size)
+
+          expect(resp.status).toBe(200)
+        })
+
+        it('keeps the tenant limit when the range allows more', async () => {
+          mergeConfig({ uploadFileSizeLimit: 1024 })
+          const bucketName = await createBucket(client)
+
+          const resp = await uploadSized(bucketName, 2048, [0, 4096])
+
+          expect(resp.status).toBe(413)
+        })
+
+        it('keeps the bucket limit when the range allows more', async () => {
+          const bucketName = await createBucket(client)
+          const update = await testApp.inject({
+            method: 'PUT',
+            url: `/bucket/${bucketName}`,
+            headers: { authorization: `Bearer ${process.env.SERVICE_KEY}` },
+            payload: { file_size_limit: 1024 },
+          })
+          expect(update.statusCode, update.body).toBe(200)
+
+          const resp = await uploadSized(bucketName, 2048, [0, 4096])
+
+          expect(resp.status).toBe(413)
+        })
+
+        it('rejects a file larger than the range', async () => {
+          const bucketName = await createBucket(client)
+
+          const resp = await uploadSized(bucketName, 101)
+
+          expect(resp.status).toBe(413)
+          await expect(
+            client.send(new HeadObjectCommand({ Bucket: bucketName, Key: 'sized.bin' }))
+          ).rejects.toThrow()
+        })
+
+        it('rejects a file smaller than the range without storing it', async () => {
+          const bucketName = await createBucket(client)
+
+          const resp = await uploadSized(bucketName, 9)
+
+          expect(resp.status).toBe(400)
+          expect(await resp.text()).toContain('EntityTooSmall')
+          await expect(
+            client.send(new HeadObjectCommand({ Bucket: bucketName, Key: 'sized.bin' }))
+          ).rejects.toThrow()
+        })
+      })
+
+      it('rejects a presigned POST replayed against a different bucket', async () => {
+        const signedBucket = await createBucket(client)
+        const otherBucket = await createBucket(client)
+
+        const signedURL = await createPresignedPost(client, {
+          Bucket: signedBucket,
+          Key: 'allowed/test.jpg',
+          Expires: 5000,
+          Fields: { 'Content-Type': 'image/jpg' },
+        })
+
+        const formData = new FormData()
+        Object.keys(signedURL.fields).forEach((key) => {
+          formData.set(key, signedURL.fields[key])
+        })
+        formData.set('file', new Blob([Buffer.alloc(16)]), 'object.txt')
+
+        const otherUrl = signedURL.url.replace(`/s3/${signedBucket}`, `/s3/${otherBucket}`)
+        const resp = await fetch(otherUrl, { method: 'POST', body: formData })
+
+        expect(resp.status).toBe(403)
+      })
+
+      it('rejects a presigned POST whose key violates the signed starts-with condition', async () => {
+        const bucketName = await createBucket(client)
+
+        const signedURL = await createPresignedPost(client, {
+          Bucket: bucketName,
+          // ${filename} produces a `["starts-with", "$key", "allowed/"]` condition
+          // biome-ignore lint/suspicious/noTemplateCurlyInString: AWS POST uses a literal ${filename} token
+          Key: 'allowed/${filename}',
+          Expires: 5000,
+          Fields: { 'Content-Type': 'image/jpg' },
+        })
+
+        const formData = new FormData()
+        Object.keys(signedURL.fields).forEach((key) => {
+          formData.set(key, signedURL.fields[key])
+        })
+        formData.set('key', 'outside/object.txt')
+        formData.set('file', new Blob([Buffer.alloc(16)]), 'object.txt')
+
+        const resp = await fetch(signedURL.url, { method: 'POST', body: formData })
+
+        expect(resp.status).toBe(403)
+      })
+
+      it('rejects a presigned POST whose Content-Type list violates the signed starts-with condition', async () => {
+        const bucketName = await createBucket(client)
+
+        const signedURL = await createPresignedPost(client, {
+          Bucket: bucketName,
+          Key: 'test.jpg',
+          Expires: 5000,
+          Conditions: [['starts-with', '$Content-Type', 'image/']],
+        })
+
+        const formData = new FormData()
+        Object.keys(signedURL.fields).forEach((key) => {
+          formData.set(key, signedURL.fields[key])
+        })
+        formData.set('Content-Type', 'image/png,text/html')
+        formData.set('file', new Blob([Buffer.alloc(16)]), 'test.jpg')
+
+        const resp = await fetch(signedURL.url, { method: 'POST', body: formData })
+
+        expect(resp.status).toBe(403)
+        expect(await resp.text()).toContain('does not start with')
+      })
+
+      it('rejects an expired policy even with a far-future X-Amz-Date', async () => {
+        const bucketName = await createBucket(client)
+
+        const { policyB64, signature, credential } = signPostPolicy({
+          expiration: '2020-01-01T00:00:00Z',
+          conditions: [{ bucket: bucketName }, ['starts-with', '$key', '']],
+        })
+
+        const formData = new FormData()
+        formData.set('key', 'some-key.txt')
+        formData.set('Policy', policyB64)
+        formData.set('X-Amz-Algorithm', 'AWS4-HMAC-SHA256')
+        formData.set('X-Amz-Credential', credential)
+        formData.set('X-Amz-Date', '99991231T235959Z')
+        formData.set('X-Amz-Signature', signature)
+        formData.set('file', new Blob([Buffer.alloc(16)]), 'some-key.txt')
+
+        const resp = await fetch(`${baseUrl}/s3/${bucketName}`, { method: 'POST', body: formData })
+
+        expect(resp.status).toBe(400)
+      })
+
+      it('rejects a key that violates an "eq" key condition', async () => {
+        const bucketName = await createBucket(client)
+
+        const { policyB64, signature, credential } = signPostPolicy({
+          expiration: '2099-01-01T00:00:00Z',
+          conditions: [{ bucket: bucketName }, ['eq', '$key', 'allowed/exact.txt']],
+        })
+
+        const formData = new FormData()
+        formData.set('key', 'allowed/different.txt')
+        formData.set('Policy', policyB64)
+        formData.set('X-Amz-Algorithm', 'AWS4-HMAC-SHA256')
+        formData.set('X-Amz-Credential', credential)
+        formData.set('X-Amz-Date', '99991231T235959Z')
+        formData.set('X-Amz-Signature', signature)
+        formData.set('file', new Blob([Buffer.alloc(16)]), 'object.txt')
+
+        const resp = await fetch(`${baseUrl}/s3/${bucketName}`, { method: 'POST', body: formData })
+
+        expect(resp.status).toBe(403)
+      })
+
+      it('accepts (and ignores) a field Storage does not act on, when covered by a condition', async () => {
+        const bucketName = await createBucket(client)
+
+        // `acl` is a valid AWS POST field that Storage does not implement. As long
+        // as it is covered by a condition (the SDK adds one for every Fields
+        // entry) it is accepted and ignored, matching AWS-compatible behavior.
+        const signedURL = await createPresignedPost(client, {
+          Bucket: bucketName,
+          Key: 'test.jpg',
+          Expires: 5000,
+          Fields: { acl: 'public-read' },
+        })
+
+        const formData = new FormData()
+        Object.keys(signedURL.fields).forEach((key) => {
+          formData.set(key, signedURL.fields[key])
+        })
+        formData.set('file', new Blob([Buffer.alloc(16)]), 'test.jpg')
+
+        const resp = await fetch(signedURL.url, { method: 'POST', body: formData })
+
+        expect(resp.status).toBe(200)
+      })
+
+      it('rejects a submitted field that is not covered by any policy condition', async () => {
+        const bucketName = await createBucket(client)
+
+        const signedURL = await createPresignedPost(client, {
+          Bucket: bucketName,
+          Key: 'test.jpg',
+          Expires: 5000,
+          Fields: { 'Content-Type': 'image/jpg' },
+        })
+
+        const formData = new FormData()
+        Object.keys(signedURL.fields).forEach((key) => {
+          formData.set(key, signedURL.fields[key])
+        })
+        // An extra field the signed policy never constrained with a condition.
+        formData.set('x-amz-meta-extra', 'value')
+        formData.set('file', new Blob([Buffer.alloc(16)]), 'test.jpg')
+
+        const resp = await fetch(signedURL.url, { method: 'POST', body: formData })
+
+        expect(resp.status).toBe(403)
+      })
+
+      it('allows an uncovered x-ignore- field (AWS exemption)', async () => {
+        // AWS exempts fields prefixed with `x-ignore-` from the "every field must
+        // be covered by a condition" rule, so an uncovered x-ignore-* field must
+        // NOT be rejected (contrast the x-amz-meta-* case above).
+        const bucketName = await createBucket(client)
+
+        const signedURL = await createPresignedPost(client, {
+          Bucket: bucketName,
+          Key: 'test.jpg',
+          Expires: 5000,
+          Fields: { 'Content-Type': 'image/jpg' },
+        })
+
+        const formData = new FormData()
+        Object.keys(signedURL.fields).forEach((key) => {
+          formData.set(key, signedURL.fields[key])
+        })
+        formData.set('x-ignore-toolkit-field', 'anything')
+        formData.set('file', new Blob([Buffer.alloc(16)]), 'test.jpg')
+
+        const resp = await fetch(signedURL.url, { method: 'POST', body: formData })
+
+        expect(resp.status).toBe(200)
+      })
     })
 
     describe('MultiPartUpload', () => {
+      it('preserves Content-Encoding after completing S3 multipart upload', async () => {
+        const bucket = await createBucket(client)
+        const key = 'multipart-compressed-object.gz'
+        const bytes = gzipSync(Buffer.from('multipart payload'.repeat(100)))
+
+        const created = await client.send(
+          new CreateMultipartUploadCommand({
+            Bucket: bucket,
+            Key: key,
+            ContentType: 'application/octet-stream',
+            ContentEncoding: 'gzip',
+          })
+        )
+        const part = await client.send(
+          new UploadPartCommand({
+            Bucket: bucket,
+            Key: key,
+            UploadId: created.UploadId,
+            PartNumber: 1,
+            Body: bytes,
+            ContentLength: bytes.length,
+          })
+        )
+        await client.send(
+          new CompleteMultipartUploadCommand({
+            Bucket: bucket,
+            Key: key,
+            UploadId: created.UploadId,
+            MultipartUpload: { Parts: [{ PartNumber: 1, ETag: part.ETag }] },
+          })
+        )
+
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }))
+        expect(head.ContentEncoding).toBe('gzip')
+        expect(head.ContentLength).toBe(bytes.length)
+        const downloaded = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+        expect(downloaded.ContentEncoding).toBe('gzip')
+        expect(Buffer.from((await downloaded.Body?.transformToByteArray()) ?? [])).toEqual(bytes)
+      })
+
       it('creates a multi part upload', async () => {
         const bucketName = await createBucket(client)
         const createMultiPartUpload = new CreateMultipartUploadCommand({
@@ -1055,7 +1577,7 @@ describe('S3 Protocol', () => {
           })
           signedRequest.requestUrl.search = '?up%6Co%61ds'
 
-          const response = await fetch(signedRequest.requestUrl, {
+          const response = await undiciFetch(signedRequest.requestUrl, {
             method: 'POST',
             headers: signedRequest.headers,
             body: '',
@@ -1093,7 +1615,9 @@ describe('S3 Protocol', () => {
         })
 
         expect(emptyJsonPostResp.status).toBe(400)
-        expect(emptyJsonPostResp.data).toContain('<Error>')
+        expect(emptyJsonPostResp.data).toContain(
+          '<Error xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        )
         expect(emptyJsonPostResp.data).toContain('<Code>InvalidRequest</Code>')
         expect(emptyJsonPostResp.data).toContain(
           "<Message>Body cannot be empty when content-type is set to 'application/json'</Message>"
@@ -1131,64 +1655,60 @@ describe('S3 Protocol', () => {
           .spyOn(ObjectCreatedPostEvent, 'sendWebhook')
           .mockResolvedValue(undefined)
 
-        try {
-          const bucketName = await createBucket(client)
-          const createMultiPartUpload = new CreateMultipartUploadCommand({
-            Bucket: bucketName,
-            Key: 'test-1.jpg',
-            ContentType: 'image/jpg',
-            CacheControl: 'max-age=2000',
-          })
-          const resp = await client.send(createMultiPartUpload)
-          expect(resp.UploadId).toBeTruthy()
+        const bucketName = await createBucket(client)
+        const createMultiPartUpload = new CreateMultipartUploadCommand({
+          Bucket: bucketName,
+          Key: 'test-1.jpg',
+          ContentType: 'image/jpg',
+          CacheControl: 'max-age=2000',
+        })
+        const resp = await client.send(createMultiPartUpload)
+        expect(resp.UploadId).toBeTruthy()
 
-          const data = Buffer.alloc(1024 * 5)
-          const uploadPart = new UploadPartCommand({
-            Bucket: bucketName,
-            Key: 'test-1.jpg',
-            ContentLength: data.length,
-            UploadId: resp.UploadId,
-            Body: data,
-            PartNumber: 1,
-          })
+        const data = Buffer.alloc(1024 * 5)
+        const uploadPart = new UploadPartCommand({
+          Bucket: bucketName,
+          Key: 'test-1.jpg',
+          ContentLength: data.length,
+          UploadId: resp.UploadId,
+          Body: data,
+          PartNumber: 1,
+        })
 
-          const part1 = await client.send(uploadPart)
+        const part1 = await client.send(uploadPart)
 
-          const completeMultiPartUpload = new CompleteMultipartUploadCommand({
-            Bucket: bucketName,
-            Key: 'test-1.jpg',
-            UploadId: resp.UploadId,
-            MultipartUpload: {
-              Parts: [
-                {
-                  PartNumber: 1,
-                  ETag: part1.ETag,
-                },
-              ],
-            },
-          })
+        const completeMultiPartUpload = new CompleteMultipartUploadCommand({
+          Bucket: bucketName,
+          Key: 'test-1.jpg',
+          UploadId: resp.UploadId,
+          MultipartUpload: {
+            Parts: [
+              {
+                PartNumber: 1,
+                ETag: part1.ETag,
+              },
+            ],
+          },
+        })
 
-          const completeResp = await client.send(completeMultiPartUpload)
-          expect(completeResp.$metadata.httpStatusCode).toBe(200)
-          expect(completeResp.Key).toEqual('test-1.jpg')
+        const completeResp = await client.send(completeMultiPartUpload)
+        expect(completeResp.$metadata.httpStatusCode).toBe(200)
+        expect(completeResp.Key).toEqual('test-1.jpg')
 
-          // Verify webhook was called with correct data
-          expect(webhookSpy).toHaveBeenCalledTimes(1)
-          const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
-          expect(webhookCall).toMatchObject({
-            tenant: expect.objectContaining({ ref: tenantId }),
-            name: 'test-1.jpg',
-            version: expect.any(String),
-            bucketId: bucketName,
-            reqId: expect.any(String),
-            metadata: expect.any(Object),
-            uploadType: 's3',
-          })
-          expect(webhookCall.metadata).toBeDefined()
-          expect(webhookCall.metadata).toHaveProperty('size')
-        } finally {
-          webhookSpy.mockRestore()
-        }
+        // Verify webhook was called with correct data
+        expect(webhookSpy).toHaveBeenCalledTimes(1)
+        const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
+        expect(webhookCall).toMatchObject({
+          tenant: expect.objectContaining({ ref: tenantId }),
+          name: 'test-1.jpg',
+          version: expect.any(String),
+          bucketId: bucketName,
+          reqId: expect.any(String),
+          metadata: expect.any(Object),
+          uploadType: 's3',
+        })
+        expect(webhookCall.metadata).toBeDefined()
+        expect(webhookCall.metadata).toHaveProperty('size')
       })
 
       it('does not complete multipart upload on malformed xml body', async () => {
@@ -1230,8 +1750,10 @@ describe('S3 Protocol', () => {
         })
 
         expect(malformedCompleteResp.status).toBe(400)
-        expect(malformedCompleteResp.data).toContain('<Error>')
-        expect(malformedCompleteResp.data).toContain('<Code>InvalidRequest</Code>')
+        expect(malformedCompleteResp.data).toContain(
+          '<Error xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        )
+        expect(malformedCompleteResp.data).toContain('<Code>MalformedXML</Code>')
         expect(malformedCompleteResp.data).toContain('<Message>Invalid XML payload:')
 
         await expectMultipartUploadToRemainPending(client, {
@@ -1269,6 +1791,73 @@ describe('S3 Protocol', () => {
         const data = await getResp.Body?.transformToByteArray()
         expect(Buffer.from(data || [])).toEqual(part1Body)
         expect(part1.ETag).toBeTruthy()
+      })
+
+      it('rejects invalid multipart part numbers through route validation', async () => {
+        const bucketName = await createBucket(client)
+        const key = 'test-non-decimal-part-number.bin'
+        const createResp = await client.send(
+          new CreateMultipartUploadCommand({
+            Bucket: bucketName,
+            Key: key,
+            ContentType: 'application/octet-stream',
+          })
+        )
+        expect(createResp.UploadId).toBeTruthy()
+        onTestFinished(async () => {
+          await client.send(
+            new AbortMultipartUploadCommand({
+              Bucket: bucketName,
+              Key: key,
+              UploadId: createResp.UploadId,
+            })
+          )
+        })
+
+        const partBody = Buffer.alloc(1024 * 5, 'p')
+        const part = await client.send(
+          new UploadPartCommand({
+            Bucket: bucketName,
+            Key: key,
+            ContentLength: partBody.length,
+            UploadId: createResp.UploadId,
+            Body: partBody,
+            PartNumber: 1,
+          })
+        )
+
+        const malformedPartNumbers = [
+          '<PartNumber>   </PartNumber>',
+          '<PartNumber/>',
+          '<PartNumber>Infinity</PartNumber>',
+          `<PartNumber>${'9'.repeat(400)}</PartNumber>`,
+        ]
+
+        for (const partNumber of malformedPartNumbers) {
+          const completeResp = await sendSignedS3Request({
+            baseUrl,
+            method: 'POST',
+            path: `/s3/${bucketName}/${key}`,
+            query: {
+              uploadId: createResp.UploadId!,
+            },
+            headers: {
+              'Content-Type': 'application/xml',
+            },
+            body: `<CompleteMultipartUpload><Part>${partNumber}<ETag>${part.ETag}</ETag></Part></CompleteMultipartUpload>`,
+          })
+
+          expect(completeResp.status).toBe(400)
+          expect(completeResp.data).toContain('<Code>InvalidRequest</Code>')
+          expect(completeResp.data).toContain('PartNumber')
+        }
+
+        await expectMultipartUploadToRemainPending(client, {
+          bucket: bucketName,
+          key,
+          uploadId: createResp.UploadId!,
+          partETag: part.ETag!,
+        })
       })
 
       it('does not complete multipart upload on malformed json body', async () => {
@@ -1310,7 +1899,9 @@ describe('S3 Protocol', () => {
         })
 
         expect(malformedCompleteResp.status).toBe(400)
-        expect(malformedCompleteResp.data).toContain('<Error>')
+        expect(malformedCompleteResp.data).toContain(
+          '<Error xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        )
         expect(malformedCompleteResp.data).toContain('<Code>InvalidRequest</Code>')
         expect(malformedCompleteResp.data).toContain(
           "<Message>Body is not valid JSON but content-type is set to 'application/json'</Message>"
@@ -1391,7 +1982,9 @@ describe('S3 Protocol', () => {
         })
 
         expect(emptyJsonCompleteResp.status).toBe(400)
-        expect(emptyJsonCompleteResp.data).toContain('<Error>')
+        expect(emptyJsonCompleteResp.data).toContain(
+          '<Error xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        )
         expect(emptyJsonCompleteResp.data).toContain('<Code>InvalidRequest</Code>')
         expect(emptyJsonCompleteResp.data).toContain(
           "<Message>Body cannot be empty when content-type is set to 'application/json'</Message>"
@@ -1472,35 +2065,92 @@ describe('S3 Protocol', () => {
           .spyOn(ObjectCreatedPostEvent, 'sendWebhook')
           .mockResolvedValue(undefined)
 
-        try {
-          const bucketName = await createBucket(client)
+        const bucketName = await createBucket(client)
 
-          const putObject = new PutObjectCommand({
-            Bucket: bucketName,
-            Key: 'test-1-put-object.jpg',
-            Body: Buffer.alloc(1024 * 12),
+        const putObject = new PutObjectCommand({
+          Bucket: bucketName,
+          Key: 'test-1-put-object.jpg',
+          Body: Buffer.alloc(1024 * 12),
+        })
+
+        const resp = await client.send(putObject)
+        expect(resp.$metadata.httpStatusCode).toEqual(200)
+
+        // Verify webhook was called with correct data
+        expect(webhookSpy).toHaveBeenCalledTimes(1)
+        const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
+        expect(webhookCall).toMatchObject({
+          tenant: expect.objectContaining({ ref: tenantId }),
+          name: 'test-1-put-object.jpg',
+          version: expect.any(String),
+          bucketId: bucketName,
+          reqId: expect.any(String),
+          metadata: expect.any(Object),
+          uploadType: 's3',
+        })
+        expect(webhookCall.metadata).toBeDefined()
+        expect(webhookCall.metadata).toHaveProperty('size')
+      })
+
+      it('preserves upload-time Content-Encoding and no-transform through S3 reads and ranges', async () => {
+        const bucket = await createBucket(client)
+        const key = 'compressed-object.gz'
+        const bytes = gzipSync(Buffer.from('compressed object payload'.repeat(100)))
+
+        await client.send(
+          new PutObjectCommand({
+            Bucket: bucket,
+            Key: key,
+            Body: bytes,
+            ContentType: 'application/octet-stream',
+            ContentEncoding: 'gzip',
+            CacheControl: 'no-transform',
           })
+        )
 
-          const resp = await client.send(putObject)
-          expect(resp.$metadata.httpStatusCode).toEqual(200)
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }))
+        expect(head.ContentEncoding).toBe('gzip')
+        expect(head.CacheControl).toBe('no-transform')
+        expect(head.ContentLength).toBe(bytes.length)
 
-          // Verify webhook was called with correct data
-          expect(webhookSpy).toHaveBeenCalledTimes(1)
-          const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
-          expect(webhookCall).toMatchObject({
-            tenant: expect.objectContaining({ ref: tenantId }),
-            name: 'test-1-put-object.jpg',
-            version: expect.any(String),
-            bucketId: bucketName,
-            reqId: expect.any(String),
-            metadata: expect.any(Object),
-            uploadType: 's3',
+        const full = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+        expect(full.ContentEncoding).toBe('gzip')
+        expect(Buffer.from((await full.Body?.transformToByteArray()) ?? [])).toEqual(bytes)
+
+        const ranged = await client.send(
+          new GetObjectCommand({ Bucket: bucket, Key: key, Range: 'bytes=0-9' })
+        )
+        expect(ranged.$metadata.httpStatusCode).toBe(206)
+        expect(ranged.ContentEncoding).toBe('gzip')
+        expect(Buffer.from((await ranged.Body?.transformToByteArray()) ?? [])).toEqual(
+          bytes.subarray(0, 10)
+        )
+      })
+
+      it('strips aws-chunked while retaining gzip after streaming signature decoding', async () => {
+        const upload = vi.spyOn(Uploader.prototype, 'upload')
+        const bucket = await createBucket(client)
+        const key = 'streamed-compressed-object.gz'
+        const bytes = gzipSync(Buffer.from('streamed compressed payload'.repeat(100)))
+
+        const put = await sendAwsChunkedRequest({
+          baseUrl,
+          path: `/s3/${bucket}/${key}`,
+          payload: bytes,
+          contentEncoding: 'aws-chunked,gzip',
+        })
+        expect(put.status, put.data).toBe(200)
+
+        // Assert before the provider can normalize the header itself.
+        expect(upload).toHaveBeenCalledWith(
+          expect.objectContaining({
+            file: expect.objectContaining({ contentEncoding: 'gzip' }),
           })
-          expect(webhookCall.metadata).toBeDefined()
-          expect(webhookCall.metadata).toHaveProperty('size')
-        } finally {
-          webhookSpy.mockRestore()
-        }
+        )
+
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }))
+        expect(head.ContentEncoding).toBe('gzip')
+        expect(head.ContentLength).toBe(bytes.length)
       })
 
       it('upload a broken JSON body using putObject ', async () => {
@@ -1754,40 +2404,36 @@ describe('S3 Protocol', () => {
           .spyOn(ObjectCreatedPostEvent, 'sendWebhook')
           .mockResolvedValue(undefined)
 
-        try {
-          const bucketName = await createBucket(client)
+        const bucketName = await createBucket(client)
 
-          const uploader = new Upload({
-            client,
-            params: {
-              Bucket: bucketName,
-              Key: 'test-1.jpg',
-              ContentType: 'image/jpg',
-              Body: Buffer.alloc(1024 * 12),
-            },
-          })
+        const uploader = new Upload({
+          client,
+          params: {
+            Bucket: bucketName,
+            Key: 'test-1.jpg',
+            ContentType: 'image/jpg',
+            Body: Buffer.alloc(1024 * 12),
+          },
+        })
 
-          const resp = await uploader.done()
+        const resp = await uploader.done()
 
-          expect(resp.$metadata).toBeTruthy()
+        expect(resp.$metadata).toBeTruthy()
 
-          // Verify webhook was called with correct data
-          expect(webhookSpy).toHaveBeenCalledTimes(1)
-          const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
-          expect(webhookCall).toMatchObject({
-            tenant: expect.objectContaining({ ref: tenantId }),
-            name: 'test-1.jpg',
-            version: expect.any(String),
-            bucketId: bucketName,
-            reqId: expect.any(String),
-            metadata: expect.any(Object),
-            uploadType: 's3',
-          })
-          expect(webhookCall.metadata).toBeDefined()
-          expect(webhookCall.metadata).toHaveProperty('size')
-        } finally {
-          webhookSpy.mockRestore()
-        }
+        // Verify webhook was called with correct data
+        expect(webhookSpy).toHaveBeenCalledTimes(1)
+        const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
+        expect(webhookCall).toMatchObject({
+          tenant: expect.objectContaining({ ref: tenantId }),
+          name: 'test-1.jpg',
+          version: expect.any(String),
+          bucketId: bucketName,
+          reqId: expect.any(String),
+          metadata: expect.any(Object),
+          uploadType: 's3',
+        })
+        expect(webhookCall.metadata).toBeDefined()
+        expect(webhookCall.metadata).toHaveProperty('size')
       })
 
       it('does not mutate in_progress_size when canUpload (RLS) fails', async () => {
@@ -1827,9 +2473,9 @@ describe('S3 Protocol', () => {
         )
         expect(part1Resp.ETag).toBeTruthy()
 
-        const canUploadSpy = vi
-          .spyOn(Uploader.prototype, 'canUpload')
-          .mockRejectedValueOnce(ERRORS.AccessDenied('upload'))
+        vi.spyOn(Uploader.prototype, 'canUpload').mockRejectedValueOnce(
+          ERRORS.AccessDenied('upload')
+        )
 
         try {
           await client.send(
@@ -1845,8 +2491,6 @@ describe('S3 Protocol', () => {
           throw new Error('Should not reach here')
         } catch (e) {
           expect((e as Error).message).not.toEqual('Should not reach here')
-        } finally {
-          canUploadSpy.mockRestore()
         }
 
         const part2Resp = await client.send(
@@ -1915,52 +2559,118 @@ describe('S3 Protocol', () => {
         expect(data).toBeTruthy()
         expect(resp.ETag).toBeTruthy()
       })
+
+      it('rejects a read with 412 when If-Match does not match the current ETag', async () => {
+        const bucketName = await createBucket(client)
+        const key = 'test-1.jpg'
+        await uploadFile(client, bucketName, key, 1)
+
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }))
+
+        const matching = await client.send(
+          new GetObjectCommand({ Bucket: bucketName, Key: key, IfMatch: head.ETag })
+        )
+        await matching.Body?.transformToByteArray()
+        expect(matching.$metadata.httpStatusCode).toEqual(200)
+
+        await expect(
+          client.send(
+            new GetObjectCommand({
+              Bucket: bucketName,
+              Key: key,
+              IfMatch: '"not-the-current-etag"',
+              Range: 'bytes=0-100',
+            })
+          )
+        ).rejects.toMatchObject({ name: 'PreconditionFailed', $metadata: { httpStatusCode: 412 } })
+      })
+
+      it('returns 304 with the ETag and no error document when If-None-Match matches', async () => {
+        const bucketName = await createBucket(client)
+        const key = 'test-1.jpg'
+        await uploadFile(client, bucketName, key, 1)
+
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }))
+
+        const error = (await client
+          .send(new GetObjectCommand({ Bucket: bucketName, Key: key, IfNoneMatch: head.ETag }))
+          .catch((e) => e)) as S3ServiceException
+
+        expect(error.$metadata.httpStatusCode).toBe(304)
+        expect(error.$response?.headers.etag).toBe(head.ETag)
+        expect(error.$response?.headers['content-type'] ?? '').not.toMatch(/xml/)
+      })
+
+      it('rejects a read with 412 when the object changed after If-Unmodified-Since', async () => {
+        const bucketName = await createBucket(client)
+        const key = 'test-1.jpg'
+        await uploadFile(client, bucketName, key, 1)
+
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }))
+        const lastModified = head.LastModified as Date
+
+        const unchanged = await client.send(
+          new GetObjectCommand({
+            Bucket: bucketName,
+            Key: key,
+            IfUnmodifiedSince: new Date(lastModified.getTime() + 60_000),
+          })
+        )
+        await unchanged.Body?.transformToByteArray()
+        expect(unchanged.$metadata.httpStatusCode).toEqual(200)
+
+        await expect(
+          client.send(
+            new GetObjectCommand({
+              Bucket: bucketName,
+              Key: key,
+              IfUnmodifiedSince: new Date(lastModified.getTime() - 60_000),
+            })
+          )
+        ).rejects.toMatchObject({ name: 'PreconditionFailed', $metadata: { httpStatusCode: 412 } })
+      })
     })
 
     describe('DeleteObjectCommand', () => {
       it('can delete an existing object', async () => {
         const webhookSpy = vi.spyOn(ObjectRemoved, 'sendWebhook').mockResolvedValue(undefined)
 
+        const bucketName = await createBucket(client)
+        const key = 'test-1.jpg'
+        await uploadFile(client, bucketName, key, 1)
+
+        const deleteObject = new DeleteObjectCommand({
+          Bucket: bucketName,
+          Key: key,
+        })
+
+        const deleteResp = await client.send(deleteObject)
+        expect(deleteResp.$metadata.httpStatusCode).toEqual(204)
+
+        const getObject = new GetObjectCommand({
+          Bucket: bucketName,
+          Key: key,
+        })
+
         try {
-          const bucketName = await createBucket(client)
-          const key = 'test-1.jpg'
-          await uploadFile(client, bucketName, key, 1)
-
-          const deleteObject = new DeleteObjectCommand({
-            Bucket: bucketName,
-            Key: key,
-          })
-
-          const deleteResp = await client.send(deleteObject)
-          expect(deleteResp.$metadata.httpStatusCode).toEqual(204)
-
-          const getObject = new GetObjectCommand({
-            Bucket: bucketName,
-            Key: key,
-          })
-
-          try {
-            await client.send(getObject)
-          } catch (e) {
-            expect((e as S3ServiceException).$metadata.httpStatusCode).toEqual(404)
-          }
-
-          // Verify webhook was called with correct data
-          expect(webhookSpy).toHaveBeenCalledTimes(1)
-          const webhookCall = webhookSpy.mock.calls[0][0] as Omit<ObjectRemovedEvent, '$version'>
-          expect(webhookCall).toMatchObject({
-            tenant: expect.objectContaining({ ref: tenantId }),
-            name: key,
-            version: expect.any(String),
-            bucketId: bucketName,
-            reqId: expect.any(String),
-            metadata: expect.any(Object),
-          })
-          expect(webhookCall.metadata).toBeDefined()
-          expect(webhookCall.metadata).toHaveProperty('size')
-        } finally {
-          webhookSpy.mockRestore()
+          await client.send(getObject)
+        } catch (e) {
+          expect((e as S3ServiceException).$metadata.httpStatusCode).toEqual(404)
         }
+
+        // Verify webhook was called with correct data
+        expect(webhookSpy).toHaveBeenCalledTimes(1)
+        const webhookCall = webhookSpy.mock.calls[0][0] as Omit<ObjectRemovedEvent, '$version'>
+        expect(webhookCall).toMatchObject({
+          tenant: expect.objectContaining({ ref: tenantId }),
+          name: key,
+          version: expect.any(String),
+          bucketId: bucketName,
+          reqId: expect.any(String),
+          metadata: expect.any(Object),
+        })
+        expect(webhookCall.metadata).toBeDefined()
+        expect(webhookCall.metadata).toHaveProperty('size')
       })
 
       it('can delete non-existing object', async () => {
@@ -1996,42 +2706,175 @@ describe('S3 Protocol', () => {
       it('can delete a single object', async () => {
         const webhookSpy = vi.spyOn(ObjectRemoved, 'sendWebhook').mockResolvedValue(undefined)
 
-        try {
-          const bucketName = await createBucket(client)
-          await Promise.all([uploadFile(client, bucketName, 'test-1.jpg', 1)])
+        const bucketName = await createBucket(client)
+        await Promise.all([uploadFile(client, bucketName, 'test-1.jpg', 1)])
 
-          const deleteObjectsCommand = new DeleteObjectsCommand({
+        const deleteObjectsCommand = new DeleteObjectsCommand({
+          Bucket: bucketName,
+          Delete: {
+            Objects: [
+              {
+                Key: 'test-1.jpg',
+              },
+            ],
+          },
+        })
+
+        const deleteResp = await client.send(deleteObjectsCommand)
+
+        expect(deleteResp.Deleted).toEqual([
+          {
+            Key: 'test-1.jpg',
+          },
+        ])
+
+        const listObjectsCommand = new ListObjectsV2Command({
+          Bucket: bucketName,
+        })
+
+        const resp = await client.send(listObjectsCommand)
+        expect(resp.Contents).toBe(undefined)
+
+        // Verify webhook was called with correct data
+        expect(webhookSpy).toHaveBeenCalledTimes(1)
+        const webhookCall = webhookSpy.mock.calls[0][0] as Omit<ObjectRemovedEvent, '$version'>
+        expect(webhookCall).toMatchObject({
+          tenant: expect.objectContaining({ ref: tenantId }),
+          name: 'test-1.jpg',
+          version: expect.any(String),
+          bucketId: bucketName,
+          reqId: expect.any(String),
+          metadata: expect.any(Object),
+        })
+        expect(webhookCall.metadata).toBeDefined()
+        expect(webhookCall.metadata).toHaveProperty('size')
+      })
+
+      it('preserves whitespace-only, numeric-looking, and boolean-looking keys in bulk deletes', async () => {
+        vi.spyOn(ObjectRemoved, 'sendWebhook').mockResolvedValue(undefined)
+        const numericReferenceKeys = ['0', '1']
+        const keys = [
+          '   ',
+          ' file ',
+          '007',
+          '1e3',
+          '0x10',
+          '12345678901234567890',
+          'true',
+          'FALSE',
+          ...numericReferenceKeys,
+        ]
+
+        const bucketName = await createBucket(client)
+        await Promise.all(
+          keys.map((Key) =>
+            client.send(
+              new PutObjectCommand({
+                Bucket: bucketName,
+                Key,
+                Body: 'x',
+              })
+            )
+          )
+        )
+
+        const entityDeleteResp = await sendSignedS3Request({
+          baseUrl,
+          method: 'POST',
+          path: `/s3/${bucketName}`,
+          query: { delete: '' },
+          headers: { 'Content-Type': 'application/xml' },
+          body: '<Delete><Object><Key>&#48;</Key></Object><Object><Key>&#x31;</Key></Object></Delete>',
+        })
+
+        expect(entityDeleteResp.status).toBe(200)
+        expect(entityDeleteResp.data).toContain('<Key>0</Key>')
+        expect(entityDeleteResp.data).toContain('<Key>1</Key>')
+
+        const remainingKeys = keys.filter((key) => !numericReferenceKeys.includes(key))
+        const remainingResp = await client.send(new ListObjectsV2Command({ Bucket: bucketName }))
+        expect(remainingResp.Contents?.map(({ Key }) => Key).sort()).toEqual(
+          remainingKeys.toSorted()
+        )
+
+        const deleteResp = await client.send(
+          new DeleteObjectsCommand({
             Bucket: bucketName,
             Delete: {
-              Objects: [
-                {
-                  Key: 'test-1.jpg',
-                },
-              ],
+              Objects: remainingKeys.map((Key) => ({ Key })),
             },
           })
+        )
 
-          const deleteResp = await client.send(deleteObjectsCommand)
+        expect(deleteResp.Deleted).toEqual(remainingKeys.map((Key) => ({ Key })))
 
-          expect(deleteResp.Deleted).toEqual([
-            {
-              Key: 'test-1.jpg',
-            },
-          ])
-
-          const listObjectsCommand = new ListObjectsV2Command({
+        const listResp = await client.send(
+          new ListObjectsV2Command({
             Bucket: bucketName,
           })
+        )
+        expect(listResp.Contents).toBeUndefined()
+      })
 
-          const resp = await client.send(listObjectsCommand)
-          expect(resp.Contents).toBe(undefined)
+      it('can delete multiple objects', async () => {
+        const webhookSpy = vi.spyOn(ObjectRemoved, 'sendWebhook').mockResolvedValue(undefined)
 
-          // Verify webhook was called with correct data
-          expect(webhookSpy).toHaveBeenCalledTimes(1)
-          const webhookCall = webhookSpy.mock.calls[0][0] as Omit<ObjectRemovedEvent, '$version'>
+        const bucketName = await createBucket(client)
+        await Promise.all([
+          uploadFile(client, bucketName, 'test-1.jpg', 1),
+          uploadFile(client, bucketName, 'test-2.jpg', 1),
+          uploadFile(client, bucketName, 'test-3.jpg', 1),
+        ])
+
+        const deleteObjectsCommand = new DeleteObjectsCommand({
+          Bucket: bucketName,
+          Delete: {
+            Objects: [
+              {
+                Key: 'test-1.jpg',
+              },
+              {
+                Key: 'test-2.jpg',
+              },
+              {
+                Key: 'test-3.jpg',
+              },
+            ],
+          },
+        })
+
+        const deleteResp = await client.send(deleteObjectsCommand)
+
+        expect(deleteResp.Deleted).toEqual([
+          {
+            Key: 'test-1.jpg',
+          },
+          {
+            Key: 'test-2.jpg',
+          },
+          {
+            Key: 'test-3.jpg',
+          },
+        ])
+
+        const listObjectsCommand = new ListObjectsV2Command({
+          Bucket: bucketName,
+        })
+
+        const resp = await client.send(listObjectsCommand)
+        expect(resp.Contents).toBe(undefined)
+
+        // Verify webhook was called 3 times (once per object)
+        expect(webhookSpy).toHaveBeenCalledTimes(3)
+        const deletedKeys = webhookSpy.mock.calls.map((call) => call[0].name).sort()
+        expect(deletedKeys).toEqual(['test-1.jpg', 'test-2.jpg', 'test-3.jpg'])
+
+        // Verify all calls have the required fields with metadata
+        webhookSpy.mock.calls.forEach((call) => {
+          const webhookCall = call[0] as Omit<ObjectRemovedEvent, '$version'>
           expect(webhookCall).toMatchObject({
             tenant: expect.objectContaining({ ref: tenantId }),
-            name: 'test-1.jpg',
+            name: expect.toBeOneOf(['test-1.jpg', 'test-2.jpg', 'test-3.jpg']),
             version: expect.any(String),
             bucketId: bucketName,
             reqId: expect.any(String),
@@ -2039,82 +2882,7 @@ describe('S3 Protocol', () => {
           })
           expect(webhookCall.metadata).toBeDefined()
           expect(webhookCall.metadata).toHaveProperty('size')
-        } finally {
-          webhookSpy.mockRestore()
-        }
-      })
-
-      it('can delete multiple objects', async () => {
-        const webhookSpy = vi.spyOn(ObjectRemoved, 'sendWebhook').mockResolvedValue(undefined)
-
-        try {
-          const bucketName = await createBucket(client)
-          await Promise.all([
-            uploadFile(client, bucketName, 'test-1.jpg', 1),
-            uploadFile(client, bucketName, 'test-2.jpg', 1),
-            uploadFile(client, bucketName, 'test-3.jpg', 1),
-          ])
-
-          const deleteObjectsCommand = new DeleteObjectsCommand({
-            Bucket: bucketName,
-            Delete: {
-              Objects: [
-                {
-                  Key: 'test-1.jpg',
-                },
-                {
-                  Key: 'test-2.jpg',
-                },
-                {
-                  Key: 'test-3.jpg',
-                },
-              ],
-            },
-          })
-
-          const deleteResp = await client.send(deleteObjectsCommand)
-
-          expect(deleteResp.Deleted).toEqual([
-            {
-              Key: 'test-1.jpg',
-            },
-            {
-              Key: 'test-2.jpg',
-            },
-            {
-              Key: 'test-3.jpg',
-            },
-          ])
-
-          const listObjectsCommand = new ListObjectsV2Command({
-            Bucket: bucketName,
-          })
-
-          const resp = await client.send(listObjectsCommand)
-          expect(resp.Contents).toBe(undefined)
-
-          // Verify webhook was called 3 times (once per object)
-          expect(webhookSpy).toHaveBeenCalledTimes(3)
-          const deletedKeys = webhookSpy.mock.calls.map((call) => call[0].name).sort()
-          expect(deletedKeys).toEqual(['test-1.jpg', 'test-2.jpg', 'test-3.jpg'])
-
-          // Verify all calls have the required fields with metadata
-          webhookSpy.mock.calls.forEach((call) => {
-            const webhookCall = call[0] as Omit<ObjectRemovedEvent, '$version'>
-            expect(webhookCall).toMatchObject({
-              tenant: expect.objectContaining({ ref: tenantId }),
-              name: expect.toBeOneOf(['test-1.jpg', 'test-2.jpg', 'test-3.jpg']),
-              version: expect.any(String),
-              bucketId: bucketName,
-              reqId: expect.any(String),
-              metadata: expect.any(Object),
-            })
-            expect(webhookCall.metadata).toBeDefined()
-            expect(webhookCall.metadata).toHaveProperty('size')
-          })
-        } finally {
-          webhookSpy.mockRestore()
-        }
+        })
       })
 
       it('try to delete multiple objects that dont exist', async () => {
@@ -2192,7 +2960,7 @@ describe('S3 Protocol', () => {
           superUser: adminUser,
           host: 'localhost',
         })
-        const db = connection.pool.acquire()
+        const db = connection
         const anonKey = await anonKeyAsync
         const anonClient = new S3Client({
           endpoint: `${baseUrl}/s3`,
@@ -2265,7 +3033,7 @@ describe('S3 Protocol', () => {
           anonClient.destroy()
           await db.query(`DROP POLICY IF EXISTS "${policyName}_select" ON storage.objects`)
           await db.query(`DROP POLICY IF EXISTS "${policyName}_delete" ON storage.objects`)
-          await connection.dispose()
+          connection.dispose()
           await client
             .send(
               new DeleteObjectsCommand({
@@ -2287,36 +3055,32 @@ describe('S3 Protocol', () => {
           .spyOn(ObjectCreatedCopyEvent, 'sendWebhook')
           .mockResolvedValue(undefined)
 
-        try {
-          const bucketName = await createBucket(client)
-          await uploadFile(client, bucketName, 'test-copy-1.jpg', 1)
+        const bucketName = await createBucket(client)
+        await uploadFile(client, bucketName, 'test-copy-1.jpg', 1)
 
-          const copyObjectCommand = new CopyObjectCommand({
-            Bucket: bucketName,
-            Key: 'test-copied-2.jpg',
-            CopySource: `${bucketName}/test-copy-1.jpg`,
-          })
+        const copyObjectCommand = new CopyObjectCommand({
+          Bucket: bucketName,
+          Key: 'test-copied-2.jpg',
+          CopySource: `${bucketName}/test-copy-1.jpg`,
+        })
 
-          const resp = await client.send(copyObjectCommand)
-          expect(resp.CopyObjectResult?.ETag).toBeTruthy()
+        const resp = await client.send(copyObjectCommand)
+        expect(resp.CopyObjectResult?.ETag).toBeTruthy()
 
-          // Verify webhook was called with correct data
-          expect(webhookSpy).toHaveBeenCalledTimes(1)
-          const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
-          expect(webhookCall).toMatchObject({
-            tenant: expect.objectContaining({ ref: tenantId }),
-            name: 'test-copied-2.jpg',
-            version: expect.any(String),
-            bucketId: bucketName,
-            reqId: expect.any(String),
-            metadata: expect.any(Object),
-            uploadType: 's3',
-          })
-          expect(webhookCall.metadata).toBeDefined()
-          expect(webhookCall.metadata).toHaveProperty('size')
-        } finally {
-          webhookSpy.mockRestore()
-        }
+        // Verify webhook was called with correct data
+        expect(webhookSpy).toHaveBeenCalledTimes(1)
+        const webhookCall = webhookSpy.mock.calls[0][0] as ObjectCreatedEvent
+        expect(webhookCall).toMatchObject({
+          tenant: expect.objectContaining({ ref: tenantId }),
+          name: 'test-copied-2.jpg',
+          version: expect.any(String),
+          bucketId: bucketName,
+          reqId: expect.any(String),
+          metadata: expect.any(Object),
+          uploadType: 's3',
+        })
+        expect(webhookCall.metadata).toBeDefined()
+        expect(webhookCall.metadata).toHaveProperty('size')
       })
 
       it('will copy an object in a different bucket', async () => {
@@ -2344,6 +3108,9 @@ describe('S3 Protocol', () => {
           CopySource: `${bucketName}/test-copy-1.jpg`,
           ContentType: 'image/png',
           CacheControl: 'max-age=2009',
+          Metadata: {
+            color: 'blue',
+          },
           MetadataDirective: 'REPLACE',
         })
 
@@ -2358,6 +3125,36 @@ describe('S3 Protocol', () => {
         const headObj = await client.send(headObjectCommand)
         expect(headObj.ContentType).toBe('image/png')
         expect(headObj.CacheControl).toBe('max-age=2009')
+        expect(headObj.Metadata).toMatchObject({ color: 'blue' })
+      })
+
+      it('will not preserve omitted metadata when replacing it', async () => {
+        const bucketName = await createBucket(client)
+        await uploadFile(client, bucketName, 'test-copy-1.jpg', 1)
+
+        await client.send(
+          new CopyObjectCommand({
+            Bucket: bucketName,
+            Key: 'test-copied-2.jpg',
+            CopySource: `${bucketName}/test-copy-1.jpg`,
+            CacheControl: 'max-age=2009',
+            MetadataDirective: 'REPLACE',
+          })
+        )
+
+        const copiedObject = await client.send(
+          new GetObjectCommand({
+            Bucket: bucketName,
+            Key: 'test-copied-2.jpg',
+          })
+        )
+        await copiedObject.Body?.transformToByteArray()
+
+        expect(copiedObject.CacheControl).toBe('max-age=2009')
+        // TODO: expect 'binary/octet-stream' (the S3 default) once the backend
+        // fallback is changed. RustFS stores no content type on REPLACE, so this
+        // currently reflects our own fallback.
+        expect(copiedObject.ContentType).toBe('application/octet-stream')
       })
 
       it('will allow copying an object in the same path, just altering its metadata', async () => {
@@ -2406,6 +3203,48 @@ describe('S3 Protocol', () => {
           expect((e as S3ServiceException).$metadata.httpStatusCode).toEqual(404)
           expect((e as S3ServiceException).message).toEqual('Object not found')
         }
+      })
+
+      it.each(['/', '%2F'])('copies an encoded source with %s separators', async (separator) => {
+        const bucketName = await createBucket(client)
+        const sourceKey = 'folder/my file+1?.txt'
+        const destKey = 'copied.txt'
+        const payload = Buffer.from('encoded-copy-source')
+
+        await client.send(
+          new PutObjectCommand({
+            Bucket: bucketName,
+            Key: sourceKey,
+            Body: payload,
+            ContentType: 'text/plain',
+          })
+        )
+
+        const signedRequest = await createSignedS3Request({
+          baseUrl,
+          path: `/s3/${bucketName}/${destKey}`,
+          method: 'PUT',
+          headers: {
+            'x-amz-copy-source': `${bucketName}${separator}folder${separator}my%20file%2B1%3F.txt`,
+          },
+        })
+
+        const response = await fetch(signedRequest.requestUrl, {
+          method: 'PUT',
+          headers: signedRequest.headers,
+        })
+
+        expect(response.status).toBe(200)
+
+        const copiedObject = await client.send(
+          new GetObjectCommand({
+            Bucket: bucketName,
+            Key: destKey,
+          })
+        )
+        const copiedBytes = await copiedObject.Body?.transformToByteArray()
+
+        expect(Buffer.from(copiedBytes || [])).toEqual(payload)
       })
     })
 
@@ -2468,6 +3307,25 @@ describe('S3 Protocol', () => {
         expect(resp.Uploads?.[1].Key).toBe('test-2.jpg')
         expect(resp.Uploads?.[2].Key).toBe('test-3.jpg')
         expect(resp.CommonPrefixes?.[0].Prefix).toBe('nested/')
+
+        const encodedPrefix = `encoded !'()*/`
+        await Promise.all([
+          client.send(createMultiPartUpload(`${encodedPrefix}file.txt`)),
+          client.send(createMultiPartUpload(`${encodedPrefix}folder/file.txt`)),
+        ])
+
+        const encoded = await client.send(
+          new ListMultipartUploadsCommand({
+            Bucket: bucketName,
+            Prefix: encodedPrefix,
+            Delimiter: '/',
+            EncodingType: 'url',
+          })
+        )
+        expect(encoded.Prefix).toBe('encoded%20%21%27%28%29%2A%2F')
+        expect(encoded.Delimiter).toBe('%2F')
+        expect(encoded.Uploads?.[0].Key).toBe('encoded%20%21%27%28%29%2A%2Ffile.txt')
+        expect(encoded.CommonPrefixes?.[0].Prefix).toBe('encoded%20%21%27%28%29%2A%2Ffolder%2F')
       })
 
       it('treats % as a literal character in multipart prefix filtering with delimiter', async () => {
@@ -2524,6 +3382,40 @@ describe('S3 Protocol', () => {
         expect(resp.CommonPrefixes).toBeUndefined()
         expect(resp.Uploads?.length).toBe(1)
         expect(resp.Uploads?.[0].Key).toBe(literalMatchKey)
+      })
+
+      it.each([
+        undefined,
+        '/',
+      ])('matches multipart upload prefixes case-sensitively with delimiter %s', async (delimiter) => {
+        const bucketName = await createBucket(client)
+        const runId = randomUUID()
+        const prefix = `Case-${runId}/`
+        const matchingKey = `${prefix}hit.jpg`
+        const differentlyCasedKey = `${prefix.toLowerCase()}miss.jpg`
+        const createMultiPartUpload = (key: string) =>
+          new CreateMultipartUploadCommand({
+            Bucket: bucketName,
+            Key: key,
+            ContentType: 'image/jpg',
+            CacheControl: 'max-age=2000',
+          })
+
+        await Promise.all([
+          client.send(createMultiPartUpload(matchingKey)),
+          client.send(createMultiPartUpload(differentlyCasedKey)),
+        ])
+
+        const resp = await client.send(
+          new ListMultipartUploadsCommand({
+            Bucket: bucketName,
+            Prefix: prefix,
+            Delimiter: delimiter,
+          })
+        )
+
+        expect(resp.Uploads?.map((upload) => upload.Key)).toEqual([matchingKey])
+        expect(resp.CommonPrefixes).toBeUndefined()
       })
     })
 
@@ -2711,9 +3603,147 @@ describe('S3 Protocol', () => {
         expect(parts3.Parts?.length).toBe(1)
         expect(parts3.Parts?.[0].PartNumber).toBe(3)
       })
+
+      it('lists only the latest upload of a re-uploaded part number', async () => {
+        const bucket = await createBucket(client)
+        const key = 'test-1.jpg'
+        const resp = await client.send(
+          new CreateMultipartUploadCommand({
+            Bucket: bucket,
+            Key: key,
+            ContentType: 'image/jpg',
+          })
+        )
+        expect(resp.UploadId).toBeTruthy()
+
+        const uploadPart = (partNumber: number, fill: string) => {
+          const data = Buffer.alloc(1024 * 5, fill)
+          return new UploadPartCommand({
+            Bucket: bucket,
+            Key: key,
+            ContentLength: data.length,
+            UploadId: resp.UploadId,
+            Body: data,
+            PartNumber: partNumber,
+          })
+        }
+
+        await client.send(uploadPart(1, 'a'))
+        const reuploaded = await client.send(uploadPart(1, 'b'))
+        await client.send(uploadPart(2, 'c'))
+
+        const parts = await client.send(
+          new ListPartsCommand({
+            Bucket: bucket,
+            Key: key,
+            UploadId: resp.UploadId,
+            MaxParts: 2,
+          })
+        )
+
+        expect(parts.Parts?.map((part) => part.PartNumber)).toEqual([1, 2])
+        expect(parts.Parts?.[0].ETag).toBe(reuploaded.ETag)
+        expect(parts.IsTruncated).toBe(false)
+      })
+
+      it('completes with the latest upload of a re-uploaded part number when no part list is sent', async () => {
+        const bucket = await createBucket(client)
+        const key = 'test-1.jpg'
+        const resp = await client.send(
+          new CreateMultipartUploadCommand({
+            Bucket: bucket,
+            Key: key,
+            ContentType: 'image/jpg',
+          })
+        )
+        expect(resp.UploadId).toBeTruthy()
+
+        const uploadPart = (fill: string) => {
+          const data = Buffer.alloc(1024, fill)
+          return new UploadPartCommand({
+            Bucket: bucket,
+            Key: key,
+            ContentLength: data.length,
+            UploadId: resp.UploadId,
+            Body: data,
+            PartNumber: 1,
+          })
+        }
+
+        await client.send(uploadPart('a'))
+        await client.send(uploadPart('b'))
+
+        await client.send(
+          new CompleteMultipartUploadCommand({
+            Bucket: bucket,
+            Key: key,
+            UploadId: resp.UploadId,
+          })
+        )
+
+        const getResp = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }))
+        const data = await getResp.Body?.transformToByteArray()
+        expect(Buffer.from(data ?? []).equals(Buffer.alloc(1024, 'b'))).toBe(true)
+      })
     })
 
     describe('UploadPartCopyCommand', () => {
+      it('returns CopyPartResult as the raw XML root', async () => {
+        const bucket = await createBucket(client)
+        const sourceKey = `source-${randomUUID()}.txt`
+        const targetKey = `copy-${randomUUID()}.txt`
+
+        await client.send(
+          new PutObjectCommand({
+            Bucket: bucket,
+            Key: sourceKey,
+            Body: 'source',
+            ContentType: 'text/plain',
+          })
+        )
+
+        const multipart = await client.send(
+          new CreateMultipartUploadCommand({
+            Bucket: bucket,
+            Key: targetKey,
+            ContentType: 'text/plain',
+          })
+        )
+        onTestFinished(async () => {
+          await client.send(
+            new AbortMultipartUploadCommand({
+              Bucket: bucket,
+              Key: targetKey,
+              UploadId: multipart.UploadId,
+            })
+          )
+        })
+
+        const signedRequest = await createSignedS3Request({
+          baseUrl,
+          path: `/s3/${bucket}/${targetKey}`,
+          method: 'PUT',
+          query: {
+            partNumber: '1',
+            uploadId: multipart.UploadId!,
+          },
+          headers: {
+            'x-amz-copy-source': `${bucket}/${sourceKey}`,
+          },
+        })
+
+        const response = await fetch(signedRequest.requestUrl, {
+          method: 'PUT',
+          headers: signedRequest.headers,
+        })
+        const body = await response.text()
+
+        expect(response.status).toBe(200)
+        expect(response.headers.get('content-type')).toContain('application/xml')
+        expect(body).toContain('?><CopyPartResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">')
+        expect(body).not.toContain('<responseBody>')
+      })
+
       it('copies inclusive source ranges without dropping boundary bytes', async () => {
         const bucket = await createBucket(client)
 
@@ -2853,18 +3883,35 @@ describe('S3 Protocol', () => {
         const resp = await client.send(createMultiPartUpload)
         expect(resp.UploadId).toBeTruthy()
 
-        const copyPart = new UploadPartCopyCommand({
-          Bucket: bucket,
-          Key: newKey,
-          UploadId: resp.UploadId,
-          PartNumber: 1,
-          CopySource: `${bucket}/${sourceKey}`,
-          CopySourceRange: `bytes=0-${1024 * 4}`,
+        const copySource = `${bucket}/${sourceKey}`
+        const copySourceRange = `bytes=0-${1024 * 4}`
+        const signedRequest = await createSignedS3Request({
+          baseUrl,
+          path: `/s3/${bucket}/${newKey}`,
+          method: 'PUT',
+          query: {
+            partNumber: '1',
+            uploadId: resp.UploadId!,
+          },
+          headers: {
+            'x-amz-copy-source': copySource,
+            'x-amz-copy-source-range': copySourceRange,
+          },
         })
+        const rawResponse = await fetch(signedRequest.requestUrl, {
+          method: 'PUT',
+          headers: {
+            ...signedRequest.headers,
+            accept: 'application/xml',
+          },
+        })
+        const rawBody = (await rawResponse.text()).replace(/^<\?xml[^>]*\?>/, '')
 
-        const copyResp = await client.send(copyPart)
-        expect(copyResp.CopyPartResult?.ETag).toBeTruthy()
-        expect(copyResp.CopyPartResult?.LastModified).toBeTruthy()
+        expect(rawResponse.status).toBe(200)
+        expect(rawBody).toMatch(/^<CopyPartResult(?:\s[^>]*)?>/)
+        expect(rawBody).toContain('<ETag>')
+        expect(rawBody).toContain('<LastModified>')
+        expect(rawBody).toMatch(/<\/CopyPartResult>$/)
 
         const listPartsCmd = new ListPartsCommand({
           Bucket: bucket,
@@ -2874,6 +3921,157 @@ describe('S3 Protocol', () => {
 
         const parts = await client.send(listPartsCmd)
         expect(parts.Parts?.length).toBe(1)
+      })
+
+      it.each(['/', '%2F'])('copies a part with %s source separators', async (separator) => {
+        const bucket = await createBucket(client)
+        const sourceKey = 'folder/my file+1?.txt'
+        const targetKey = `copy-${randomUUID()}.txt`
+        const payload = Buffer.from('encoded-part-copy-source')
+
+        await client.send(
+          new PutObjectCommand({
+            Bucket: bucket,
+            Key: sourceKey,
+            Body: payload,
+            ContentType: 'text/plain',
+          })
+        )
+
+        const multipart = await client.send(
+          new CreateMultipartUploadCommand({
+            Bucket: bucket,
+            Key: targetKey,
+            ContentType: 'text/plain',
+          })
+        )
+        onTestFinished(async () => {
+          await client
+            .send(
+              new AbortMultipartUploadCommand({
+                Bucket: bucket,
+                Key: targetKey,
+                UploadId: multipart.UploadId,
+              })
+            )
+            .catch(() => undefined)
+        })
+
+        const signedRequest = await createSignedS3Request({
+          baseUrl,
+          path: `/s3/${bucket}/${targetKey}`,
+          method: 'PUT',
+          query: {
+            partNumber: '1',
+            uploadId: multipart.UploadId!,
+          },
+          headers: {
+            'x-amz-copy-source': `${bucket}${separator}folder${separator}my%20file%2B1%3F.txt`,
+          },
+        })
+
+        const response = await fetch(signedRequest.requestUrl, {
+          method: 'PUT',
+          headers: signedRequest.headers,
+        })
+
+        expect(response.status).toBe(200)
+
+        const parts = await client.send(
+          new ListPartsCommand({
+            Bucket: bucket,
+            Key: targetKey,
+            UploadId: multipart.UploadId,
+          })
+        )
+        expect(parts.Parts).toHaveLength(1)
+
+        await client.send(
+          new CompleteMultipartUploadCommand({
+            Bucket: bucket,
+            Key: targetKey,
+            UploadId: multipart.UploadId,
+            MultipartUpload: {
+              Parts: [
+                {
+                  PartNumber: 1,
+                  ETag: parts.Parts?.[0].ETag,
+                },
+              ],
+            },
+          })
+        )
+
+        const copiedObject = await client.send(
+          new GetObjectCommand({
+            Bucket: bucket,
+            Key: targetKey,
+          })
+        )
+        const copiedBytes = await copiedObject.Body?.transformToByteArray()
+
+        expect(Buffer.from(copiedBytes || [])).toEqual(payload)
+      })
+    })
+
+    describe('Session token authentication', () => {
+      function sessionTokenClient(secretAccessKey: string, sessionToken: string) {
+        return new S3Client({
+          endpoint: `${baseUrl}/s3`,
+          forcePathStyle: true,
+          region: storageS3Region,
+          credentials: {
+            accessKeyId: tenantId,
+            secretAccessKey,
+            sessionToken,
+          },
+        })
+      }
+
+      it.each([
+        { name: 'tenantId', secret: () => tenantId },
+        { name: 'anon key', secret: (anonKey: string) => anonKey },
+      ])('authenticates a request signed with the $name as secret', async ({ secret }) => {
+        const anonKey = await anonKeyAsync
+        const sessionClient = sessionTokenClient(secret(anonKey), anonKey)
+
+        try {
+          const resp = await sessionClient.send(new ListBucketsCommand({}))
+          expect(resp.$metadata.httpStatusCode).toBe(200)
+        } finally {
+          sessionClient.destroy()
+        }
+      })
+
+      it('rejects a request signed with an unknown secret', async () => {
+        const anonKey = await anonKeyAsync
+        const sessionClient = sessionTokenClient('unknown-secret', anonKey)
+
+        try {
+          await sessionClient.send(new ListBucketsCommand({}))
+          throw new Error('Should not reach here')
+        } catch (e) {
+          expect((e as Error).message).not.toBe('Should not reach here')
+          expect((e as S3ServiceException).$metadata.httpStatusCode).toBe(403)
+          expect((e as S3ServiceException).name).toBe('SignatureDoesNotMatch')
+        } finally {
+          sessionClient.destroy()
+        }
+      })
+
+      it('rejects a valid signature when the session token is not a valid JWT', async () => {
+        const sessionClient = sessionTokenClient(tenantId, 'not-a-jwt')
+
+        try {
+          await sessionClient.send(new ListBucketsCommand({}))
+          throw new Error('Should not reach here')
+        } catch (e) {
+          expect((e as Error).message).not.toBe('Should not reach here')
+          expect((e as S3ServiceException).$metadata.httpStatusCode).toBe(403)
+          expect((e as S3ServiceException).name).toBe('AccessDenied')
+        } finally {
+          sessionClient.destroy()
+        }
       })
     })
 
@@ -2935,7 +4133,7 @@ describe('S3 Protocol', () => {
           { expiresIn: 100 }
         )
 
-        const resp = await fetch(uploadUrl, {
+        const resp = await undiciFetch(uploadUrl, {
           method: 'PUT',
           body,
           headers: {
@@ -2944,6 +4142,124 @@ describe('S3 Protocol', () => {
         })
 
         expect(resp.ok).toBeTruthy()
+      })
+
+      it('keeps metadata hoisted into a presigned upload url', async () => {
+        const bucket = await createBucket(client)
+        const key = 'test-meta.jpg'
+        const body = Buffer.alloc(1024)
+
+        const uploadUrl = await getSignedUrl(
+          client,
+          new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, Metadata: { foo: 'bar' } }),
+          { expiresIn: 100 }
+        )
+        expect(new URL(uploadUrl).searchParams.get('x-amz-meta-foo')).toBe('bar')
+
+        const resp = await undiciFetch(uploadUrl, {
+          method: 'PUT',
+          body,
+          headers: { 'Content-Length': body.length.toString() },
+        })
+        expect(resp.status).toBe(200)
+
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }))
+        expect(head.Metadata).toEqual({ foo: 'bar' })
+      })
+
+      it('prefers presigned query metadata over a conflicting header', async () => {
+        const bucket = await createBucket(client)
+        const key = 'test-meta-conflict.jpg'
+        const body = Buffer.alloc(1024)
+
+        const uploadUrl = await getSignedUrl(
+          client,
+          new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, Metadata: { foo: 'bar' } }),
+          { expiresIn: 100 }
+        )
+
+        const resp = await undiciFetch(uploadUrl, {
+          method: 'PUT',
+          body,
+          headers: { 'Content-Length': body.length.toString(), 'x-amz-meta-foo': 'baz' },
+        })
+        expect(resp.status).toBe(200)
+
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }))
+        expect(head.Metadata).toEqual({ foo: 'bar' })
+      })
+
+      it('routes a presigned copy url to CopyObject', async () => {
+        const bucket = await createBucket(client)
+        await uploadFile(client, bucket, 'source.jpg', 1)
+        await uploadFile(client, bucket, 'dest.jpg', 2)
+
+        const copyUrl = await getSignedUrl(
+          client,
+          new CopyObjectCommand({
+            Bucket: bucket,
+            Key: 'dest.jpg',
+            CopySource: `${bucket}/source.jpg`,
+            MetadataDirective: 'REPLACE',
+            Metadata: { copied: 'yes' },
+          }),
+          { expiresIn: 100 }
+        )
+        expect(new URL(copyUrl).searchParams.get('x-amz-copy-source')).toBe(`${bucket}/source.jpg`)
+
+        const resp = await undiciFetch(copyUrl, { method: 'PUT' })
+        expect(resp.status).toBe(200)
+
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: 'dest.jpg' }))
+        expect(head.ContentLength).toBe(1024)
+        expect(head.Metadata).toEqual({ copied: 'yes' })
+      })
+
+      it('completes a multipart upload through presigned urls', async () => {
+        const bucket = await createBucket(client)
+        const key = 'presigned-mpu.jpg'
+        const body = Buffer.alloc(1024, 'a')
+
+        const createUrl = await getSignedUrl(
+          client,
+          new CreateMultipartUploadCommand({ Bucket: bucket, Key: key, Metadata: { foo: 'bar' } }),
+          { expiresIn: 100 }
+        )
+        const createResp = await undiciFetch(createUrl, { method: 'POST' })
+        expect(createResp.status).toBe(200)
+        const uploadId = (await createResp.text()).match(/<UploadId>([^<]+)<\/UploadId>/)?.[1]
+        expect(uploadId).toBeTruthy()
+
+        const partUrl = await getSignedUrl(
+          client,
+          new UploadPartCommand({ Bucket: bucket, Key: key, UploadId: uploadId, PartNumber: 1 }),
+          { expiresIn: 100 }
+        )
+        const partResp = await undiciFetch(partUrl, {
+          method: 'PUT',
+          body,
+          headers: { 'Content-Length': body.length.toString() },
+        })
+        expect(partResp.status).toBe(200)
+
+        const completeUrl = await getSignedUrl(
+          client,
+          new CompleteMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId }),
+          { expiresIn: 100 }
+        )
+        const completeResp = await undiciFetch(completeUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/xml' },
+          body:
+            '<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">' +
+            `<Part><PartNumber>1</PartNumber><ETag>${partResp.headers.get('etag')}</ETag></Part>` +
+            '</CompleteMultipartUpload>',
+        })
+        expect(completeResp.status).toBe(200)
+
+        const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }))
+        expect(head.ContentLength).toBe(1024)
+        expect(head.Metadata).toEqual({ foo: 'bar' })
       })
 
       it('can fetch an asset via presigned URL', async () => {
@@ -2964,6 +4280,77 @@ describe('S3 Protocol', () => {
         const resp = await fetch(getUrl)
 
         expect(resp.ok).toBeTruthy()
+      })
+
+      it('ignores an incidental non-SigV4 Authorization header on a presigned GET', async () => {
+        // A presigned URL carries its signature in the query string, so an
+        // unrelated Authorization header must not be parsed as an S3 signature
+        // and must not override it.
+        const bucket = await createBucket(client)
+        const key = 'test-1.jpg'
+
+        await uploadFile(client, bucket, key, 2)
+
+        const getUrl = await getSignedUrl(
+          client,
+          new GetObjectCommand({
+            Bucket: bucket,
+            Key: key,
+          }),
+          { expiresIn: 100 }
+        )
+
+        const resp = await fetch(getUrl, {
+          headers: {
+            Authorization: 'Bearer not-a-sigv4-value',
+          },
+        })
+
+        expect(resp.ok).toBeTruthy()
+      })
+
+      it('ignores an incidental non-SigV4 Authorization header on a presigned upload', async () => {
+        const bucket = await createBucket(client)
+        const key = 'test-1.jpg'
+        const body = Buffer.alloc(1024 * 2)
+
+        const uploadUrl = await getSignedUrl(
+          client,
+          new PutObjectCommand({
+            Bucket: bucket,
+            Key: key,
+            Body: body,
+          }),
+          { expiresIn: 100 }
+        )
+
+        const resp = await undiciFetch(uploadUrl, {
+          method: 'PUT',
+          body,
+          headers: {
+            'Content-Length': body.length.toString(),
+            Authorization: 'Bearer not-a-sigv4-value',
+          },
+        })
+
+        expect(resp.ok).toBeTruthy()
+      })
+
+      it('rejects a non-SigV4 Authorization header when there is no query signature', async () => {
+        // Counterpart to the presigned cases above: with no query-string
+        // signature to fall through to, a non-SigV4 Authorization header must
+        // be rejected rather than silently accepted.
+        const bucket = await createBucket(client)
+
+        const resp = await fetch(`${baseUrl}/s3/${bucket}/test-key`, {
+          headers: {
+            Authorization: 'Bearer not-a-sigv4-value',
+          },
+        })
+
+        expect(resp.ok).toBeFalsy()
+        expect(resp.status).toBe(403)
+        expect(await resp.text()).toContain('AccessDenied')
       })
 
       it('supports response-content-disposition override', async () => {
@@ -3174,7 +4561,7 @@ describe('S3 Protocol', () => {
 describe('Migration compatibility', () => {
   describe('integration', () => {
     const { tenantId } = getConfig()
-    let connection: PgTenantConnection
+    let connection: TenantConnection
     let bucketId: string
 
     beforeAll(async () => {
@@ -3194,7 +4581,7 @@ describe('Migration compatibility', () => {
     afterAll(async () => {
       const db = new StoragePgDB(connection, { tenantId, host: 'localhost' })
       await db.deleteBucket(bucketId)
-      await connection.dispose()
+      connection.dispose()
     })
 
     const makeDB = (latestMigration?: keyof typeof DBMigration) =>

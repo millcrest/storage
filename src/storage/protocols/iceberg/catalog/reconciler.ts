@@ -1,4 +1,4 @@
-import { multitenantPgExecutor, PgTransaction } from '@internal/database'
+import { type DatabaseTransaction, multitenantPgExecutor } from '@internal/database'
 import { logger, logSchema } from '@internal/monitoring'
 import { PgShardStoreFactory, ShardCatalog, ShardRow } from '@internal/sharding'
 import {
@@ -10,7 +10,7 @@ import { IcebergCatalog } from '@storage/schemas'
 
 type NamespaceWithShardInfo = TableIndex & { shard_id?: string; shard_key?: string }
 type CatalogRow = Pick<IcebergCatalog, 'id' | 'name'>
-type ReconcilerTransaction = PgTransaction
+type ReconcilerTransaction = DatabaseTransaction
 
 /**
  * Highly experimental reconciler for iceberg catalogs
@@ -150,7 +150,7 @@ export class IcebergCatalogReconciler {
           const existingShard = await sharder.findShardByResourceId({
             kind: 'iceberg-table',
             tenantId,
-            bucketName: catalog.name,
+            bucketName: catalog.id,
             logicalName: `${namespaceId}/${table.name}`,
           })
 
@@ -159,7 +159,7 @@ export class IcebergCatalogReconciler {
             const { reservationId } = await sharder.reserve({
               kind: 'iceberg-table',
               tenantId,
-              bucketName: catalog.name,
+              bucketName: catalog.id,
               logicalName: `${namespaceId}/${table.name}`,
               shardId: shard.id,
             })
@@ -167,7 +167,7 @@ export class IcebergCatalogReconciler {
             await sharder.confirm(reservationId, {
               kind: 'iceberg-table',
               tenantId,
-              bucketName: catalog.name,
+              bucketName: catalog.id,
               logicalName: `${namespaceId}/${table.name}`,
             })
           }

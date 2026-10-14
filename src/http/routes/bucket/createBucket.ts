@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyRequest } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
 import { createDefaultSchema } from '../../routes-helper'
+import { fileSizeLimitSchema } from '../../schemas/file-size-limit'
 import { AuthenticatedRequest } from '../../types'
 import { ROUTE_OPERATIONS } from '../operations'
 
@@ -11,12 +12,8 @@ const createBucketBodySchema = {
     id: { type: 'string', examples: ['avatars'] },
     public: { type: 'boolean', examples: [false] },
     type: { type: 'string', enum: ['STANDARD', 'ANALYTICS'] },
-    file_size_limit: {
-      anyOf: [
-        { type: 'integer', examples: [1000], nullable: true, minimum: 0 },
-        { type: 'string', examples: ['100MB'], nullable: true },
-      ],
-    },
+    versioning_status: { type: 'string', enum: ['DISABLED', 'ENABLED'], examples: ['ENABLED'] },
+    file_size_limit: fileSizeLimitSchema,
     allowed_mime_types: {
       type: 'array',
       nullable: true,
@@ -25,6 +22,7 @@ const createBucketBodySchema = {
     },
   },
   required: ['name'],
+  not: { required: ['lifecycle_configuration'] },
 } as const
 
 const successResponseSchema = {
@@ -50,7 +48,7 @@ export default async function routes(fastify: FastifyInstance) {
     '/',
     {
       config: {
-        operation: { type: ROUTE_OPERATIONS.CREATE_BUCKET },
+        operation: ROUTE_OPERATIONS.CREATE_BUCKET,
         resources: (req: FastifyRequest<createBucketRequestInterface>) => [
           req.body.id || req.body.name || '',
         ],
@@ -67,6 +65,7 @@ export default async function routes(fastify: FastifyInstance) {
         allowed_mime_types,
         file_size_limit,
         type,
+        versioning_status,
       } = request.body
 
       await request.storage.createBucket({
@@ -75,6 +74,7 @@ export default async function routes(fastify: FastifyInstance) {
         name: bucketName,
         owner,
         public: isPublic ?? false,
+        versioning_status,
         fileSizeLimit: file_size_limit,
         allowedMimeTypes: allowed_mime_types
           ? allowed_mime_types?.filter((mime) => mime)

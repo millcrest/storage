@@ -1,5 +1,4 @@
 import { ERRORS } from '@internal/errors'
-import { Storage } from '@storage/storage'
 import { Agent } from 'undici'
 
 import { getConfig } from '../../config'
@@ -7,11 +6,16 @@ import { getConfig } from '../../config'
 const { cdnPurgeEndpointURL, cdnPurgeEndpointKey } = getConfig()
 
 const CDN_PURGE_TIMEOUT_MS = 10_000
+const CDN_PURGE_CONNECT_TIMEOUT_MS = 3_000
+const CDN_PURGE_HEADERS_BODY_TIMEOUT_MS = CDN_PURGE_TIMEOUT_MS - CDN_PURGE_CONNECT_TIMEOUT_MS
 
 const dispatcher = new Agent({
   connections: 200,
-  keepAliveTimeout: 1000 * 2,
-  keepAliveMaxTimeout: 1000 * 2,
+  keepAliveTimeout: 30_000,
+  keepAliveMaxTimeout: 30_000,
+  connectTimeout: CDN_PURGE_CONNECT_TIMEOUT_MS,
+  headersTimeout: CDN_PURGE_HEADERS_BODY_TIMEOUT_MS,
+  bodyTimeout: CDN_PURGE_HEADERS_BODY_TIMEOUT_MS,
 })
 
 const defaultHeaders = new Headers({
@@ -81,8 +85,6 @@ async function assertOkResponse(response: Response) {
 }
 
 export class CdnCacheManager {
-  constructor(protected readonly storage: Storage) {}
-
   async purge(opts: PurgeCacheInput) {
     if (!cdnPurgeUrl) {
       throw ERRORS.MissingParameter('CDN_PURGE_ENDPOINT_URL is not set')
@@ -127,5 +129,9 @@ export class CdnCacheManager {
         'Error purging cache'
       )
     }
+  }
+
+  isConfigured() {
+    return Boolean(cdnPurgeUrl)
   }
 }

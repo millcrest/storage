@@ -1,9 +1,10 @@
-import { createMutexByKey } from '@internal/concurrency'
+import { createSingleFlightByKey } from '@internal/concurrency'
 import {
   getPostgresConnection,
   getServiceKeyUser,
   getTenantConfig,
-  PgTenantConnection,
+  type TenantConnection,
+  TenantMigrationStatus,
 } from '@internal/database'
 import {
   areMigrationsUpToDate,
@@ -14,19 +15,35 @@ import {
   updateTenantMigrationsState,
 } from '@internal/database/migrations'
 import { ERRORS } from '@internal/errors'
-import { logSchema } from '@internal/monitoring'
+import type { FastifyInstance } from 'fastify'
 import fastifyPlugin from 'fastify-plugin'
 import { getConfig, MultitenantMigrationStrategy } from '../../config'
 
 declare module 'fastify' {
   interface FastifyRequest {
-    db: PgTenantConnection
+    db: TenantConnection
     latestMigration?: keyof typeof DBMigration
   }
 }
 
 const { databaseEnableQueryCancellation, dbMigrationStrategy, isMultitenant, dbMigrationFreezeAt } =
   getConfig()
+
+const migrationSingleFlight = createSingleFlightByKey<keyof typeof DBMigration>()
+
+function resolveLatestMigration(
+  localLatest: keyof typeof DBMigration,
+  applied: keyof typeof DBMigration | undefined
+): keyof typeof DBMigration {
+  if (
+    applied &&
+    DBMigration[applied] !== undefined &&
+    DBMigration[applied] > DBMigration[localLatest]
+  ) {
+    return applied
+  }
+  return localLatest
+}
 
 export const db = fastifyPlugin(
   async function db(fastify) {
@@ -53,7 +70,7 @@ export const db = fastifyPlugin(
         headers: request.headers,
         path: request.url,
         method: request.method,
-        operation: () => request.operation?.type,
+        operation: () => request.operation,
       })
 
       // Connect abort signal to DB connection for query cancellation
@@ -62,18 +79,7 @@ export const db = fastifyPlugin(
       }
     })
 
-    fastify.addHook('onSend', async (request, reply, payload) => {
-      disposeRequestConnections(request)
-      return payload
-    })
-
-    fastify.addHook('onTimeout', async (request) => {
-      disposeRequestConnections(request)
-    })
-
-    fastify.addHook('onRequestAbort', async (request) => {
-      disposeRequestConnections(request)
-    })
+    registerConnectionCleanupHooks(fastify)
   },
   { name: 'db-init' }
 )
@@ -99,7 +105,7 @@ export const dbSuperUser = fastifyPlugin<DbSuperUserPluginOptions>(
         method: request.method,
         headers: request.headers,
         disableHostCheck: opts.disableHostCheck,
-        operation: () => request.operation?.type,
+        operation: () => request.operation,
       })
 
       // Connect abort signal to DB connection for query cancellation
@@ -108,38 +114,25 @@ export const dbSuperUser = fastifyPlugin<DbSuperUserPluginOptions>(
       }
     })
 
-    fastify.addHook('onSend', async (request, reply, payload) => {
-      disposeRequestConnections(request)
-      return payload
-    })
-
-    fastify.addHook('onTimeout', async (request) => {
-      disposeRequestConnections(request)
-    })
-
-    fastify.addHook('onRequestAbort', async (request) => {
-      disposeRequestConnections(request)
-    })
+    registerConnectionCleanupHooks(fastify)
   },
   { name: 'db-superuser-init' }
 )
 
-function disposeRequestConnections(request: {
-  db?: PgTenantConnection
-  log: Parameters<typeof logSchema.error>[0]
-  tenantId: string
-  id: string
-  sbReqId?: string
-}) {
-  request.db?.dispose().catch((e) => {
-    logSchema.error(request.log, 'Error disposing db connection', {
-      type: 'db-connection',
-      tenantId: request.tenantId,
-      project: request.tenantId,
-      reqId: request.id,
-      sbReqId: request.sbReqId,
-      error: e,
-    })
+function registerConnectionCleanupHooks(fastify: FastifyInstance) {
+  fastify.addHook('onSend', (request, _reply, payload, done) => {
+    request.db?.dispose()
+    done(null, payload)
+  })
+
+  fastify.addHook('onTimeout', (request, _reply, done) => {
+    request.db?.dispose()
+    done()
+  })
+
+  fastify.addHook('onRequestAbort', (request, done) => {
+    request.db?.dispose()
+    done()
   })
 }
 
@@ -159,8 +152,6 @@ export const migrations = fastifyPlugin(
     })
 
     if (dbMigrationStrategy === MultitenantMigrationStrategy.ON_REQUEST) {
-      const migrationsMutex = createMutexByKey<void>()
-
       fastify.addHook('preHandler', async (request) => {
         // migrations are handled via async migrations
         if (!isMultitenant) {
@@ -168,27 +159,50 @@ export const migrations = fastifyPlugin(
         }
 
         const tenant = await getTenantConfig(request.tenantId)
-        const migrationsUpToDate = await areMigrationsUpToDate(request.tenantId)
-
-        if (tenant.syncMigrationsDone || migrationsUpToDate) {
+        if (tenant.syncMigrationsDone) {
+          request.latestMigration = resolveLatestMigration(
+            await lastLocalMigrationName(),
+            tenant.migrationVersion
+          )
           return
         }
 
-        await migrationsMutex(request.tenantId, async () => {
-          const tenant = await getTenantConfig(request.tenantId)
+        const latestMigration = await migrationSingleFlight(request.tenantId, async () => {
+          const localLatest = await lastLocalMigrationName()
+          const migrationsUpToDate = await areMigrationsUpToDate(request.tenantId)
 
-          if (tenant.syncMigrationsDone) {
-            return
+          if (!migrationsUpToDate) {
+            await runMigrationsOnTenant({
+              databaseUrl: tenant.databaseUrl,
+              tenantId: request.tenantId,
+              upToMigration: dbMigrationFreezeAt,
+            })
           }
 
-          await runMigrationsOnTenant({
-            databaseUrl: tenant.databaseUrl,
-            tenantId: request.tenantId,
-            upToMigration: dbMigrationFreezeAt,
-          })
-          await updateTenantMigrationsState(request.tenantId)
-          tenant.syncMigrationsDone = true
+          const refreshedTenant = await getTenantConfig(request.tenantId)
+          const resolvedMigration = resolveLatestMigration(
+            resolveLatestMigration(localLatest, tenant.migrationVersion),
+            refreshedTenant.migrationVersion
+          )
+
+          if (!migrationsUpToDate) {
+            await updateTenantMigrationsState(request.tenantId, {
+              migration: resolvedMigration,
+              state: TenantMigrationStatus.COMPLETED,
+            })
+          }
+
+          refreshedTenant.migrationVersion = resolvedMigration
+          refreshedTenant.migrationStatus = TenantMigrationStatus.COMPLETED
+          refreshedTenant.syncMigrationsDone = true
+
+          return resolvedMigration
         })
+
+        tenant.migrationVersion = latestMigration
+        tenant.migrationStatus = TenantMigrationStatus.COMPLETED
+        tenant.syncMigrationsDone = true
+        request.latestMigration = latestMigration
       })
     }
 
@@ -199,10 +213,13 @@ export const migrations = fastifyPlugin(
         }
 
         const tenant = await getTenantConfig(request.tenantId)
-        const migrationsUpToDate = await areMigrationsUpToDate(request.tenantId)
+        if (tenant.syncMigrationsDone) {
+          return
+        }
 
         // migrations are up to date
-        if (tenant.syncMigrationsDone || migrationsUpToDate) {
+        if (await areMigrationsUpToDate(request.tenantId)) {
+          tenant.syncMigrationsDone = true
           return
         }
 

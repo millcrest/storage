@@ -17,6 +17,9 @@ export interface TransformOptions {
   resize?: 'cover' | 'contain' | 'fill'
   format?: 'origin' | 'avif' | 'webp'
   quality?: number
+  gravity?: 'no' | 'so' | 'ea' | 'we' | 'noea' | 'nowe' | 'soea' | 'sowe' | 'ce' | 'sm' | 'fp'
+  x_offset?: number
+  y_offset?: number
 }
 
 const {
@@ -62,6 +65,7 @@ const IMGPROXY_TOO_MANY_REQUESTS_MESSAGE = 'Too many requests'
 const IMGPROXY_REQUEST_TIMED_OUT_MESSAGE = 'Image request timed out'
 const IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE =
   'The source image is invalid or unsupported for rendering'
+const IMGPROXY_SOURCE_IMAGE_TYPE_UNDETERMINED_MESSAGE = 'Unable to determine source image type'
 const IMGPROXY_SOURCE_IMAGE_BAD_REQUESTS = [
   {
     message: IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE,
@@ -77,11 +81,37 @@ const IMGPROXY_SOURCE_IMAGE_BAD_REQUESTS = [
   },
   {
     message: IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE,
+    pattern: /^Can't download source image: invalid JPEG format:/i,
+  },
+  {
+    message: IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE,
+    pattern: /^Can't download source image: webp: invalid format$/i,
+  },
+  {
+    message: IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE,
+    pattern:
+      /^Can't download source image: (?:Invalid (?:box data size|(?:ftyp|meta|ispe) data)|Dimensions data wasn't found in meta box)$/i,
+  },
+  {
+    // v3 classifies load_buffer; v4 classifies load_source and any *2vips.
+    message: IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE,
+    pattern: /^(?:\S+load_(?:buffer|source)|\S+2vips|VipsJpeg): /i,
+  },
+  {
+    message: IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE,
+    pattern: /XML parse error:/i,
+  },
+  {
+    message: IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE,
+    pattern: /heif: Invalid input:/i,
+  },
+  {
+    message: IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE,
     pattern: /^Invalid source image$/i,
   },
   {
     message: IMGPROXY_SOURCE_IMAGE_INVALID_OR_UNSUPPORTED_MESSAGE,
-    pattern: /^Broken or unsupported image$/i,
+    pattern: /^Broken or unsupported (?:SVG )?image$/i,
   },
   {
     message: 'The source image resolution is too large to process',
@@ -99,7 +129,11 @@ const IMGPROXY_SOURCE_IMAGE_BAD_REQUESTS = [
 const IMGPROXY_PUBLIC_ERRORS = [
   {
     message: IMGPROXY_SOURCE_IMAGE_ERROR_MESSAGE,
-    pattern: /^Source image is unreachable$/i,
+    pattern: /^Source (?:image )?is unreachable$/i,
+  },
+  {
+    message: IMGPROXY_SOURCE_IMAGE_ERROR_MESSAGE,
+    pattern: /^Source response is incomplete$/i,
   },
   {
     message: IMGPROXY_INVALID_TRANSFORMATION_MESSAGE,
@@ -107,7 +141,11 @@ const IMGPROXY_PUBLIC_ERRORS = [
   },
   {
     message: IMGPROXY_INVALID_SOURCE_MESSAGE,
-    pattern: /^Invalid source$/i,
+    pattern: /^Invalid source(?: URL)?$/i,
+  },
+  {
+    message: IMGPROXY_SOURCE_IMAGE_TYPE_UNDETERMINED_MESSAGE,
+    pattern: /^Failed to detect source image type$/i,
   },
   {
     message: IMGPROXY_REJECTED_REQUEST_MESSAGE,
@@ -318,6 +356,27 @@ export class ImageRenderer extends Renderer {
       segments.push(`format:${options.format}`)
     }
 
+    if (options.gravity === 'sm') {
+      // imgproxy smart gravity ignores offsets
+      segments.push('gravity:sm')
+    } else if (options.gravity === 'fp') {
+      const { x_offset: xOffset, y_offset: yOffset } = options
+      if (!isValidFocalPointCoordinate(xOffset) || !isValidFocalPointCoordinate(yOffset)) {
+        throw ERRORS.InvalidParameter('gravity', {
+          message: 'Focal point requires x and y coordinates within 0-1 range',
+        })
+      }
+      segments.push(`gravity:fp:${xOffset}:${yOffset}`)
+    } else if (options.gravity) {
+      const { x_offset: xOffset, y_offset: yOffset } = options
+      // Omit optional offsets when unset so imgproxy uses its type default (no extra :0:0).
+      segments.push(
+        xOffset === undefined && yOffset === undefined
+          ? `gravity:${options.gravity}`
+          : `gravity:${options.gravity}:${xOffset ?? 0}:${yOffset ?? 0}`
+      )
+    }
+
     return segments
   }
 
@@ -370,7 +429,7 @@ export class ImageRenderer extends Renderer {
     const transformOptions: TransformOptions = {}
 
     for (const param of transformations.split(',')) {
-      const [name, value] = param.split(':')
+      const [name, value, xOffset, yOffset] = param.split(':')
       if (value === undefined || value === '') {
         continue
       }
@@ -390,6 +449,21 @@ export class ImageRenderer extends Renderer {
           break
         case 'quality':
           transformOptions.quality = parseInt(value, 10)
+          break
+        case 'gravity':
+          transformOptions.gravity = value as TransformOptions['gravity']
+          if (xOffset !== undefined && xOffset !== '') {
+            const parsedXOffset = parseFloat(xOffset)
+            if (Number.isFinite(parsedXOffset)) {
+              transformOptions.x_offset = parsedXOffset
+            }
+          }
+          if (yOffset !== undefined && yOffset !== '') {
+            const parsedYOffset = parseFloat(yOffset)
+            if (Number.isFinite(parsedYOffset)) {
+              transformOptions.y_offset = parsedYOffset
+            }
+          }
           break
       }
     }
@@ -411,6 +485,9 @@ export class ImageRenderer extends Renderer {
       this.backend.privateAssetUrl(options.bucket, options.key, options.version),
       this.backend.headObject(options.bucket, options.key, options.version),
     ])
+    if (headObj.contentEncoding) {
+      throw ERRORS.ImageProcessingError(400, 'Cannot transform a content-encoded object')
+    }
     const transformations = ImageRenderer.applyTransformation(this.transformOptions || {})
     const transformLimits = ImageRenderer.applyTransformationLimits(this.limits || {})
 
@@ -503,6 +580,10 @@ export class ImageRenderer extends Renderer {
     )
     return ERRORS.ImageProcessingError(processingError.statusCode, processingError.message)
   }
+}
+
+function isValidFocalPointCoordinate(value: number | undefined): value is number {
+  return value !== undefined && Number.isFinite(value) && value >= 0 && value <= 1
 }
 
 function getImageProcessingError(statusCode: number, message: string) {

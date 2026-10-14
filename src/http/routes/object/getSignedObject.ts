@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
 import { getConfig } from '../../../config'
 import { SIGNED_URL_SCOPE_DOWNLOAD } from '../../../internal/auth'
+import { sharedErrorResponseSchemas } from '../../schemas/error'
 import { ROUTE_OPERATIONS } from '../operations'
 
 const { storageS3Bucket } = getConfig()
@@ -47,18 +48,18 @@ export default async function routes(fastify: FastifyInstance) {
         params: getSignedObjectParamsSchema,
         querystring: getSignedObjectQSSchema,
         summary,
-        response: { '4xx': { $ref: 'errorSchema#', description: 'Error response' } },
+        response: sharedErrorResponseSchemas,
         tags: ['object'],
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.GET_SIGNED_OBJECT },
+        operation: ROUTE_OPERATIONS.GET_SIGNED_OBJECT,
       },
     },
     async (request, response) => {
       const { token } = request.query
       const { download } = request.query
 
-      const { url, exp } = await request.storage
+      const { url, exp, versionId } = await request.storage
         .from(request.params.bucketName)
         .verifyObjectSignature(token, request.params['*'], SIGNED_URL_SCOPE_DOWNLOAD)
 
@@ -68,7 +69,7 @@ export default async function routes(fastify: FastifyInstance) {
       const obj = await request.storage
         .asSuperUser()
         .from(bucketName)
-        .findObject(objParts.join('/'), 'id,version,metadata')
+        .findObject(objParts.join('/'), 'id,version,metadata', undefined, versionId)
 
       return request.storage.renderer('asset').render(request, response, {
         bucket: storageS3Bucket,

@@ -1,9 +1,11 @@
-import { getTenantConfig } from '@internal/database'
 import { DBMigration } from '@internal/database/migrations'
+import { ERRORS, ErrorCode } from '@internal/errors'
+import { OBJECT_LISTING_FILTER_MODES } from '@storage/schemas'
 import { FastifyInstance } from 'fastify'
 import { FastifyRequest } from 'fastify/types/request'
 import { FromSchema } from 'json-schema-to-ts'
 import { getConfig } from '../../../config'
+import { sharedErrorResponseSchemas } from '../../schemas/error'
 import { AuthenticatedRequest } from '../../types'
 import { ROUTE_OPERATIONS } from '../operations'
 
@@ -21,7 +23,8 @@ const searchRequestBodySchema = {
   type: 'object',
   properties: {
     prefix: { type: 'string', examples: ['folder/subfolder'] },
-    limit: { type: 'integer', minimum: 1, examples: [10] },
+    exactMatch: { type: 'boolean' },
+    limit: { type: 'integer', finite: true, minimum: 1, examples: [10] },
     cursor: { type: 'string' },
     with_delimiter: { type: 'boolean' },
     sortBy: {
@@ -32,6 +35,8 @@ const searchRequestBodySchema = {
       },
       required: ['column'],
     },
+    noncurrentVersions: { type: 'string', enum: OBJECT_LISTING_FILTER_MODES },
+    deleteMarkers: { type: 'string', enum: OBJECT_LISTING_FILTER_MODES },
   },
 } as const
 interface searchRequestInterface extends AuthenticatedRequest {
@@ -47,11 +52,12 @@ export default async function routes(fastify: FastifyInstance) {
       schema: {
         body: searchRequestBodySchema,
         params: searchRequestParamsSchema,
+        response: sharedErrorResponseSchemas,
         summary,
         tags: ['object'],
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.LIST_OBJECTS_V2 },
+        operation: ROUTE_OPERATIONS.LIST_OBJECTS_V2,
         logMetadata: (req: FastifyRequest<searchRequestInterface>) => ({
           prefix: req.body.prefix,
           limit: req.body.limit,
@@ -62,17 +68,39 @@ export default async function routes(fastify: FastifyInstance) {
       },
     },
     async (request, response) => {
-      if (isMultitenant) {
-        const { migrationVersion } = await getTenantConfig(request.tenantId)
-        if (migrationVersion && DBMigration[migrationVersion] < DBMigration['search-v2']) {
-          return response.status(400).send({
-            message: 'This feature is not available for your tenant',
-          })
-        }
+      const latestMigration = request.latestMigration
+      if (
+        isMultitenant &&
+        latestMigration &&
+        DBMigration[latestMigration] < DBMigration['search-v2']
+      ) {
+        return response.status(400).send({
+          statusCode: '400',
+          error: 'FeatureNotEnabled',
+          message: 'This feature is not available for your tenant',
+          code: ErrorCode.FeatureNotEnabled,
+        })
       }
 
       const { bucketName } = request.params
-      const { limit, with_delimiter, cursor, prefix, sortBy } = request.body
+      const {
+        limit,
+        with_delimiter,
+        cursor,
+        prefix,
+        sortBy,
+        noncurrentVersions,
+        deleteMarkers,
+        exactMatch,
+      } = request.body
+
+      if (
+        ((noncurrentVersions !== undefined && noncurrentVersions !== 'exclude') ||
+          (deleteMarkers !== undefined && deleteMarkers !== 'exclude')) &&
+        !(await request.storage.db.hasMigration('list-objects-with-versions'))
+      ) {
+        throw ERRORS.FeatureNotEnabled(bucketName, 'object versioning schema')
+      }
 
       const results = await request.storage.from(bucketName).listObjectsV2({
         prefix,
@@ -80,6 +108,9 @@ export default async function routes(fastify: FastifyInstance) {
         maxKeys: limit,
         cursor,
         sortBy,
+        noncurrentVersions,
+        deleteMarkers,
+        exactMatch,
       })
 
       return response.status(200).send(results)

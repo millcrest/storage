@@ -1,21 +1,26 @@
 import { randomUUID } from 'node:crypto'
 import { ListBucketsCommand } from '@aws-sdk/client-s3'
-import { describeAcceptance, getAcceptanceConfig, requireConfigValue } from '../support/config'
-import { AcceptanceHttpClient, createAdminClient } from '../support/http'
+import {
+  describeAcceptance,
+  encodePathSegments,
+  getAcceptanceConfig,
+  requireConfigValue,
+} from '../support/config'
+import { AcceptanceHttpClient, createAdminClient, createRestClient } from '../support/http'
+import {
+  cleanupRestResources,
+  createRestBucket,
+  requireServiceKey,
+  uniqueBucketName,
+  uniqueObjectKey,
+  uploadRestObject,
+} from '../support/resources'
 import { createAcceptanceS3Client } from '../support/s3'
+import { isUuid } from '../support/validation'
 
 interface TenantSummary {
   fileSizeLimit?: number
   id: string
-}
-
-interface MetricConfigEntry {
-  enabled: boolean
-  name: string
-}
-
-interface MetricsConfigResponse {
-  metrics: MetricConfigEntry[]
 }
 
 interface TenantFeatures {
@@ -45,7 +50,6 @@ interface TenantFeatures {
 interface TenantDetailResponse {
   anonKey?: string
   capabilities?: Record<string, unknown>
-  databasePoolMode?: string | null
   databasePoolUrl?: string | null
   databaseUrl?: string
   fileSizeLimit?: number
@@ -95,6 +99,23 @@ interface JwksToggleResponse {
   result: boolean
 }
 
+interface JwksListItem {
+  active: boolean
+  kid: string
+  kind: string
+  type: string
+}
+
+interface SignedUrlResponse {
+  signedURL: string
+}
+
+interface WellKnownJwksResponse {
+  keys: Array<Record<string, unknown>>
+}
+
+const STORAGE_URL_SIGNING_KIND = 'storage-url-signing-key'
+
 describeAcceptance(
   'admin API contract',
   {
@@ -103,7 +124,7 @@ describeAcceptance(
     requires: ['admin'],
   },
   () => {
-    it('covers tenant reads, migration and queue validation, metrics config, JWKS validation, orphan validation, and S3 credential CRUD', async () => {
+    it('covers tenant reads, migration and queue validation, JWKS validation, orphan validation, and S3 credential CRUD', async () => {
       const config = getAcceptanceConfig()
       const client = createAdminClient()
       const headers = {
@@ -128,12 +149,6 @@ describeAcceptance(
           headers,
         })
         expect(migrations.json).toBeTruthy()
-
-        const metrics = await client.request<MetricsConfigResponse>('GET', '/metrics/config', {
-          expectedStatus: 200,
-          headers,
-        })
-        expect(Array.isArray(metrics.json?.metrics)).toBe(true)
 
         await client.request('GET', '/migrations/failed?cursor=not-a-number', {
           expectedStatus: 400,
@@ -186,7 +201,7 @@ describeAcceptance(
         if (typeof jwkKid !== 'string' || jwkKid.length === 0) {
           throw new Error('Admin JWKS create response did not include a non-empty kid')
         }
-        expect(jwkKid.startsWith(`${jwkKind}_`)).toBe(true)
+        expect(isUuid(jwkKid)).toBe(true)
         jwkKids.add(jwkKid)
 
         const disabledJwk = await client.request<JwksToggleResponse>(
@@ -336,8 +351,23 @@ describeAcceptance(
       const tenantIdsToCleanup = new Set<string>()
 
       try {
+        const createTenantOverrides = config.adminReturnSensitiveData
+          ? {
+              fileSizeLimit: 1_048_576,
+            }
+          : {
+              fileSizeLimit: 1_048_576,
+              anonKey: 'abc',
+              databaseUrl: config.adminDatabaseUrlOverride ?? 'def',
+              jwtSecret: 'ghi',
+              serviceKey: 'jkl',
+            }
         await client.request('POST', `/tenants/${createdTenantId}`, {
-          body: buildTenantProvisionBody(sourceTenant.json, 1_048_576),
+          body: buildTenantProvisionBody(
+            sourceTenant.json,
+            createTenantOverrides,
+            config.adminReturnSensitiveData
+          ),
           expectedStatus: 201,
           headers,
         })
@@ -413,15 +443,45 @@ describeAcceptance(
           expect(reset.json?.message).toBe('Migrations reset')
         }
 
+        const putTenantOverrides = config.adminReturnSensitiveData
+          ? {
+              fileSizeLimit: 3_145_728,
+            }
+          : {
+              fileSizeLimit: 3_145_728,
+              anonKey: 'abc',
+              databaseUrl: config.adminDatabaseUrlOverride ?? 'def',
+              jwtSecret: 'ghi',
+              serviceKey: 'jkl',
+            }
         await client.request('PUT', `/tenants/${upsertedTenantId}`, {
-          body: buildTenantProvisionBody(sourceTenant.json, 3_145_728),
+          body: buildTenantProvisionBody(
+            sourceTenant.json,
+            putTenantOverrides,
+            config.adminReturnSensitiveData
+          ),
           expectedStatus: 204,
           headers,
         })
         tenantIdsToCleanup.add(upsertedTenantId)
 
+        const putTenantOverride2 = config.adminReturnSensitiveData
+          ? {
+              fileSizeLimit: 4_194_304,
+            }
+          : {
+              fileSizeLimit: 4_194_304,
+              anonKey: 'abc',
+              databaseUrl: config.adminDatabaseUrlOverride ?? 'def',
+              jwtSecret: 'ghi',
+              serviceKey: 'jkl',
+            }
         await client.request('PUT', `/tenants/${upsertedTenantId}`, {
-          body: buildTenantProvisionBody(sourceTenant.json, 4_194_304),
+          body: buildTenantProvisionBody(
+            sourceTenant.json,
+            putTenantOverride2,
+            config.adminReturnSensitiveData
+          ),
           expectedStatus: 204,
           headers,
         })
@@ -468,8 +528,6 @@ describeAcceptance(
           )
         }
 
-        await expectMetricsConfigMutation(client, headers)
-
         await client.request('DELETE', `/tenants/${createdTenantId}`, {
           expectedStatus: 204,
           headers,
@@ -489,6 +547,123 @@ describeAcceptance(
             })
             .catch(() => undefined)
         }
+      }
+    })
+
+    it('rotates the url-signing key through a standby swap without breaking existing signed URLs, and publishes only the public key at well-known jwks', async () => {
+      const config = getAcceptanceConfig()
+      const client = createAdminClient()
+      const headers = {
+        apikey: requireConfigValue(config.adminApiKey, 'ACCEPTANCE_ADMIN_API_KEY'),
+      }
+      const tenantId = await resolveTenantId(client, headers)
+      const restClient = createRestClient()
+      const bucketName = uniqueBucketName('jwks-swap')
+      const objectKey = uniqueObjectKey('jwks-swap')
+      const encodedObjectKey = encodePathSegments(objectKey)
+      const payload = `acceptance-jwks-swap-${config.runId}`
+      const jwkKids = new Set<string>()
+
+      const originalActiveKid = await findActiveUrlSigningKid(client, tenantId, headers)
+      if (!originalActiveKid) {
+        throw new Error(`Tenant ${tenantId} has no active url-signing key to rotate away from`)
+      }
+
+      try {
+        await createRestBucket(bucketName, { isPublic: false })
+        await uploadRestObject(bucketName, objectKey, payload)
+
+        const signedBeforeSwap = await restClient.request<SignedUrlResponse>(
+          'POST',
+          `/object/sign/${bucketName}/${encodedObjectKey}`,
+          {
+            body: { expiresIn: 60 },
+            expectedStatus: 200,
+            token: requireServiceKey(config),
+          }
+        )
+
+        const standby = await client.request<JwksAddResponse>(
+          'POST',
+          `/tenants/${tenantId}/jwks/url-signing/standby`,
+          {
+            body: { type: 'ES256' },
+            expectedStatus: 201,
+            headers,
+          }
+        )
+        const standbyKid = standby.json?.kid
+        if (typeof standbyKid !== 'string' || standbyKid.length === 0) {
+          throw new Error('Admin standby JWKS response did not include a non-empty kid')
+        }
+        jwkKids.add(standbyKid)
+
+        // a kid is just the row's uuid, which a swap never changes - only its kind flips,
+        // so the promoted key keeps the standby's kid
+        const promotedKid = standbyKid
+
+        await client.request(
+          'POST',
+          `/tenants/${tenantId}/jwks/url-signing/standby/${standbyKid}/swap`,
+          {
+            expectedStatus: 201,
+            headers,
+          }
+        )
+
+        const signedAfterSwap = await restClient.request<SignedUrlResponse>(
+          'POST',
+          `/object/sign/${bucketName}/${encodedObjectKey}`,
+          {
+            body: { expiresIn: 60 },
+            expectedStatus: 200,
+            token: requireServiceKey(config),
+          }
+        )
+
+        const beforeSwapResult = await restClient.request(
+          'GET',
+          signedBeforeSwap.json?.signedURL ?? '',
+          { expectedStatus: 200 }
+        )
+        expect(beforeSwapResult.body).toBe(payload)
+
+        const afterSwapResult = await restClient.request(
+          'GET',
+          signedAfterSwap.json?.signedURL ?? '',
+          { expectedStatus: 200 }
+        )
+        expect(afterSwapResult.body).toBe(payload)
+
+        const wellKnown = await restClient.request<WellKnownJwksResponse>(
+          'GET',
+          '/.well-known/jwks.json',
+          {
+            expectedStatus: 200,
+            isExpectedResponse: (response) =>
+              response.json?.keys.some((key) => key.kid === promotedKid) ?? false,
+            retries: 10,
+          }
+        )
+        const publicKey = wellKnown.json?.keys.find((key) => key.kid === promotedKid)
+        expect(publicKey).toEqual({
+          kty: 'EC',
+          crv: 'P-256',
+          x: expect.any(String),
+          y: expect.any(String),
+          kid: promotedKid,
+          alg: 'ES256',
+        })
+      } finally {
+        await client
+          .request(
+            'POST',
+            `/tenants/${tenantId}/jwks/url-signing/standby/${originalActiveKid}/swap`,
+            { expectedStatus: [201, 404], headers }
+          )
+          .catch(() => undefined)
+        await cleanupRestResources(bucketName, [objectKey], restClient)
+        await deactivateJwks(client, tenantId, headers, jwkKids)
       }
     })
   }
@@ -515,68 +690,17 @@ async function resolveTenantId(
   return tenantId
 }
 
-async function expectMetricsConfigMutation(
+async function findActiveUrlSigningKid(
   client: AcceptanceHttpClient,
+  tenantId: string,
   headers: Record<string, string>
-) {
-  const metrics = await client.request<MetricsConfigResponse>('GET', '/metrics/config', {
+): Promise<string | undefined> {
+  const jwks = await client.request<JwksListItem[]>('GET', `/tenants/${tenantId}/jwks`, {
     expectedStatus: 200,
     headers,
   })
-  const metric = metrics.json?.metrics[0]
-  expect(metric).toBeTruthy()
-  if (!metric) {
-    throw new Error('Admin metrics config did not include any registered metrics')
-  }
 
-  const metricToRestore = {
-    enabled: metric.enabled,
-    name: metric.name,
-  }
-  const toggledMetric = {
-    enabled: !metric.enabled,
-    name: metric.name,
-  }
-
-  try {
-    const toggledMetrics = await client.request<MetricsConfigResponse>('PUT', '/metrics/config', {
-      body: {
-        metrics: [toggledMetric],
-      },
-      expectedStatus: 200,
-      headers,
-    })
-    expect(
-      toggledMetrics.json?.metrics.find((candidate) => candidate.name === metric.name)?.enabled
-    ).toBe(toggledMetric.enabled)
-
-    const persistedMetrics = await client.request<MetricsConfigResponse>('GET', '/metrics/config', {
-      expectedStatus: 200,
-      headers,
-    })
-    expect(
-      persistedMetrics.json?.metrics.find((candidate) => candidate.name === metric.name)?.enabled
-    ).toBe(toggledMetric.enabled)
-  } finally {
-    const restoredMetrics = await client.request<MetricsConfigResponse>('PUT', '/metrics/config', {
-      body: {
-        metrics: [metricToRestore],
-      },
-      expectedStatus: 200,
-      headers,
-    })
-    expect(
-      restoredMetrics.json?.metrics.find((candidate) => candidate.name === metric.name)?.enabled
-    ).toBe(metricToRestore.enabled)
-
-    const persistedRestore = await client.request<MetricsConfigResponse>('GET', '/metrics/config', {
-      expectedStatus: 200,
-      headers,
-    })
-    expect(
-      persistedRestore.json?.metrics.find((candidate) => candidate.name === metric.name)?.enabled
-    ).toBe(metricToRestore.enabled)
-  }
+  return jwks.json?.find((jwk) => jwk.active && jwk.kind === STORAGE_URL_SIGNING_KIND)?.kid
 }
 
 async function deactivateJwks(
@@ -644,19 +768,17 @@ function uniqueTenantId(): string {
 
 function buildTenantProvisionBody(
   sourceTenant: TenantDetailResponse | undefined,
-  fileSizeLimit: number
+  overrides: Partial<TenantDetailResponse>,
+  returnSensitiveData: boolean
 ): Record<string, unknown> {
+  const checkExpectedSensitiveData = returnSensitiveData ? requireString : requireUndefined
   const body: Record<string, unknown> = {
-    anonKey: requireString(sourceTenant?.anonKey, 'anonKey'),
-    databaseUrl: requireString(sourceTenant?.databaseUrl, 'databaseUrl'),
+    anonKey: checkExpectedSensitiveData(sourceTenant?.anonKey, 'anonKey'),
+    databaseUrl: checkExpectedSensitiveData(sourceTenant?.databaseUrl, 'databaseUrl'),
     features: normalizeTenantFeatures(sourceTenant?.features),
-    fileSizeLimit,
-    jwtSecret: requireString(sourceTenant?.jwtSecret, 'jwtSecret'),
-    serviceKey: requireString(sourceTenant?.serviceKey, 'serviceKey'),
-  }
-
-  if (typeof sourceTenant?.databasePoolMode === 'string') {
-    body.databasePoolMode = sourceTenant.databasePoolMode
+    jwtSecret: checkExpectedSensitiveData(sourceTenant?.jwtSecret, 'jwtSecret'),
+    serviceKey: checkExpectedSensitiveData(sourceTenant?.serviceKey, 'serviceKey'),
+    ...overrides,
   }
 
   if (typeof sourceTenant?.databasePoolUrl === 'string') {
@@ -701,5 +823,12 @@ function requireString(value: unknown, name: string): string {
     throw new Error(`Admin tenant response did not include ${name}`)
   }
 
+  return value
+}
+
+function requireUndefined(value: unknown, name: string): unknown {
+  if (typeof value !== 'undefined') {
+    throw new Error(`Admin tenant response unexpectedly included ${name}`)
+  }
   return value
 }

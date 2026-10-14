@@ -7,7 +7,7 @@ export interface ByteRange {
 }
 
 export function parseRangeHeader(range: string, fileSize: number): ByteRange {
-  const match = /^bytes=(\d*)-(\d*)$/.exec(range)
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(range)
   if (!match || fileSize <= 0) {
     throw invalidRangeHeaderError()
   }
@@ -46,12 +46,13 @@ export function parseRangeHeader(range: string, fileSize: number): ByteRange {
   }
 }
 
-function invalidRangeHeaderError() {
+export function invalidRangeHeaderError(originalError?: unknown) {
   return StorageBackendError.withStatusCode(416, {
     error: 'invalid_range',
     code: ErrorCode.InvalidRange,
     httpStatusCode: 416,
     message: 'invalid range provided',
+    originalError,
   })
 }
 

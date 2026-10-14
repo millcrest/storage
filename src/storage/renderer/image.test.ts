@@ -1,11 +1,20 @@
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import type { FastifyRequest } from 'fastify'
+import { ErrorCode } from '@internal/errors'
+import Fastify, { type FastifyRequest } from 'fastify'
 import { Readable } from 'stream'
+import { blobResponse } from '../../http/plugins/blob-response'
+import { errorSchema } from '../../http/schemas/error'
 import { spyOnAbortSignalTimeout } from '../../test/utils/abort-signal'
 import type { StorageBackendAdapter } from '../backend'
 
 const EXHAUSTED_RETRY_BACKOFF_MS = 50 + 100 + 200 + 400 + 800
+const REQUEST_ABORTED_RESPONSE = {
+  error: 'Request aborted',
+  message: 'Request aborted',
+  statusCode: '499',
+  code: ErrorCode.Aborted,
+} as const
 
 async function readStream(stream: unknown) {
   const chunks: Buffer[] = []
@@ -28,6 +37,8 @@ async function loadRendererModule(
     imgProxyHttpMaxSockets?: number
     imgProxyRequestTimeout?: number
     imgProxyURL?: string
+    responseStaleWhileRevalidate?: number
+    responseStaleIfError?: number
   },
   options: { mockUndici?: boolean } = {}
 ) {
@@ -97,6 +108,37 @@ function createRenderOptions(signal = new AbortController().signal) {
   }
 }
 
+function stubSuccessfulImageFetch(headers: Record<string, string> = {}) {
+  const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+    new Response('rendered-body', {
+      headers: {
+        'content-length': '13',
+        'content-type': 'image/webp',
+        ...headers,
+      },
+    })
+  )
+  vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
+}
+
+async function expectMappedImgproxyError(
+  status: number,
+  body: string,
+  expected: Record<string, unknown>
+) {
+  vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(body, { status })))
+
+  const { ImageRenderer } = await loadRendererModule()
+
+  await expect(
+    new ImageRenderer(createBackend('local:///tmp/cat.png')).getAsset(
+      createRequest(),
+      createRenderOptions()
+    )
+  ).rejects.toMatchObject(expected)
+}
+
 async function waitForCondition(condition: () => boolean) {
   const deadline = Date.now() + 500
 
@@ -146,25 +188,128 @@ async function useUndiciMockAgent() {
   }
 }
 
-describe('ImageRenderer fetch client', () => {
-  afterEach(() => {
-    vi.restoreAllMocks()
-    vi.unstubAllGlobals()
-    vi.doUnmock('undici')
-    vi.useRealTimers()
+afterEach(() => {
+  vi.doUnmock('undici')
+  vi.useRealTimers()
+})
+
+describe('ImageRenderer gravity transformations', () => {
+  const directionalGravityCases = [
+    ['no', undefined, undefined, 'gravity:no'],
+    ['so', 0.25, 0.75, 'gravity:so:0.25:0.75'],
+    ['ea', 12, undefined, 'gravity:ea:12:0'],
+    ['we', undefined, 12, 'gravity:we:0:12'],
+    ['noea', -12, 4, 'gravity:noea:-12:4'],
+    ['nowe', 0, 0, 'gravity:nowe:0:0'],
+    ['soea', 0.25, 12, 'gravity:soea:0.25:12'],
+    ['sowe', -0.25, -0.5, 'gravity:sowe:-0.25:-0.5'],
+    ['ce', undefined, undefined, 'gravity:ce'],
+  ] as const
+
+  for (const [gravity, xOffset, yOffset, expected] of directionalGravityCases) {
+    it(`emits directional gravity ${gravity}`, async () => {
+      const { ImageRenderer } = await loadRendererModule()
+
+      expect(
+        ImageRenderer.applyTransformation({
+          gravity,
+          x_offset: xOffset,
+          y_offset: yOffset,
+        })
+      ).toEqual([expected])
+    })
+  }
+
+  it('emits smart gravity without coordinates and ignores supplied offsets', async () => {
+    const { ImageRenderer } = await loadRendererModule()
+
+    expect(
+      ImageRenderer.applyTransformation({ gravity: 'sm', x_offset: 12, y_offset: -4 })
+    ).toEqual(['gravity:sm'])
   })
 
-  it('fetches the transformed image with native fetch and maps the streamed response metadata', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response('rendered-body', {
-        headers: {
-          'content-length': '13',
-          'content-type': 'image/webp',
-          'last-modified': 'Wed, 12 Oct 2022 11:17:02 GMT',
-        },
+  it.each([
+    [0, 0],
+    [0, 1],
+    [1, 0],
+    [1, 1],
+  ])('accepts focal point boundary coordinates %s:%s', async (xOffset, yOffset) => {
+    const { ImageRenderer } = await loadRendererModule()
+
+    expect(
+      ImageRenderer.applyTransformation({
+        gravity: 'fp',
+        x_offset: xOffset,
+        y_offset: yOffset,
       })
-    )
-    vi.stubGlobal('fetch', fetchMock)
+    ).toEqual([`gravity:fp:${xOffset}:${yOffset}`])
+  })
+
+  it('rejects missing, non-finite, and out-of-range focal point coordinates', async () => {
+    const { ImageRenderer } = await loadRendererModule()
+    const invalidCoordinates = [
+      [undefined, 0.5],
+      [0.5, undefined],
+      [Number.NaN, 0.5],
+      [0.5, Number.POSITIVE_INFINITY],
+      [-0.1, 0.5],
+      [0.5, 1.1],
+    ] as const
+
+    for (const [xOffset, yOffset] of invalidCoordinates) {
+      expect(() =>
+        ImageRenderer.applyTransformation({
+          gravity: 'fp',
+          x_offset: xOffset,
+          y_offset: yOffset,
+        })
+      ).toThrow('Focal point requires x and y coordinates within 0-1 range')
+    }
+  })
+
+  describe('signed gravity transformations', () => {
+    beforeEach(() => {
+      stubSuccessfulImageFetch()
+    })
+
+    it.each([
+      [{ gravity: 'fp', x_offset: 0.5, y_offset: 0.75 }, 'gravity:fp:0.5:0.75'],
+      [{ gravity: 'no', x_offset: 12, y_offset: -4 }, 'gravity:no:12:-4'],
+      [{ gravity: 'sm', x_offset: 12, y_offset: -4 }, 'gravity:sm'],
+      [{ gravity: 'ce' }, 'gravity:ce'],
+    ] as const)('round-trips transformation %s', async (options, expected) => {
+      const { ImageRenderer } = await loadRendererModule()
+      const signedTransformations = ImageRenderer.applyTransformation(options, true).join(',')
+      const renderer = new ImageRenderer(createBackend()).setTransformationsFromString(
+        signedTransformations
+      )
+
+      const result = await renderer.getAsset(createRequest(), createRenderOptions())
+
+      expect(signedTransformations).toBe(expected)
+      expect(result.transformations).toEqual([expected])
+      await expect(readStream(result.body)).resolves.toBe('rendered-body')
+    })
+
+    it('ignores non-finite compound offsets', async () => {
+      const { ImageRenderer } = await loadRendererModule()
+      const renderer = new ImageRenderer(createBackend()).setTransformationsFromString(
+        'gravity:no:NaN:Infinity'
+      )
+
+      const result = await renderer.getAsset(createRequest(), createRenderOptions())
+
+      expect(result.transformations).toEqual(['gravity:no'])
+      await expect(readStream(result.body)).resolves.toBe('rendered-body')
+    })
+  })
+})
+
+describe('ImageRenderer fetch client', () => {
+  it('fetches the transformed image with native fetch and maps the streamed response metadata', async () => {
+    const fetchMock = stubSuccessfulImageFetch({
+      'last-modified': 'Wed, 12 Oct 2022 11:17:02 GMT',
+    })
 
     const { ImageRenderer } = await loadRendererModule()
     const renderer = new ImageRenderer(createBackend()).setTransformations({
@@ -203,7 +348,31 @@ describe('ImageRenderer fetch client', () => {
     expect(result.transformations).toEqual(['width:100', 'resizing_type:fill', 'format:webp'])
   })
 
-  it('coerces numeric string object metadata for head and info renderers', async () => {
+  it('rejects content-encoded sources without calling imgproxy', async () => {
+    const fetchMock = stubSuccessfulImageFetch()
+    const backend = createBackend()
+    vi.mocked(backend.headObject).mockResolvedValue({
+      cacheControl: 'max-age=3600',
+      contentEncoding: 'gzip',
+      contentLength: 123,
+      eTag: '"source-etag"',
+      mimetype: 'image/jpeg',
+      size: 123,
+    })
+
+    const { ImageRenderer } = await loadRendererModule()
+
+    await expect(
+      new ImageRenderer(backend).getAsset(createRequest(), createRenderOptions())
+    ).rejects.toMatchObject({
+      code: 'InvalidRequest',
+      httpStatusCode: 400,
+      message: 'Cannot transform a content-encoded object',
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('coerces numeric string object metadata and passes through string metadata for head and info renderers', async () => {
     await loadRendererModule()
     const [{ HeadRenderer }, { InfoRenderer }] = await Promise.all([
       import('./head'),
@@ -215,12 +384,15 @@ describe('ImageRenderer fetch client', () => {
       id: 'object-id',
       metadata: {
         cacheControl: 'max-age=3600',
+        contentEncoding: 'gzip',
         contentLength: '123',
+        contentRange: 'bytes 0-122/123',
         eTag: '"source-etag"',
         httpStatusCode: '206',
         lastModified: '2022-10-12T11:17:02.000Z',
         mimetype: 'image/webp',
         size: '123',
+        xRobotsTag: 'noindex',
       },
       name: 'folder/cat.png',
       updated_at: '2022-10-12T11:17:02.000Z',
@@ -244,13 +416,34 @@ describe('ImageRenderer fetch client', () => {
     )
 
     expect(headAsset.metadata).toMatchObject({
+      contentEncoding: 'gzip',
       contentLength: 123,
+      contentRange: 'bytes 0-122/123',
       httpStatusCode: 206,
       size: 123,
+      xRobotsTag: 'noindex',
     })
     expect(infoAsset.body).toMatchObject({
+      content_encoding: 'gzip',
       content_type: 'image/webp',
       size: 123,
+    })
+  })
+
+  it('throws NoSuchKey when the head renderer has no object to render', async () => {
+    await loadRendererModule()
+    const { HeadRenderer } = await import('./head')
+
+    await expect(
+      new HeadRenderer().getAsset(
+        { headers: {}, query: {} } as never,
+        createRenderOptions() as never
+      )
+    ).rejects.toMatchObject({
+      code: ErrorCode.NoSuchKey,
+      error: 'not_found',
+      httpStatusCode: 404,
+      message: 'Object not found',
     })
   })
 
@@ -330,6 +523,123 @@ describe('ImageRenderer fetch client', () => {
     expect(infoReply.header).not.toHaveBeenCalledWith('Cache-Control', expect.anything())
   })
 
+  it('serializes backend 404s through the shared error schema', async () => {
+    await loadRendererModule()
+    const { Renderer } = await import('./renderer')
+
+    class MissingAssetRenderer extends Renderer {
+      async getAsset(): Promise<never> {
+        throw Object.assign(new Error('missing asset'), {
+          $metadata: { httpStatusCode: 404 },
+        })
+      }
+    }
+
+    const app = Fastify()
+    app.addSchema(errorSchema)
+    app.get(
+      '/missing',
+      {
+        schema: {
+          response: {
+            '4xx': { $ref: 'errorSchema#' },
+          },
+        },
+      },
+      async (request, reply) =>
+        new MissingAssetRenderer().render(request, reply, createRenderOptions())
+    )
+
+    try {
+      const response = await app.inject('/missing')
+
+      expect(response.statusCode).toBe(400)
+      expect(response.headers['cache-control']).toBe('no-store')
+      expect(response.json()).toEqual({
+        error: 'Not found',
+        message: 'The resource was not found',
+        statusCode: '404',
+        code: ErrorCode.NoSuchKey,
+      })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('serializes caller aborts through the shared error schema', async () => {
+    await loadRendererModule()
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {},
+        }
+      }
+    }
+
+    const controller = new AbortController()
+    controller.abort()
+
+    const app = Fastify()
+    app.addSchema(errorSchema)
+    app.get(
+      '/aborted',
+      {
+        schema: {
+          response: {
+            '4xx': { $ref: 'errorSchema#' },
+          },
+        },
+      },
+      async (request, reply) =>
+        new TestRenderer().render(request, reply, createRenderOptions(controller.signal))
+    )
+
+    try {
+      const response = await app.inject('/aborted')
+
+      expect(response.statusCode).toBe(499)
+      expect(response.json()).toEqual(REQUEST_ABORTED_RESPONSE)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('streams Blob asset bodies instead of sending object payloads to Fastify', async () => {
+    await loadRendererModule()
+    const { Renderer } = await import('./renderer')
+
+    class BlobRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: new Blob(['blob-body']),
+          metadata: {
+            contentLength: 9,
+            mimetype: 'text/plain',
+          },
+        }
+      }
+    }
+
+    const app = Fastify()
+    await app.register(blobResponse)
+    app.get('/blob', async (request, reply) =>
+      new BlobRenderer().render(request, reply, createRenderOptions())
+    )
+
+    try {
+      const response = await app.inject('/blob')
+
+      expect(response.statusCode).toBe(200)
+      expect(response.headers['content-type']).toBe('text/plain')
+      expect(response.body).toBe('blob-body')
+    } finally {
+      await app.close()
+    }
+  })
+
   it('omits nullish Cache-Control parts when only shared cache max-age applies', async () => {
     await loadRendererModule()
     const { Renderer } = await import('./renderer')
@@ -361,6 +671,362 @@ describe('ImageRenderer fetch client', () => {
     )
   })
 
+  it('does not duplicate s-maxage already present in the object Cache-Control', async () => {
+    await loadRendererModule()
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      protected sMaxAge = 120
+
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {
+            eTag: '"current-etag"',
+            cacheControl: 'public, max-age=3600, s-maxage=999',
+          },
+        }
+      }
+    }
+
+    const reply = createReply()
+    await new TestRenderer().render(
+      createRequest({ 'if-none-match': '"stale-etag"' }),
+      reply as never,
+      createRenderOptions()
+    )
+
+    expect(reply.header).toHaveBeenCalledWith(
+      'Cache-Control',
+      'public, max-age=3600, s-maxage=999, stale-while-revalidate=30'
+    )
+  })
+
+  it('does not add stale-while-revalidate/stale-if-error when unconfigured', async () => {
+    await loadRendererModule()
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {
+            cacheControl: 'public, max-age=3600',
+          },
+        }
+      }
+    }
+
+    const reply = createReply()
+    await new TestRenderer().render(createRequest(), reply as never, createRenderOptions())
+
+    expect(reply.header).toHaveBeenCalledWith('Cache-Control', 'public, max-age=3600')
+  })
+
+  it('adds configured stale-while-revalidate and stale-if-error alongside the object Cache-Control', async () => {
+    await loadRendererModule({
+      responseStaleWhileRevalidate: 120,
+      responseStaleIfError: 300,
+    })
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {
+            cacheControl: 'public, max-age=3600',
+          },
+        }
+      }
+    }
+
+    const reply = createReply()
+    await new TestRenderer().render(createRequest(), reply as never, createRenderOptions())
+
+    expect(reply.header).toHaveBeenCalledWith(
+      'Cache-Control',
+      'public, max-age=3600, stale-while-revalidate=120, stale-if-error=300'
+    )
+  })
+
+  it('configures stale-while-revalidate and stale-if-error independently', async () => {
+    await loadRendererModule({
+      responseStaleWhileRevalidate: 90,
+    })
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {
+            cacheControl: 'public, max-age=3600',
+          },
+        }
+      }
+    }
+
+    const reply = createReply()
+    await new TestRenderer().render(createRequest(), reply as never, createRenderOptions())
+
+    expect(reply.header).toHaveBeenCalledWith(
+      'Cache-Control',
+      'public, max-age=3600, stale-while-revalidate=90'
+    )
+  })
+
+  it('uses the configured stale-while-revalidate instead of the default even when the etag mismatches', async () => {
+    await loadRendererModule({
+      responseStaleWhileRevalidate: 120,
+    })
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {
+            eTag: '"current-etag"',
+            cacheControl: 'public, max-age=3600',
+          },
+        }
+      }
+    }
+
+    const reply = createReply()
+    // A mismatched conditional request etag used to make the base Renderer
+    // push its own hardcoded `stale-while-revalidate=30`. Once configured,
+    // that default is superseded — the configured value applies uniformly
+    // instead of being layered underneath it.
+    await new TestRenderer().render(
+      createRequest({ 'if-none-match': '"stale-etag"' }),
+      reply as never,
+      createRenderOptions()
+    )
+
+    expect(reply.header).toHaveBeenCalledWith(
+      'Cache-Control',
+      'public, max-age=3600, stale-while-revalidate=120'
+    )
+  })
+
+  it('applies stale-if-error alongside the configured stale-while-revalidate on an etag mismatch', async () => {
+    await loadRendererModule({
+      responseStaleWhileRevalidate: 120,
+      responseStaleIfError: 300,
+    })
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {
+            eTag: '"current-etag"',
+            cacheControl: 'public, max-age=3600',
+          },
+        }
+      }
+    }
+
+    const reply = createReply()
+    await new TestRenderer().render(
+      createRequest({ 'if-none-match': '"stale-etag"' }),
+      reply as never,
+      createRenderOptions()
+    )
+
+    expect(reply.header).toHaveBeenCalledWith(
+      'Cache-Control',
+      'public, max-age=3600, stale-while-revalidate=120, stale-if-error=300'
+    )
+  })
+
+  it('falls back to the default stale-while-revalidate on an etag mismatch when unconfigured', async () => {
+    await loadRendererModule()
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {
+            eTag: '"current-etag"',
+            cacheControl: 'public, max-age=3600',
+          },
+        }
+      }
+    }
+
+    const reply = createReply()
+    await new TestRenderer().render(
+      createRequest({ 'if-none-match': '"stale-etag"' }),
+      reply as never,
+      createRenderOptions()
+    )
+
+    expect(reply.header).toHaveBeenCalledWith(
+      'Cache-Control',
+      'public, max-age=3600, stale-while-revalidate=30'
+    )
+  })
+
+  it('does not duplicate a stale directive already present in the object Cache-Control', async () => {
+    await loadRendererModule({
+      responseStaleWhileRevalidate: 120,
+      responseStaleIfError: 300,
+    })
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {
+            cacheControl: 'public, max-age=3600, stale-while-revalidate=999',
+          },
+        }
+      }
+    }
+
+    const reply = createReply()
+    await new TestRenderer().render(createRequest(), reply as never, createRenderOptions())
+
+    expect(reply.header).toHaveBeenCalledWith(
+      'Cache-Control',
+      'public, max-age=3600, stale-while-revalidate=999, stale-if-error=300'
+    )
+  })
+
+  it('does not mistake a comma inside a quoted object Cache-Control value for a directive boundary', async () => {
+    await loadRendererModule({
+      responseStaleWhileRevalidate: 120,
+      responseStaleIfError: 300,
+    })
+    const { Renderer } = await import('./renderer')
+
+    class TestRenderer extends Renderer {
+      async getAsset() {
+        return {
+          body: Buffer.from('body'),
+          metadata: {
+            cacheControl: 'private="Set-Cookie, X-Foo", stale-while-revalidate=999',
+          },
+        }
+      }
+    }
+
+    const reply = createReply()
+    await new TestRenderer().render(createRequest(), reply as never, createRenderOptions())
+
+    expect(reply.header).toHaveBeenCalledWith(
+      'Cache-Control',
+      'private="Set-Cookie, X-Foo", stale-while-revalidate=999, stale-if-error=300'
+    )
+  })
+
+  it('does not add stale-while-revalidate/stale-if-error to HeadRenderer or InfoRenderer responses', async () => {
+    await loadRendererModule({
+      responseStaleWhileRevalidate: 120,
+      responseStaleIfError: 300,
+    })
+    const [{ HeadRenderer }, { InfoRenderer }] = await Promise.all([
+      import('./head'),
+      import('./info'),
+    ])
+
+    const headReply = createReply()
+    await new HeadRenderer().render(
+      { headers: {}, query: {} } as never,
+      headReply as never,
+      {
+        ...createRenderOptions(),
+        object: {
+          metadata: {
+            cacheControl: 'public, max-age=3600',
+          },
+        },
+      } as never
+    )
+
+    expect(headReply.header).toHaveBeenCalledWith('Cache-Control', 'public, max-age=3600')
+
+    const infoReply = createReply()
+    await new InfoRenderer().render(
+      { headers: {}, query: {} } as never,
+      infoReply as never,
+      {
+        ...createRenderOptions(),
+        object: {
+          bucket_id: 'bucket',
+          created_at: '2022-10-01T00:00:00.000Z',
+          id: 'object-id',
+          metadata: {
+            cacheControl: 'public, max-age=3600',
+          },
+          name: 'folder/cat.png',
+          updated_at: '2022-10-12T11:17:02.000Z',
+          user_metadata: null,
+          version: 'version',
+        },
+      } as never
+    )
+
+    expect(infoReply.header).toHaveBeenCalledWith('Cache-Control', 'public, max-age=3600')
+  })
+
+  it('does not duplicate must-revalidate already present in the object Cache-Control for HeadRenderer', async () => {
+    await loadRendererModule()
+    const { HeadRenderer } = await import('./head')
+
+    const reply = createReply()
+    await new HeadRenderer().render(
+      { headers: { 'if-none-match': '"stale-etag"' }, query: {} } as never,
+      reply as never,
+      {
+        ...createRenderOptions(),
+        object: {
+          metadata: {
+            eTag: '"current-etag"',
+            cacheControl: 'public, max-age=3600, must-revalidate',
+          },
+        },
+      } as never
+    )
+
+    expect(reply.header).toHaveBeenCalledWith(
+      'Cache-Control',
+      'public, max-age=3600, must-revalidate'
+    )
+  })
+
+  it('adds s-maxage for HeadRenderer when the etag matches', async () => {
+    await loadRendererModule()
+    const { HeadRenderer } = await import('./head')
+
+    class TestHeadRenderer extends HeadRenderer {
+      protected sMaxAge = 60
+    }
+
+    const reply = createReply()
+    await new TestHeadRenderer().render(
+      { headers: { 'if-none-match': '"current-etag"' }, query: {} } as never,
+      reply as never,
+      {
+        ...createRenderOptions(),
+        object: {
+          metadata: {
+            eTag: '"current-etag"',
+            cacheControl: 'public, max-age=3600',
+          },
+        },
+      } as never
+    )
+
+    expect(reply.header).toHaveBeenCalledWith('Cache-Control', 'public, max-age=3600, s-maxage=60')
+  })
+
   it('passes an undici dispatcher to fetch when imgproxy socket pooling is enabled', async () => {
     const agentInstances: Array<{ instance: unknown; options: unknown }> = []
     const composedHandlers: unknown[] = []
@@ -380,15 +1046,7 @@ describe('ImageRenderer fetch client', () => {
       interceptors: { retry: retryStub },
     }))
 
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response('rendered-body', {
-        headers: {
-          'content-length': '13',
-          'content-type': 'image/webp',
-        },
-      })
-    )
-    vi.stubGlobal('fetch', fetchMock)
+    const fetchMock = stubSuccessfulImageFetch()
 
     const { ImageRenderer } = await loadRendererModule(
       {
@@ -457,15 +1115,7 @@ describe('ImageRenderer fetch client', () => {
       interceptors: { retry: retryStub },
     }))
 
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response('rendered-body', {
-        headers: {
-          'content-length': '13',
-          'content-type': 'image/webp',
-        },
-      })
-    )
-    vi.stubGlobal('fetch', fetchMock)
+    const fetchMock = stubSuccessfulImageFetch()
 
     const { ImageRenderer } = await loadRendererModule(
       {
@@ -570,83 +1220,56 @@ describe('ImageRenderer fetch client', () => {
   })
 
   it.each([
-    [
-      500,
-      "Can't download source image: Image is not compatible with heic/avif",
-      400,
-      'The source image is invalid or unsupported for rendering',
-    ],
-    [
-      500,
-      "Can't download source image: Image is not compatible with future/format",
-      400,
-      'The source image is invalid or unsupported for rendering',
-    ],
+    [500, "Can't download source image: Image is not compatible with heic/avif"],
+    [500, "Can't download source image: Image is not compatible with future/format"],
     [
       422,
       "Can't download source image: Source image resolution is too big",
-      400,
       'The source image resolution is too large to process',
     ],
     [
       422,
       "Can't download source image: Source image frame resolution is too big",
-      400,
       'The source image frame resolution is too large to process',
     ],
     [
       422,
       "Can't download source image: Source image file is too big",
-      400,
       'The source image file is too large to process',
     ],
+    [422, "Can't download source image: Source image type not supported"],
+    [500, "Can't download source image: invalid TIFF format: image dimensions are not specified"],
     [
-      422,
-      "Can't download source image: Source image type not supported",
-      400,
-      'The source image is invalid or unsupported for rendering',
+      500,
+      'glib: XML parse error: warning code=100 (3) in (null):8:23: xmlns: URI ns_sfw; is not absolute',
     ],
     [
       500,
-      "Can't download source image: invalid TIFF format: image dimensions are not specified",
-      400,
-      'The source image is invalid or unsupported for rendering',
+      "source: bad seek to 3022366\nheif: Invalid input: No 'hvcC' box: No hvcC property in hvc1 type image (2.106)",
     ],
-    [422, 'Invalid source image', 400, 'The source image is invalid or unsupported for rendering'],
-    [
-      422,
-      'Invalid source image \n',
-      400,
-      'The source image is invalid or unsupported for rendering',
-    ],
-    [
-      422,
-      'Broken or unsupported image',
-      400,
-      'The source image is invalid or unsupported for rendering',
-    ],
-    [
-      422,
-      'Broken or unsupported image \t',
-      400,
-      'The source image is invalid or unsupported for rendering',
-    ],
-  ])('maps imgproxy source-image validation error %# (%i)', async (upstreamStatusCode, body, expectedStatusCode, expectedMessage) => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(body, {
-        status: upstreamStatusCode,
-      })
-    )
-    vi.stubGlobal('fetch', fetchMock)
-
-    const { ImageRenderer } = await loadRendererModule()
-    const renderer = new ImageRenderer(createBackend('local:///tmp/cat.png'))
-    const result = await renderer.getAsset(createRequest(), createRenderOptions()).catch((e) => e)
-
-    expect(result).toMatchObject({
+    [422, 'Invalid source image'],
+    [422, 'Invalid source image \n'],
+    [422, 'Broken or unsupported image'],
+    [422, 'Broken or unsupported image \t'],
+    [500, "Can't download source image: invalid JPEG format: missing SOF marker"],
+    [500, "Can't download source image: webp: invalid format"],
+    [500, "Can't download source image: Invalid box data size"],
+    [500, "Can't download source image: Invalid ftyp data"],
+    [500, "Can't download source image: Invalid meta data"],
+    [500, "Can't download source image: Invalid ispe data"],
+    [500, "Can't download source image: Dimensions data wasn't found in meta box"],
+    [422, 'VipsJpeg: Invalid JPEG file structure: two SOI markers'],
+    [422, 'pngload_buffer: libspng read error'],
+    [422, 'pngload_source: libspng read error\n/vips/vips.go:136'],
+    [422, 'tiff2vips: unable to read header'],
+    [422, 'webp2vips: unable to read pixels'],
+    [422, 'gif2vips: unable to read header'],
+    [422, 'Broken or unsupported SVG image'],
+  ])('maps imgproxy source-image validation error %# (%i)', async (upstreamStatusCode, body, expectedMessage = 'The source image is invalid or unsupported for rendering') => {
+    await expectMappedImgproxyError(upstreamStatusCode, body, {
       code: 'InvalidRequest',
-      httpStatusCode: expectedStatusCode,
-      userStatusCode: expectedStatusCode,
+      httpStatusCode: 400,
+      userStatusCode: 400,
       message: expectedMessage,
     })
   })
@@ -658,18 +1281,7 @@ describe('ImageRenderer fetch client', () => {
     ],
     [422, "Can't download source image: local:///tmp/private-source.jpg: unsupported source state"],
   ])('sanitizes unrecognized imgproxy source-image error %# (%i)', async (upstreamStatusCode, body) => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(body, {
-        status: upstreamStatusCode,
-      })
-    )
-    vi.stubGlobal('fetch', fetchMock)
-
-    const { ImageRenderer } = await loadRendererModule()
-    const renderer = new ImageRenderer(createBackend('local:///tmp/cat.png'))
-    const result = await renderer.getAsset(createRequest(), createRenderOptions()).catch((e) => e)
-
-    expect(result).toMatchObject({
+    await expectMappedImgproxyError(upstreamStatusCode, body, {
       code: 'InvalidRequest',
       httpStatusCode: upstreamStatusCode,
       userStatusCode: 400,
@@ -690,19 +1302,24 @@ describe('ImageRenderer fetch client', () => {
     [503, 'Timeout', 503, 400, 'Image request timed out'],
     [422, '<html>upstream debug</html>', 422, 400, 'Invalid image request'],
     [502, '<html>upstream failure</html>', 502, 400, 'Internal error'],
+    [500, 'heif: Memory allocation error', 500, 500, 'Internal error'],
+    [500, 'source: bad seek to 3022366', 500, 500, 'Internal error'],
+    [500, "Can't download source image: unexpected EOF", 500, 500, 'Internal error'],
+    [
+      500,
+      "Can't download source image: Invalid meta data from upstream server",
+      500,
+      500,
+      'Internal error',
+    ],
+    [500, 'VipsForeignSave: unable to write output', 500, 500, 'Internal error'],
+    [404, 'Source is unreachable', 404, 400, 'Unable to download source image'],
+    [504, 'Source is unreachable', 504, 400, 'Unable to download source image'],
+    [422, 'Source response is incomplete', 422, 400, 'Unable to download source image'],
+    [422, 'Failed to detect source image type', 422, 400, 'Unable to determine source image type'],
+    [404, 'Invalid source URL', 404, 400, 'Invalid image source'],
   ])('maps imgproxy production public error %# (%i)', async (upstreamStatusCode, body, expectedStatusCode, expectedUserStatusCode, expectedMessage) => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(body, {
-        status: upstreamStatusCode,
-      })
-    )
-    vi.stubGlobal('fetch', fetchMock)
-
-    const { ImageRenderer } = await loadRendererModule()
-    const renderer = new ImageRenderer(createBackend('local:///tmp/cat.png'))
-    const result = await renderer.getAsset(createRequest(), createRenderOptions()).catch((e) => e)
-
-    expect(result).toMatchObject({
+    await expectMappedImgproxyError(upstreamStatusCode, body, {
       httpStatusCode: expectedStatusCode,
       userStatusCode: expectedUserStatusCode,
       message: expectedMessage,
@@ -876,17 +1493,10 @@ describe('ImageRenderer fetch client', () => {
   })
 
   it('only exposes renderer metadata headers from fetch responses', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response('rendered-body', {
-        headers: {
-          'content-length': '13',
-          'content-type': 'image/webp',
-          'last-modified': 'Wed, 12 Oct 2022 11:17:02 GMT',
-          'set-cookie': 'session=abc',
-        },
-      })
-    )
-    vi.stubGlobal('fetch', fetchMock)
+    stubSuccessfulImageFetch({
+      'last-modified': 'Wed, 12 Oct 2022 11:17:02 GMT',
+      'set-cookie': 'session=abc',
+    })
 
     const { ImageRenderer } = await loadRendererModule()
     const renderer = new ImageRenderer(createBackend('local:///tmp/cat.png'))
@@ -900,15 +1510,7 @@ describe('ImageRenderer fetch client', () => {
   })
 
   it('skips nullish request headers when fetching imgproxy', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response('rendered-body', {
-        headers: {
-          'content-length': '13',
-          'content-type': 'image/webp',
-        },
-      })
-    )
-    vi.stubGlobal('fetch', fetchMock)
+    const fetchMock = stubSuccessfulImageFetch()
 
     const { ImageRenderer } = await loadRendererModule()
     const renderer = new ImageRenderer(createBackend('local:///tmp/cat.png'))
@@ -1175,15 +1777,7 @@ describe('ImageRenderer fetch client', () => {
   })
 
   it('ignores malformed transformation segments with missing or empty values', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response('rendered-body', {
-        headers: {
-          'content-length': '13',
-          'content-type': 'image/webp',
-        },
-      })
-    )
-    vi.stubGlobal('fetch', fetchMock)
+    stubSuccessfulImageFetch()
 
     const { ImageRenderer } = await loadRendererModule()
     const renderer = new ImageRenderer(
@@ -1359,7 +1953,7 @@ describe('ImageRenderer fetch client', () => {
     await renderer.render(createRequest(), reply as never, createRenderOptions(controller.signal))
 
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
@@ -1402,7 +1996,7 @@ describe('ImageRenderer fetch client', () => {
       expect(unhandledRejection).not.toHaveBeenCalled()
       expect(reply.status).toHaveBeenCalledWith(499)
       expect(reply.status).not.toHaveBeenCalledWith(200)
-      expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+      expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
       expect(fetchMock).toHaveBeenCalledTimes(1)
     } finally {
       process.off('unhandledRejection', unhandledRejection)
@@ -1692,7 +2286,7 @@ describe('ImageRenderer fetch client', () => {
 
     expect(cancelSpy).toHaveBeenCalledTimes(1)
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
@@ -1725,7 +2319,7 @@ describe('ImageRenderer fetch client', () => {
     expect(body.destroyed).toBe(true)
     expect(reply.status).toHaveBeenCalledWith(499)
     expect(reply.status).not.toHaveBeenCalledWith(200)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
   })
 
   it('destroys an asset body when header setup fails before send', async () => {
@@ -1905,7 +2499,7 @@ describe('ImageRenderer fetch client', () => {
     await renderPromise
 
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
@@ -1968,7 +2562,7 @@ describe('ImageRenderer fetch client', () => {
     await renderer.render(createRequest(), reply as never, createRenderOptions(controller.signal))
 
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
   })
 
   it('maps nested caller abort causes during render to the request-aborted response', async () => {
@@ -1997,7 +2591,7 @@ describe('ImageRenderer fetch client', () => {
     await renderer.render(createRequest(), reply as never, createRenderOptions(controller.signal))
 
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
   })
 
   it('maps storage errors wrapping caller aborts to the request-aborted response', async () => {
@@ -2023,7 +2617,7 @@ describe('ImageRenderer fetch client', () => {
     await renderer.render(createRequest(), reply as never, createRenderOptions(controller.signal))
 
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
   })
 
   it('maps nested storage original errors wrapping caller aborts to the request-aborted response', async () => {
@@ -2050,7 +2644,7 @@ describe('ImageRenderer fetch client', () => {
     await renderer.render(createRequest(), reply as never, createRenderOptions(controller.signal))
 
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
   })
 
   it('maps fresh SDK AbortError instances after caller aborts to the request-aborted response', async () => {
@@ -2076,7 +2670,7 @@ describe('ImageRenderer fetch client', () => {
     await renderer.render(createRequest(), reply as never, createRenderOptions(controller.signal))
 
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
   })
 
   it('maps deep caller abort cause chains without recursive stack growth', async () => {
@@ -2103,7 +2697,7 @@ describe('ImageRenderer fetch client', () => {
     await renderer.render(createRequest(), reply as never, createRenderOptions(controller.signal))
 
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
   })
 
   it('does not let throwing error cause getters poison caller abort checks', async () => {
@@ -2294,7 +2888,7 @@ describe('ImageRenderer fetch client', () => {
     await renderer.render(createRequest(), reply as never, createRenderOptions(controller.signal))
 
     expect(reply.status).toHaveBeenCalledWith(499)
-    expect(reply.send).toHaveBeenCalledWith({ error: 'Request aborted', statusCode: '499' })
+    expect(reply.send).toHaveBeenCalledWith(REQUEST_ABORTED_RESPONSE)
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 

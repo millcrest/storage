@@ -1,4 +1,4 @@
-import '@internal/monitoring/otel-tracing'
+import './tracing'
 import '@internal/monitoring/otel-metrics'
 
 import { IncomingMessage, Server, ServerResponse } from 'node:http'
@@ -21,7 +21,7 @@ import { PgShardStoreFactory, ShardCatalog } from '@internal/sharding'
 import { getGlobal } from '@platformatic/globals'
 import { registerWorkers } from '@storage/events'
 import { SyncCatalogIds } from '@storage/events/upgrades/sync-catalog-ids'
-import { FastifyInstance } from 'fastify'
+import { FastifyInstance, LogController } from 'fastify'
 import buildAdmin from '../admin-app'
 import build from '../app'
 import { getConfig } from '../config'
@@ -69,6 +69,10 @@ async function main() {
     icebergShards,
     numWorkers,
   } = getConfig()
+  // Abort order: HTTP -> migrations -> queue -> dependencies.
+  const migrationShutdownGroup = shutdownSignal.nextGroup
+  const queueShutdownGroup = migrationShutdownGroup.nextGroup
+  const dependencyShutdownGroup = queueShutdownGroup.nextGroup
 
   // VECTOR_DATABASE_URL is only required when pgvector is actually going to
   // be used: single-tenant mode (it's the maintenance URL used to CREATE
@@ -88,10 +92,33 @@ async function main() {
     )
   }
 
+  // PoolManager.
+  // Pool strategies snapshot numWorkers and cluster size at
+  // creation and only rebalances cluster size, so initialization
+  // must happen before queue workers can create tenant pools.
+  PgTenantConnection.poolManager.setNumWorkers(numWorkers)
+  PgTenantConnection.poolManager.monitor()
+
+  // Cluster information
+  await Cluster.init(dependencyShutdownGroup.signal)
+
+  Cluster.on('change', (data) => {
+    logger.info(
+      {
+        type: 'cluster',
+        clusterSize: data.size,
+      },
+      `[Cluster] Cluster size changed to ${data.size}`
+    )
+    PgTenantConnection.poolManager.rebalanceAll({
+      clusterSize: data.size,
+    })
+  })
+
   // Queue
   if (pgQueueEnable) {
     await Queue.start({
-      signal: shutdownSignal.nextGroup.signal,
+      signal: queueShutdownGroup.signal,
       registerWorkers,
     })
 
@@ -139,33 +166,13 @@ async function main() {
 
   // Pubsub
   await PubSub.start({
-    signal: shutdownSignal.nextGroup.signal,
+    signal: dependencyShutdownGroup.signal,
   })
 
   // Start async migrations background process
   if (isMultitenant && pgQueueEnable) {
-    startAsyncMigrations(shutdownSignal.nextGroup.signal)
+    startAsyncMigrations(migrationShutdownGroup.signal)
   }
-
-  // PoolManager
-  PgTenantConnection.poolManager.setNumWorkers(numWorkers)
-  PgTenantConnection.poolManager.monitor()
-
-  // Cluster information
-  await Cluster.init(shutdownSignal.nextGroup.signal)
-
-  Cluster.on('change', (data) => {
-    logger.info(
-      {
-        type: 'cluster',
-        clusterSize: data.size,
-      },
-      `[Cluster] Cluster size changed to ${data.size}`
-    )
-    PgTenantConnection.poolManager.rebalanceAll({
-      clusterSize: data.size,
-    })
-  })
 
   // HTTP Server
   const app = await httpServer(shutdownSignal.signal)
@@ -185,7 +192,7 @@ async function httpServer(signal: AbortSignal) {
 
   const app: FastifyInstance<Server, IncomingMessage, ServerResponse> = build({
     loggerInstance: logger,
-    disableRequestLogging: true,
+    logController: new LogController({ disableRequestLogging: true }),
     childLoggerFactory(logger) {
       return logger
     },
@@ -237,7 +244,7 @@ async function httpAdminServer(
 
   const adminApp = buildAdmin({
     loggerInstance: logger,
-    disableRequestLogging: true,
+    logController: new LogController({ disableRequestLogging: true }),
     childLoggerFactory(logger) {
       return logger
     },

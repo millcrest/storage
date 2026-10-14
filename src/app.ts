@@ -1,8 +1,10 @@
 import fastifySwagger from '@fastify/swagger'
 import fastifySwaggerUi from '@fastify/swagger-ui'
+import { getPublicJwks } from '@internal/database'
 import fastify, { FastifyInstance, FastifyServerOptions } from 'fastify'
 import { getConfig } from './config'
 import { plugins, routes, schemas, setErrorHandler } from './http'
+import { finiteSwaggerTransform, withFiniteAjv } from './http/finite'
 
 interface buildOpts extends FastifyServerOptions {
   exposeDocs?: boolean
@@ -11,7 +13,7 @@ interface buildOpts extends FastifyServerOptions {
 const { version, keepAliveTimeout, headersTimeout, isMultitenant } = getConfig()
 
 const build = (opts: buildOpts = {}): FastifyInstance => {
-  const app = fastify(opts)
+  const app = fastify(withFiniteAjv(opts))
 
   app.addContentTypeParser('*', function (request, payload, done) {
     done(null)
@@ -26,6 +28,7 @@ const build = (opts: buildOpts = {}): FastifyInstance => {
   if (opts.exposeDocs) {
     app.register(fastifySwagger, {
       exposeHeadRoutes: true,
+      transform: finiteSwaggerTransform,
       openapi: {
         info: {
           title: 'Supabase Storage API',
@@ -60,19 +63,21 @@ const build = (opts: buildOpts = {}): FastifyInstance => {
     })
   }
 
-  const excludedRoutesFromMonitoring = [
+  const excludedRoutesFromMonitoring = new Set([
     '/status',
     '/metrics',
     '/health',
     '/healthcheck',
     '/version',
     '/documentation',
-  ]
+  ])
 
   // add in common schemas
   app.addSchema(schemas.authSchema)
   app.addSchema(schemas.errorSchema)
 
+  app.register(plugins.closeConnectionOnError)
+  app.register(plugins.blobResponse)
   app.register(plugins.requestContext)
   app.register(plugins.signals)
   app.register(plugins.tenantId)
@@ -100,7 +105,13 @@ const build = (opts: buildOpts = {}): FastifyInstance => {
   app.get('/version', (_, reply) => {
     reply.send(version)
   })
-  app.get('/status', async (request, response) => response.status(200).send())
+  app.get('/status', async (_, response) => response.status(200).send())
+  app.get('/.well-known/jwks.json', async (request, reply) => {
+    const keys = await getPublicJwks(request.tenantId)
+    reply.header('cache-control', 'public, max-age=600')
+    reply.header('vary', 'x-forwarded-host')
+    reply.send({ keys })
+  })
 
   return app
 }

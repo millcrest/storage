@@ -1,5 +1,6 @@
 import assert from 'node:assert'
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { signJWT } from '@internal/auth'
 import { isS3Error } from '@internal/errors'
 import { DeleteIcebergResources } from '@storage/events/iceberg/delete-iceberg-resources'
 import {
@@ -14,11 +15,13 @@ import { getConfig, mergeConfig } from '../config'
 import { createBucketIfNotExists, useStorage } from './utils/storage'
 
 const {
+  jwtSecret,
   serviceKeyAsync,
   storageS3Region,
   storageS3Endpoint,
   s3ProtocolAccessKeyId,
   s3ProtocolAccessKeySecret,
+  tenantId,
 } = getConfig()
 
 const icebergLimitOverrides = {
@@ -36,19 +39,15 @@ describe('Iceberg Catalog', () => {
 
     const { default: makeApp } = await import('../app')
     app = makeApp()
-    icebergMetastore = new PgMetastore(t.database.connection.pool.acquire(), {
+    icebergMetastore = new PgMetastore(t.database.connection, {
       multiTenant: false,
       schema: 'storage',
     })
   })
 
-  afterEach(async () => {
-    vi.restoreAllMocks()
-  })
-
   afterAll(async () => {
     await app.close()
-    await t.database.connection.pool.destroy()
+    t.database.connection.dispose()
   })
 
   it('can create an analytic bucket', async () => {
@@ -69,6 +68,37 @@ describe('Iceberg Catalog', () => {
     const resp = await response.json()
     expect(response.statusCode).toBe(200)
     expect(resp.id).toBe(bucketName)
+  })
+
+  it('rejects an analytics bucket created with a non-DISABLED versioning_status', async () => {
+    const bucketName = t.random.name('ice-bucket')
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/bucket',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${await serviceKeyAsync}`,
+      },
+      payload: {
+        name: bucketName,
+        type: 'ANALYTICS',
+        versioning_status: 'ENABLED',
+      },
+    })
+
+    expect(response.statusCode).toBe(400)
+
+    const listResponse = await app.inject({
+      method: 'GET',
+      url: '/iceberg/bucket',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${await serviceKeyAsync}`,
+      },
+    })
+    const list: Array<{ id: string }> = await listResponse.json()
+    expect(list.some((b) => b.id === bucketName)).toBe(false)
   })
 
   it('can list analytic buckets', async () => {
@@ -108,7 +138,7 @@ describe('Iceberg Catalog', () => {
 
     expect(response.statusCode).toBe(200)
 
-    const deletedCatalog = await t.database.connection.pool.acquire().query<{
+    const deletedCatalog = await t.database.connection.query<{
       deleted_at: Date | string | null
     }>({
       text: `
@@ -166,7 +196,7 @@ describe('Iceberg Catalog', () => {
       db: {
         ...t.storage.db,
         connection: t.storage.db.connection,
-        destroyConnection: vi.fn().mockResolvedValue(undefined),
+        destroyConnection: vi.fn(),
       },
     } as unknown as typeof t.storage)
 
@@ -934,13 +964,15 @@ describe('Iceberg Catalog', () => {
 
   describe('S3 Protocol Iceberg Bucket Detection', () => {
     let client: S3Client
-    let minioClient: S3Client
+    let rustfsClient: S3Client
+    let endpoint: string
 
     beforeAll(async () => {
       const listener = await app.listen()
+      endpoint = `${listener.replace('[::1]', 'localhost')}/s3`
 
       client = new S3Client({
-        endpoint: `${listener.replace('[::1]', 'localhost')}/s3`,
+        endpoint,
         forcePathStyle: true,
         region: storageS3Region,
         credentials: {
@@ -949,7 +981,7 @@ describe('Iceberg Catalog', () => {
         },
       })
 
-      minioClient = new S3Client({
+      rustfsClient = new S3Client({
         endpoint: storageS3Endpoint,
         forcePathStyle: true,
         region: storageS3Region,
@@ -961,7 +993,7 @@ describe('Iceberg Catalog', () => {
       const tableName = t.random.name('ice-table')
       const internalBucketName = `internal-${Date.now()}--table-s3`
 
-      await createBucketIfNotExists(internalBucketName, minioClient)
+      await createBucketIfNotExists(internalBucketName, rustfsClient)
 
       const uploadFile = new PutObjectCommand({
         Bucket: internalBucketName,
@@ -988,7 +1020,7 @@ describe('Iceberg Catalog', () => {
       const bucketName = t.random.name('ice-bucket')
       const internalBucketName = `internal-${Date.now()}--table-s3`
 
-      await createBucketIfNotExists(internalBucketName, minioClient)
+      await createBucketIfNotExists(internalBucketName, rustfsClient)
 
       const bucket = await t.storage.createIcebergBucket({
         name: bucketName,
@@ -1022,6 +1054,55 @@ describe('Iceberg Catalog', () => {
       const response = await client.send(uploadFile)
 
       expect(response.$metadata.httpStatusCode).toBe(200)
+    })
+
+    it('denies session credentials without the service role on an iceberg table location', async () => {
+      const internalBucketName = `internal-${Date.now()}--table-s3`
+      await createBucketIfNotExists(internalBucketName, rustfsClient)
+
+      const bucket = await t.storage.createIcebergBucket({ name: t.random.name('ice-bucket') })
+      const namespace = await icebergMetastore.createNamespace({
+        name: t.random.name('namespace'),
+        bucketName: bucket.name,
+        bucketId: bucket.id,
+        tenantId: '',
+        metadata: {},
+      })
+      await icebergMetastore.createTable({
+        name: t.random.name('table'),
+        bucketName: bucket.name,
+        bucketId: bucket.id,
+        location: `s3://${internalBucketName}`,
+        namespaceId: namespace.id,
+      })
+      await rustfsClient.send(
+        new PutObjectCommand({ Bucket: internalBucketName, Key: 'secret', Body: 'private bytes' })
+      )
+
+      const anon = new S3Client({
+        endpoint,
+        forcePathStyle: true,
+        region: storageS3Region,
+        credentials: {
+          accessKeyId: tenantId,
+          secretAccessKey: tenantId,
+          sessionToken: await signJWT({ role: 'anon' }, jwtSecret, '5m'),
+        },
+      })
+
+      await expect(
+        anon.send(new GetObjectCommand({ Bucket: internalBucketName, Key: 'secret' }))
+      ).rejects.toMatchObject({ name: 'AccessDenied', $metadata: { httpStatusCode: 403 } })
+      await expect(
+        anon.send(
+          new PutObjectCommand({ Bucket: internalBucketName, Key: 'secret', Body: 'overwritten' })
+        )
+      ).rejects.toMatchObject({ name: 'AccessDenied', $metadata: { httpStatusCode: 403 } })
+
+      const object = await rustfsClient.send(
+        new GetObjectCommand({ Bucket: internalBucketName, Key: 'secret' })
+      )
+      expect(await object.Body?.transformToString()).toBe('private bytes')
     })
   })
 })

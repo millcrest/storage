@@ -1,9 +1,12 @@
+import { ErrorCode, StorageBackendError } from '@internal/errors'
 import { validateXRobotsTag } from '@storage/validators/x-robots-tag'
 import { FastifyReply, FastifyRequest } from 'fastify'
 import { Readable } from 'stream'
 import { getConfig } from '../../config'
 import { ObjectMetadata } from '../backend'
+import { invalidRangeHeaderError } from '../range'
 import { Obj } from '../schemas'
+import { hasCacheControlDirective, mergeCacheControlDirectives } from './cache-control'
 
 export interface RenderOptions {
   bucket: string
@@ -39,7 +42,8 @@ type HttpMetadataError = {
   }
 }
 
-const { requestEtagHeaders, responseSMaxAge } = getConfig()
+const { requestEtagHeaders, responseSMaxAge, responseStaleWhileRevalidate, responseStaleIfError } =
+  getConfig()
 
 /**
  * Renderer
@@ -84,12 +88,27 @@ export abstract class Renderer {
         return response.status(304).send()
       }
 
+      if (metadata?.httpStatusCode === 412) {
+        throw StorageBackendError.withStatusCode(412, {
+          error: 'PreconditionFailed',
+          code: ErrorCode.PreconditionFailed,
+          httpStatusCode: 412,
+          message: 'PreconditionFailed',
+          originalError: err,
+        })
+      }
+
+      if (metadata?.httpStatusCode === 416) {
+        throw invalidRangeHeaderError(err)
+      }
+
       if (metadata?.httpStatusCode === 404) {
         response.header('cache-control', 'no-store')
         return response.status(400).send({
           error: 'Not found',
           message: 'The resource was not found',
           statusCode: '404',
+          code: ErrorCode.NoSuchKey,
         })
       }
 
@@ -123,11 +142,18 @@ export abstract class Renderer {
       .header('ETag', data.metadata.eTag)
       .header('X-Robots-Tag', xRobotsTag)
 
+    if (data.metadata.contentEncoding) {
+      response.header('Content-Encoding', data.metadata.contentEncoding)
+    }
+
     this.setLastModifiedHeader(response, data.metadata.lastModified)
     this.setContentLengthHeader(response, data.metadata.contentLength)
 
     if (options.expires) {
       response.header('Expires', options.expires)
+      if (hasCacheControlDirective(data.metadata.cacheControl, 'no-transform')) {
+        response.header('Cache-Control', 'no-transform')
+      }
     } else {
       this.handleCacheControl(request, response, data.metadata)
     }
@@ -148,11 +174,9 @@ export abstract class Renderer {
       if (download === '') {
         response.header('Content-Disposition', 'attachment;')
       } else {
-        const encodedFileName = encodeURIComponent(download)
-
         response.header(
           'Content-Disposition',
-          `attachment; filename=${encodedFileName}; filename*=UTF-8''${encodedFileName}`
+          `attachment; filename=${toFilenameFallback(download)}; filename*=UTF-8''${encodeExtValue(download)}`
         )
       }
     }
@@ -164,23 +188,26 @@ export abstract class Renderer {
     metadata: AssetMetadata
   ) {
     const etag = this.findEtagHeader(request)
+    const directives: string[] = []
 
-    const cacheControl = [metadata.cacheControl]
-
-    if (!etag) {
-      this.setCacheControlHeader(response, cacheControl)
-      return
+    if (etag && this.sMaxAge > 0) {
+      directives.push(`s-maxage=${this.sMaxAge}`)
     }
 
-    if (this.sMaxAge > 0) {
-      cacheControl.push(`s-maxage=${this.sMaxAge}`)
+    if (responseStaleWhileRevalidate > 0) {
+      directives.push(`stale-while-revalidate=${responseStaleWhileRevalidate}`)
+    } else if (etag && etag !== metadata.eTag) {
+      directives.push(`stale-while-revalidate=30`)
     }
 
-    if (etag !== metadata.eTag) {
-      cacheControl.push('stale-while-revalidate=30')
+    if (responseStaleIfError > 0) {
+      directives.push(`stale-if-error=${responseStaleIfError}`)
     }
 
-    this.setCacheControlHeader(response, cacheControl)
+    this.setCacheControlHeader(
+      response,
+      mergeCacheControlDirectives([metadata.cacheControl], directives)
+    )
   }
 
   protected setContentLengthHeader(response: FastifyReply, contentLength: number | undefined) {
@@ -203,7 +230,12 @@ export abstract class Renderer {
   }
 
   protected sendRequestAborted(response: FastifyReply) {
-    return response.status(499).send({ error: 'Request aborted', statusCode: '499' })
+    return response.status(499).send({
+      error: 'Request aborted',
+      message: 'Request aborted',
+      statusCode: '499',
+      code: ErrorCode.Aborted,
+    })
   }
 
   protected findEtagHeader(request: FastifyRequest) {
@@ -306,8 +338,34 @@ function isReadableStream(body: object): body is ReadableStream {
   return typeof ReadableStream !== 'undefined' && body instanceof ReadableStream
 }
 
+/**
+ * Percent-encodes a value for the RFC 8187 ext-value used by `filename*`.
+ * encodeURIComponent leaves ' ( ) * unencoded, but they are not attr-char and
+ * "'" is the ext-value delimiter, so a raw one corrupts the decoded filename.
+ */
+function encodeExtValue(value: string) {
+  return encodeURIComponent(value).replace(
+    /['()*]/g,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+  )
+}
+
+const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+
+/**
+ * Builds the `filename` fallback for clients that ignore `filename*`. It must
+ * not be percent-encoded, since clients do not decode it. Non-printable-ASCII
+ * characters (including CR/LF) become "_", and so do '"' and '\\', which
+ * RFC 6266 Appendix D advises keeping out of the fallback. Names that are not
+ * a valid token (e.g. containing spaces or parentheses) are quoted.
+ */
+function toFilenameFallback(value: string) {
+  const fallback = value.replace(/[^\x20-\x7e]|["\\]/gu, '_')
+  return HTTP_TOKEN.test(fallback) ? fallback : `"${fallback}"`
+}
+
 function normalizeContentType(contentType: string | undefined): string | undefined {
-  if (contentType?.includes('text/html')) {
+  if (contentType?.toLowerCase().includes('text/html')) {
     return 'text/plain'
   }
   return contentType

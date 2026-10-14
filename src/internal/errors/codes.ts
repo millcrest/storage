@@ -1,19 +1,24 @@
 import { IcebergError } from '@storage/protocols/iceberg/catalog/errors'
 import { DatabaseError } from 'pg'
 import { configure } from 'safe-stable-stringify'
-import { StorageBackendError } from './storage-error'
+import { isS3Error, StorageBackendError } from './storage-error'
 
 export enum ErrorCode {
   NoSuchBucket = 'NoSuchBucket',
+  NoSuchLifecycleConfiguration = 'NoSuchLifecycleConfiguration',
   NoSuchKey = 'NoSuchKey',
   NoSuchUpload = 'NoSuchUpload',
   InvalidJWT = 'InvalidJWT',
   InvalidRequest = 'InvalidRequest',
+  InvalidArgument = 'InvalidArgument',
+  MalformedXML = 'MalformedXML',
   TenantNotFound = 'TenantNotFound',
   EntityTooLarge = 'EntityTooLarge',
+  EntityTooSmall = 'EntityTooSmall',
   InternalError = 'InternalError',
   ResourceAlreadyExists = 'ResourceAlreadyExists',
   ResourceNotEmpty = 'ResourceNotEmpty',
+  S3BucketNotEmpty = 'BucketNotEmpty',
   InvalidBucketName = 'InvalidBucketName',
   InvalidKey = 'InvalidKey',
   InvalidRange = 'InvalidRange',
@@ -31,6 +36,7 @@ export enum ErrorCode {
   SignatureDoesNotMatch = 'SignatureDoesNotMatch',
   AccessDenied = 'AccessDenied',
   ResourceLocked = 'ResourceLocked',
+  ResourceReferenced = 'ResourceReferenced',
   DatabaseError = 'DatabaseError',
   TransactionError = 'TransactionError',
   MissingContentLength = 'MissingContentLength',
@@ -39,10 +45,12 @@ export enum ErrorCode {
   InvalidUploadSignature = 'InvalidUploadSignature',
   LockTimeout = 'LockTimeout',
   S3Error = 'S3Error',
+  PreconditionFailed = 'PreconditionFailed',
   S3InvalidAccessKeyId = 'InvalidAccessKeyId',
   S3MaximumCredentialsLimit = 'MaximumCredentialsLimit',
   InvalidChecksum = 'InvalidChecksum',
   MissingPart = 'MissingPart',
+  InvalidPartOrder = 'InvalidPartOrder',
   SlowDown = 'SlowDown',
   TusError = 'TusError',
   Aborted = 'Aborted',
@@ -72,11 +80,19 @@ export const ERRORS = {
       message: `The bucket you tried to delete is not empty`,
       originalError: e,
     }),
-  IcebergMaximumResourceLimit: (limit: number, e?: Error) =>
+  S3BucketNotEmpty: (bucket: string, e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.S3BucketNotEmpty,
+      resource: bucket,
+      httpStatusCode: 409,
+      message: `The bucket you tried to delete is not empty`,
+      originalError: e,
+    }),
+  IcebergMaximumResourceLimit: (resource: string, limit: number, e?: Error) =>
     new StorageBackendError({
       code: ErrorCode.IcebergMaximumResourceLimit,
       httpStatusCode: 409,
-      message: `The maximum number of this resource ${limit} is reached`,
+      message: `The maximum number of this resource (${resource}) ${limit} is reached`,
       originalError: e,
     }),
   IcebergResourceNotEmpty: (resource: string, name: string, e?: Error) =>
@@ -94,11 +110,25 @@ export const ERRORS = {
       message: `The feature ${feature} is not enabled for this resource`,
       originalError: e,
     }),
+  VersioningRequiresStandardBucket: (e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.InvalidRequest,
+      httpStatusCode: 400,
+      message: 'Versioning is only supported for Standard buckets',
+      originalError: e,
+    }),
   NotSupported: (feature: string, e?: Error) =>
     new StorageBackendError({
       code: ErrorCode.NotSupported,
       httpStatusCode: 409,
       message: `The feature ${feature} is not enabled for this resource`,
+      originalError: e,
+    }),
+  LifecycleRequiresStandardBucket: (e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.InvalidRequest,
+      httpStatusCode: 400,
+      message: 'Versioning and lifecycle are only supported for Standard buckets',
       originalError: e,
     }),
   UnableToEmptyBucket: (bucket: string, msg: string) =>
@@ -115,6 +145,14 @@ export const ERRORS = {
       error: 'Bucket not found',
       httpStatusCode: 404,
       message: `Bucket not found`,
+      originalError: e,
+    }),
+  NoSuchLifecycleConfiguration: (bucket: string, e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.NoSuchLifecycleConfiguration,
+      resource: bucket,
+      httpStatusCode: 404,
+      message: 'The lifecycle configuration does not exist',
       originalError: e,
     }),
   NoSuchUpload: (uploadId: string, e?: Error) =>
@@ -156,6 +194,22 @@ export const ERRORS = {
       code: ErrorCode.InvalidRequest,
       httpStatusCode: 400,
       message: message || 'Invalid Request',
+      originalError: error,
+    }),
+
+  InvalidArgument: (message: string, error?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.InvalidArgument,
+      httpStatusCode: 400,
+      message,
+      originalError: error,
+    }),
+
+  MalformedXML: (message: string, error?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.MalformedXML,
+      httpStatusCode: 400,
+      message,
       originalError: error,
     }),
 
@@ -301,6 +355,14 @@ export const ERRORS = {
       originalError: e,
     }),
 
+  EntityTooSmall: (entity = 'object', limit = 'the minimum allowed size') =>
+    new StorageBackendError({
+      error: 'Payload too small',
+      code: ErrorCode.EntityTooSmall,
+      httpStatusCode: 400,
+      message: `The ${entity} is smaller than ${limit}`,
+    }),
+
   InternalError: (e?: Error, message?: string) =>
     new StorageBackendError({
       code: ErrorCode.InternalError,
@@ -436,6 +498,14 @@ export const ERRORS = {
       originalError: e,
     }),
 
+  ResourceReferenced: (message: string, e?: Error) =>
+    new StorageBackendError({
+      code: ErrorCode.ResourceReferenced,
+      httpStatusCode: 409,
+      message,
+      originalError: e,
+    }),
+
   RelatedResourceNotFound: (e?: Error) =>
     new StorageBackendError({
       code: ErrorCode.InvalidRequest,
@@ -495,6 +565,14 @@ export const ERRORS = {
       code: ErrorCode.MissingPart,
       httpStatusCode: 400,
       message: `Part ${partNumber} is missing for upload id ${uploadId}`,
+    }),
+
+  InvalidPartOrder: () =>
+    new StorageBackendError({
+      code: ErrorCode.InvalidPartOrder,
+      httpStatusCode: 400,
+      message:
+        'The list of parts was not in ascending order. Parts must be ordered by part number.',
     }),
 
   Aborted: (message: string, originalError?: unknown) =>
@@ -577,7 +655,22 @@ const ERROR_CODE_MAP: Record<string, ErrorCode> = {
   FST_ERR_CTP_INVALID_MEDIA_TYPE: ErrorCode.InvalidMimeType,
   FST_ERR_CTP_BODY_TOO_LARGE: ErrorCode.EntityTooLarge,
 }
-const ERROR_RAW_OMITTED_KEYS = new Set(['client'])
+// Error payloads include decoded JWT claims, including in jose's cause objects.
+const ERROR_RAW_OMITTED_KEYS = new Set([
+  'client',
+  'payload',
+  'CanonicalRequest',
+  'CanonicalRequestBytes',
+  'StringToSign',
+  'StringToSignBytes',
+  'AWSAccessKeyId',
+  'SignatureProvided',
+  'Token-0',
+])
+const FETCH_URL_ERROR_PREFIXES = [
+  'Failed to parse URL from ',
+  'Request cannot be constructed from a URL that includes credentials: ',
+]
 
 export function isStorageError(errorType: ErrorCode, error: unknown): error is StorageBackendError {
   return error instanceof StorageBackendError && error.code === errorType
@@ -592,6 +685,9 @@ function hasStringErrorCode(error: Error): error is Error & { code: string } {
 }
 
 export function getErrorCode(error: Error): string {
+  if (isS3Error(error)) {
+    return ErrorCode.S3Error
+  }
   if (error instanceof IcebergError && error.error) {
     return error.error
   }
@@ -607,6 +703,9 @@ export function getErrorCode(error: Error): string {
 }
 
 function getErrorStatusCode(error: Error): number {
+  if (isS3Error(error) && error.$metadata.httpStatusCode) {
+    return error.$metadata.httpStatusCode
+  }
   if (error instanceof StorageBackendError && error.httpStatusCode) {
     return error.httpStatusCode
   }
@@ -626,25 +725,43 @@ export function normalizeRawError(error: unknown, logLevel: string) {
     const errorCode = getErrorCode(error)
     const includeStack =
       logLevel === 'debug' || statusCode >= 500 || errorCode === ErrorCode.UnknownError
+    const { name, message, stack } = normalizeErrorFields(error, includeStack)
 
     return {
-      raw: stringifyErrorRaw(error),
-      name: error.name,
-      message: error.message,
-      stack: includeStack ? error.stack || '' : '',
+      raw: stringifyErrorRaw(error, includeStack),
+      name,
+      message,
+      stack: stack || '',
       statusCode,
       errorCode,
     }
   }
 
-  try {
-    return {
-      raw: JSON.stringify(error),
+  return {
+    raw: stringifyErrorRaw(error, logLevel === 'debug'),
+  }
+}
+
+function normalizeErrorFields(error: Error, includeStack: boolean) {
+  let message = error.message
+  let stack = includeStack ? error.stack : undefined
+  // Undici embeds the entire supplied URL in these messages, including invalid inputs.
+  if (typeof message === 'string') {
+    for (const prefix of FETCH_URL_ERROR_PREFIXES) {
+      if (message.startsWith(prefix)) {
+        const redacted = `${prefix}[Redacted URL]`
+        if (typeof stack === 'string') {
+          stack = stack.replaceAll(message, redacted)
+        }
+        message = redacted
+        break
+      }
     }
-  } catch {
-    return {
-      raw: 'Failed to stringify error',
-    }
+  }
+  return {
+    name: error.name,
+    message,
+    stack,
   }
 }
 
@@ -654,13 +771,40 @@ const stableStringify = configure({
   deterministic: false,
 })
 
-function errorRawReplacer(key: string, value: unknown) {
-  return ERROR_RAW_OMITTED_KEYS.has(key) ? undefined : value
+function createErrorRawReplacer(includeStack: boolean) {
+  return function errorRawReplacer(this: unknown, key: string, value: unknown) {
+    if (
+      ERROR_RAW_OMITTED_KEYS.has(key) ||
+      (key === 'input' && (this as { code?: unknown }).code === 'ERR_INVALID_URL')
+    ) {
+      return undefined
+    }
+
+    // Redis command arguments can contain AUTH credentials or application data.
+    if (key === 'command' && value && typeof value === 'object' && 'args' in value) {
+      return { name: 'name' in value ? value.name : undefined }
+    }
+
+    // `message`/`stack`/`cause` are non-enumerable on Error instances
+    // so a nested error (e.g. `originalError`, or a `cause` chain from `fetch`/undici)
+    // would otherwise stringify to `{}` and silently drop the data needed to debug
+    if (value instanceof Error) {
+      return {
+        ...value,
+        // Root message/stack are already captured by normalizeRawError.
+        ...(key !== '' && normalizeErrorFields(value, includeStack)),
+        cause: value.cause,
+        ...(value instanceof AggregateError && { errors: value.errors }),
+      }
+    }
+
+    return value
+  }
 }
 
-function stringifyErrorRaw(error: Error): string {
+function stringifyErrorRaw(error: unknown, includeStack: boolean): string | undefined {
   try {
-    return stableStringify(error, errorRawReplacer) ?? 'Failed to stringify error'
+    return stableStringify(error, createErrorRawReplacer(includeStack))
   } catch {
     return 'Failed to stringify error'
   }

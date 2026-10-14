@@ -29,8 +29,8 @@ const successResponseSchema = {
 const requestQuerySchema = {
   type: 'object',
   properties: {
-    limit: { type: 'integer', minimum: 1, examples: [10] },
-    offset: { type: 'integer', minimum: 0, examples: [0] },
+    limit: { type: 'integer', finite: true, minimum: 1, examples: [10] },
+    offset: { type: 'integer', finite: true, minimum: 0, examples: [0] },
     sortColumn: { type: 'string', enum: ['id', 'name', 'created_at', 'updated_at'] },
     sortOrder: { type: 'string', enum: ['asc', 'desc'] },
     search: { type: 'string', examples: ['my-bucket'] },
@@ -54,7 +54,7 @@ export default async function routes(fastify: FastifyInstance) {
     {
       schema,
       config: {
-        operation: { type: ROUTE_OPERATIONS.LIST_BUCKET },
+        operation: ROUTE_OPERATIONS.LIST_BUCKET,
       },
     },
     async (request, response) => {
@@ -70,9 +70,12 @@ export default async function routes(fastify: FastifyInstance) {
         isClientVersionBefore('supabase-py', clientInfo, '2.18.0') ||
         isClientVersionBefore('storage3', userAgent, '0.12.1')
 
+      const hasVersioningColumns = await request.storage.db.hasMigration('object-versioning-core')
+
       const results = await request.storage.listBuckets(
         'id, name, public, owner, created_at, updated_at, file_size_limit, allowed_mime_types' +
-          (omitBucketType ? '' : ', type'),
+          (omitBucketType ? '' : ', type') +
+          (omitBucketType || !hasVersioningColumns ? '' : ', versioning_status'),
         { limit, offset, sortColumn, sortOrder, search }
       )
 

@@ -3,6 +3,7 @@ import { Obj } from '@storage/schemas'
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
 import { getConfig } from '../../../config'
+import { sharedErrorResponseSchemas } from '../../schemas/error'
 import { transformationOptionsSchema } from '../../schemas/transformations'
 import { AuthenticatedRangeRequest } from '../../types'
 import { ROUTE_OPERATIONS } from '../operations'
@@ -19,8 +20,11 @@ const getObjectParamsSchema = {
 } as const
 
 const getObjectInfoQuerySchema = {
-  type: 'object',
-  properties: transformationOptionsSchema,
+  ...transformationOptionsSchema,
+  properties: {
+    ...transformationOptionsSchema.properties,
+    versionId: { type: 'string', examples: ['eaa8bdb5-2e00-4767-b5a9-d2502efe2196'] },
+  },
 } as const
 
 interface getObjectRequestInterface extends AuthenticatedRangeRequest {
@@ -38,6 +42,7 @@ async function requestHandler(
 ) {
   const { bucketName } = request.params
   const objectName = request.params['*']
+  const { versionId } = request.query
 
   const s3Key = request.storage.location.getKeyLocation({
     tenantId: request.tenantId,
@@ -61,23 +66,22 @@ async function requestHandler(
     throw ERRORS.NoSuchBucket(bucketName)
   }
 
+  const hasVersioningColumns = await request.storage.db.hasMigration('object-versioning-core')
+  const columns = hasVersioningColumns
+    ? 'id,name,version,bucket_id,metadata,user_metadata,updated_at,created_at,archived_at,is_delete_marker,is_versioned'
+    : 'id,name,version,bucket_id,metadata,user_metadata,updated_at,created_at'
+
   let obj: Obj
 
   if (bucket.public || publicRoute) {
     obj = await request.storage
       .asSuperUser()
       .from(bucketName)
-      .findObject(
-        objectName,
-        'id,name,version,bucket_id,metadata,user_metadata,updated_at,created_at'
-      )
+      .findObject(objectName, columns, undefined, versionId)
   } else {
     obj = await request.storage
       .from(bucketName)
-      .findObject(
-        objectName,
-        'id,name,version,bucket_id,metadata,user_metadata,updated_at,created_at'
-      )
+      .findObject(objectName, columns, undefined, versionId)
   }
 
   return request.storage.renderer(method).render(request, response, {
@@ -98,10 +102,10 @@ export async function publicRoutes(fastify: FastifyInstance) {
         summary: 'Get object info',
         description: 'returns object info',
         tags: ['object'],
-        response: { '4xx': { $ref: 'errorSchema#' } },
+        response: sharedErrorResponseSchemas,
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.INFO_PUBLIC_OBJECT },
+        operation: ROUTE_OPERATIONS.INFO_PUBLIC_OBJECT,
       },
     },
     async (request, response) => {
@@ -119,10 +123,10 @@ export async function publicRoutes(fastify: FastifyInstance) {
         summary: 'Get object info',
         description: 'returns object info',
         tags: ['object'],
-        response: { '4xx': { $ref: 'errorSchema#' } },
+        response: sharedErrorResponseSchemas,
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.INFO_PUBLIC_OBJECT },
+        operation: ROUTE_OPERATIONS.INFO_PUBLIC_OBJECT,
       },
     },
     async (request, response) => {
@@ -141,11 +145,11 @@ export async function authenticatedRoutes(fastify: FastifyInstance) {
         querystring: getObjectInfoQuerySchema,
         headers: { $ref: 'authSchema#' },
         summary,
-        response: { '4xx': { $ref: 'errorSchema#', description: 'Error response' } },
+        response: sharedErrorResponseSchemas,
         tags: ['object'],
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.HEAD_AUTH_OBJECT_INFO },
+        operation: ROUTE_OPERATIONS.HEAD_AUTH_OBJECT_INFO,
       },
     },
     async (request, response) => {
@@ -161,11 +165,11 @@ export async function authenticatedRoutes(fastify: FastifyInstance) {
         querystring: getObjectInfoQuerySchema,
         headers: { $ref: 'authSchema#' },
         summary,
-        response: { '4xx': { $ref: 'errorSchema#', description: 'Error response' } },
+        response: sharedErrorResponseSchemas,
         tags: ['object'],
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.GET_AUTH_OBJECT_INFO },
+        operation: ROUTE_OPERATIONS.GET_AUTH_OBJECT_INFO,
       },
     },
     async (request, response) => {
@@ -182,10 +186,10 @@ export async function authenticatedRoutes(fastify: FastifyInstance) {
         summary,
         description: 'Object Info',
         tags: ['object'],
-        response: { '4xx': { $ref: 'errorSchema#' } },
+        response: sharedErrorResponseSchemas,
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.GET_AUTH_OBJECT_INFO },
+        operation: ROUTE_OPERATIONS.GET_AUTH_OBJECT_INFO,
         allowInvalidJwt: true,
       },
     },
@@ -203,10 +207,10 @@ export async function authenticatedRoutes(fastify: FastifyInstance) {
         summary,
         description: 'Head object info',
         tags: ['object'],
-        response: { '4xx': { $ref: 'errorSchema#' } },
+        response: sharedErrorResponseSchemas,
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.HEAD_AUTH_OBJECT_INFO },
+        operation: ROUTE_OPERATIONS.HEAD_AUTH_OBJECT_INFO,
         allowInvalidJwt: true,
       },
     },

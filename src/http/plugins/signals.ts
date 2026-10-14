@@ -124,12 +124,15 @@ export const signals = fastifyPlugin(
   async function (fastify: FastifyInstance) {
     fastify.decorateRequest('signals')
 
-    fastify.addHook('onRequest', async (req, res) => {
+    fastify.addHook('onRequest', (req, res, done) => {
       req.signals = new RequestSignals(req.raw, res.raw)
+      done()
     })
 
-    fastify.addHook('onRequestAbort', async (req) => {
-      req.signals.abortRequest()
+    fastify.addHook('onRequestAbort', (req, done) => {
+      // A closing connection can skip onRequest before signals are initialized.
+      req.signals?.abortRequest()
+      done()
     })
   },
   { name: 'request-signals' }

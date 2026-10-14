@@ -4,6 +4,7 @@ import { ImageRenderer } from '@storage/renderer'
 import { FastifyInstance } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
 import { getConfig } from '../../../config'
+import { sharedErrorResponseSchemas } from '../../schemas/error'
 import { ROUTE_OPERATIONS } from '../operations'
 
 const { storageS3Bucket, isMultitenant } = getConfig()
@@ -45,18 +46,18 @@ export default async function routes(fastify: FastifyInstance) {
         params: renderAuthenticatedImageParamsSchema,
         querystring: renderImageQuerySchema,
         summary,
-        response: { '4xx': { $ref: 'errorSchema#', description: 'Error response' } },
+        response: sharedErrorResponseSchemas,
         tags: ['transformation'],
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.RENDER_SIGNED_IMAGE },
+        operation: ROUTE_OPERATIONS.RENDER_SIGNED_IMAGE,
       },
     },
     async (request, response) => {
       const { token } = request.query
       const { download } = request.query
 
-      const { url, transformations, exp } = await request.storage
+      const { url, transformations, format, exp, versionId } = await request.storage
         .from(request.params.bucketName)
         .verifyObjectSignature(token, request.params['*'], SIGNED_URL_SCOPE_DOWNLOAD)
 
@@ -66,7 +67,7 @@ export default async function routes(fastify: FastifyInstance) {
       const obj = await request.storage
         .asSuperUser()
         .from(bucketName)
-        .findObject(objParts.join('/'), 'id,version,metadata')
+        .findObject(objParts.join('/'), 'id,version,metadata', undefined, versionId)
 
       const renderer = request.storage.renderer('image') as ImageRenderer
 
@@ -77,8 +78,15 @@ export default async function routes(fastify: FastifyInstance) {
         })
       }
 
+      // The signed URL keeps `format` in its own claim, and the transformations
+      // string never contains format:origin, so restore it from the claim.
+      const signedTransformations =
+        format === 'origin'
+          ? [transformations, 'format:origin'].filter(Boolean).join(',')
+          : transformations || ''
+
       return renderer
-        .setTransformationsFromString(transformations || '')
+        .setTransformationsFromString(signedTransformations)
         .render(request, response, {
           bucket: storageS3Bucket,
           key: s3Key,

@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import {
-  PgExecutor,
-  PgStatement,
-  PgTenantConnection,
-  PgTransaction,
+  type DatabaseExecutor,
+  type DatabaseStatement,
+  type DatabaseTransaction,
   quoteIdentifier,
   quoteQualifiedIdentifier,
+  type TenantConnection,
+  type TransactionOptions,
 } from '@internal/database'
 import { DBMigration, tenantHasMigrations } from '@internal/database/migrations'
 import { ERRORS, ErrorCode, isStorageError, StorageBackendError } from '@internal/errors'
@@ -13,31 +14,92 @@ import { hashStringToInt } from '@internal/hashing'
 import { logger, logSchema } from '@internal/monitoring'
 import { dbQueryPerformance } from '@internal/monitoring/metrics'
 import { ObjectMetadata } from '@storage/backend'
+import { assertLifecycleSchemaReady, lifecycleConfigurationsEqual } from '@storage/lifecycle'
 import { DatabaseError, QueryResultRow } from 'pg'
 import { DatabaseEngine, getConfig } from '../../config'
 import { isUuid } from '../limits'
-import { Bucket, IcebergCatalog, Obj, S3MultipartUpload, S3PartUpload } from '../schemas'
+import {
+  Bucket,
+  BucketLifecycleConfiguration,
+  BucketVersioningStatus,
+  IcebergCatalog,
+  LifecycleBucket,
+  Obj,
+  ObjectListEntry,
+  ObjectListingFilterMode,
+  S3MultipartUpload,
+  S3PartUpload,
+} from '../schemas'
 import {
   Database,
+  DeleteMarkerOptions,
   FindBucketFilters,
   FindObjectFilters,
   ListBucketOptions,
+  ObjectLockKey,
+  ObjectTargets,
   ScannerS3Key,
   SearchObjectOption,
-  TransactionOptions,
+  UpsertObjectOptions,
+  VersioningStatusHint,
+  WrittenObject,
 } from './adapter'
+import { SelectColumnPolicy, selectColumns } from './columns'
 import { DBError, mapPgTransactionAbortedError, PgErrorContext } from './errors'
 
-const { databaseEngine, isMultitenant } = getConfig()
+const { databaseEngine, databaseStatementTimeout, isMultitenant, databaseHealthcheckUnscoped } =
+  getConfig()
 // Scanner cache tables are unlogged scratch tables, not session temp tables.
 // They must survive across pooled pg clients used by separate unscoped queries.
 const S3_KEYS_SCRATCH_TABLE_SCHEMA = 'storage'
 const S3_KEYS_SCRATCH_TABLE_PREFIX = '_s3_remote_keys_'
 const S3_KEYS_SCRATCH_TABLE_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const S3_KEYS_SCRATCH_TABLE_PATTERN = `^${S3_KEYS_SCRATCH_TABLE_PREFIX}([0-9]{13})(?:_[A-Za-z0-9_]+)?$`
+export const S3_KEYS_SCRATCH_TABLE_QUALIFIED_PATTERN = `^${S3_KEYS_SCRATCH_TABLE_SCHEMA}\\.${S3_KEYS_SCRATCH_TABLE_PATTERN.slice(1)}`
+const S3_KEYS_SCRATCH_TABLE_QUALIFIED_REGEX = new RegExp(S3_KEYS_SCRATCH_TABLE_QUALIFIED_PATTERN)
+// Keep direct search queries aligned with the cap enforced by storage.search.
+const SEARCH_OBJECTS_MAX_LIMIT = 1500
+
+function quoteS3KeysScratchTable(tableName: string): string {
+  if (!S3_KEYS_SCRATCH_TABLE_QUALIFIED_REGEX.test(tableName)) {
+    throw ERRORS.InvalidParameter('tmpTable')
+  }
+
+  return quoteQualifiedIdentifier(tableName)
+}
 
 export function escapeLike(str: string) {
   return str.replace(/\\/g, '\\\\').replace(/([%_])/g, '\\$1')
+}
+
+function buildVersioningConditions(
+  noncurrentVersions: ObjectListingFilterMode,
+  deleteMarkers: ObjectListingFilterMode
+): string[] {
+  const conditions: string[] = []
+  if (noncurrentVersions === 'exclude') {
+    conditions.push('archived_at IS NULL')
+  } else if (noncurrentVersions === 'only') {
+    conditions.push('archived_at IS NOT NULL')
+  }
+  if (deleteMarkers === 'exclude') {
+    conditions.push('NOT is_delete_marker')
+  } else if (deleteMarkers === 'only') {
+    conditions.push('is_delete_marker')
+  }
+  return conditions
+}
+
+/**
+ * Role scope currently applied to a transaction through TenantConnection.setScope.
+ * One holder is created with the transaction and shared, through the options,
+ * by every StoragePgDB bound to it, so nested units and superuser queries only
+ * switch scope when the transaction is scoped to another role instead of
+ * re-applying and restoring it around every statement. A transaction supplied
+ * from outside has no holder: its scope is unknown and treated conservatively.
+ */
+interface TransactionScope {
+  applied?: TenantConnection
 }
 
 interface PgDatabaseOptions {
@@ -47,9 +109,43 @@ interface PgDatabaseOptions {
   latestMigration?: keyof typeof DBMigration
   databaseEngine?: DatabaseEngine
   host: string
-  tnx?: PgTransaction
-  parentTnx?: PgTransaction
-  parentConnection?: PgTenantConnection
+  tnx?: DatabaseTransaction
+  parentTnx?: DatabaseTransaction
+  parentConnection?: TenantConnection
+  /** Original request connection, retained across role changes. */
+  callerConnection?: TenantConnection
+  scope?: TransactionScope
+}
+
+interface UnscopedQueryOptions {
+  readonly timeoutMs?: number
+}
+
+const HEALTHCHECK_SQL = 'SELECT id from storage.buckets limit 1'
+const HEALTHCHECK_QUERY_OPTIONS: UnscopedQueryOptions = Object.freeze({
+  timeoutMs: databaseStatementTimeout,
+})
+const LIFECYCLE_BUCKET_COLUMNS = [
+  'id',
+  'name',
+  'type',
+  'lifecycle_configuration',
+  'lifecycle_configuration_generation',
+].join(',')
+async function executeQuery<T extends QueryResultRow = QueryResultRow>(
+  db: DatabaseExecutor,
+  statement: string | DatabaseStatement,
+  signal?: AbortSignal
+) {
+  try {
+    return await db.query<T>(statement, { signal })
+  } catch (error) {
+    throw mapPgError(error, typeof statement === 'string' ? statement : statement.text)
+  }
+}
+
+function healthcheckProbe(db: DatabaseExecutor, signal?: AbortSignal) {
+  return executeQuery(db, HEALTHCHECK_SQL, signal)
 }
 
 class TestPermissionRollbackError extends Error {
@@ -59,6 +155,10 @@ class TestPermissionRollbackError extends Error {
     Object.setPrototypeOf(this, TestPermissionRollbackError.prototype)
   }
 }
+
+const testPermissionRollbackError = new TestPermissionRollbackError()
+testPermissionRollbackError.stack = undefined
+Object.freeze(testPermissionRollbackError)
 
 /**
  * Pg-backed storage metadata adapter.
@@ -70,9 +170,14 @@ export class StoragePgDB implements Database {
   public readonly sbReqId: string | undefined
   public readonly role?: string
   public readonly latestMigration?: keyof typeof DBMigration
+  private readonly objectColumnPolicy: SelectColumnPolicy | undefined
+  private readonly multipartColumnPolicy: SelectColumnPolicy
+  private readonly bucketColumnPolicy: SelectColumnPolicy | undefined
+  private readonly supportsCustomMetadataColumns: boolean
+  private readonly supportsMultipartMetadataColumn: boolean
 
   constructor(
-    public readonly connection: PgTenantConnection,
+    public readonly connection: TenantConnection,
     private readonly options: PgDatabaseOptions
   ) {
     this.tenantHost = options.host
@@ -81,6 +186,42 @@ export class StoragePgDB implements Database {
     this.sbReqId = options.sbReqId
     this.role = connection.role
     this.latestMigration = options.latestMigration
+
+    const migrationOrdinal = this.latestMigration ? DBMigration[this.latestMigration] : undefined
+    this.supportsCustomMetadataColumns =
+      !this.latestMigration ||
+      (migrationOrdinal !== undefined && migrationOrdinal >= DBMigration['custom-metadata'])
+    this.supportsMultipartMetadataColumn =
+      !this.latestMigration ||
+      (migrationOrdinal !== undefined &&
+        migrationOrdinal >= DBMigration['s3-multipart-uploads-metadata'])
+    this.objectColumnPolicy =
+      migrationOrdinal === undefined
+        ? this.latestMigration
+          ? SelectColumnPolicy.objectWithoutUserMetadataOrVersioning
+          : undefined
+        : this.objectColumnPolicyForMigrations(
+            migrationOrdinal >= DBMigration['custom-metadata'],
+            migrationOrdinal >= DBMigration['object-versioning-core']
+          )
+    this.bucketColumnPolicy =
+      migrationOrdinal === undefined
+        ? undefined
+        : migrationOrdinal < DBMigration['iceberg-catalog-flag-on-buckets']
+          ? SelectColumnPolicy.bucketWithoutTypeOrVersioningStatus
+          : migrationOrdinal < DBMigration['object-versioning-core']
+            ? SelectColumnPolicy.bucketWithoutVersioningStatus
+            : SelectColumnPolicy.none
+
+    if (this.supportsCustomMetadataColumns) {
+      this.multipartColumnPolicy = this.supportsMultipartMetadataColumn
+        ? SelectColumnPolicy.none
+        : SelectColumnPolicy.multipartWithoutMetadata
+    } else {
+      this.multipartColumnPolicy = this.supportsMultipartMetadataColumn
+        ? SelectColumnPolicy.multipartWithoutUserMetadata
+        : SelectColumnPolicy.multipartWithoutUserOrMultipartMetadata
+    }
   }
 
   async withTransaction<T>(
@@ -90,7 +231,10 @@ export class StoragePgDB implements Database {
     const parentTnx = this.options.tnx
     const tnx = parentTnx ?? (await this.connection.transaction(opts))
     const savepoint = parentTnx ? nextSavepointName() : undefined
+    const scope: TransactionScope = parentTnx ? (this.options.scope ?? {}) : {}
+    const scopeAtEntry = parentTnx ? scope.applied : undefined
     let savepointEstablished = false
+    let scopeToRestore: TenantConnection | undefined
 
     try {
       if (savepoint) {
@@ -98,23 +242,27 @@ export class StoragePgDB implements Database {
         savepointEstablished = true
       }
 
-      await this.connection.setScope(tnx)
+      // A nested unit only switches scope when the transaction is scoped to another
+      // role (or to an unknown one). Queries issued through the child then run
+      // without per-statement scope switching until the unit ends.
+      if (!parentTnx || !scopeAtEntry || scopeAtEntry.role !== this.connection.role) {
+        scopeToRestore = parentTnx ? this.scopeToRestoreAfterSwitch(scope) : undefined
+        await this.applyScope(tnx, scope)
+      }
 
       const storageWithTnx = new StoragePgDB(this.connection, {
         ...this.options,
         tnx,
+        scope,
       })
 
       const result = await fn(storageWithTnx)
 
       if (savepoint) {
-        if (
-          this.options.parentConnection?.role &&
-          this.connection.role !== this.options.parentConnection.role
-        ) {
+        if (scopeToRestore) {
           // Keep scope restoration inside the savepoint. If it fails, rolling back
           // the nested unit is preferable to leaking elevated scope into the parent transaction.
-          await this.options.parentConnection.setScope(tnx)
+          await this.applyScope(tnx, scope, scopeToRestore)
         }
 
         await tnx.query(`RELEASE SAVEPOINT ${savepoint}`)
@@ -127,7 +275,10 @@ export class StoragePgDB implements Database {
       if (savepointEstablished && savepoint && !tnx.isCompleted()) {
         try {
           await rollbackSavepoint(tnx, savepoint)
+          // Rolling back to the savepoint also reverts transaction-local settings.
+          scope.applied = scopeAtEntry
         } catch (rollbackError) {
+          scope.applied = undefined
           logSchema.warning(logger, '[StoragePgDB] Failed to rollback savepoint', {
             type: 'db',
             tenantId: this.tenantId,
@@ -165,11 +316,91 @@ export class StoragePgDB implements Database {
     }
   }
 
+  private objectColumnPolicyForMigrations(
+    hasCustomMetadata: boolean,
+    hasVersioning: boolean
+  ): SelectColumnPolicy {
+    if (hasCustomMetadata) {
+      return hasVersioning ? SelectColumnPolicy.none : SelectColumnPolicy.objectWithoutVersioning
+    }
+    return hasVersioning
+      ? SelectColumnPolicy.objectWithoutUserMetadata
+      : SelectColumnPolicy.objectWithoutUserMetadataOrVersioning
+  }
+
+  private async getObjectColumnPolicy() {
+    if (this.objectColumnPolicy !== undefined) {
+      return this.objectColumnPolicy
+    }
+
+    const [hasCustomMetadata, hasVersioning] = await Promise.all([
+      this.hasMigration('custom-metadata'),
+      this.hasMigration('object-versioning-core'),
+    ])
+    return this.objectColumnPolicyForMigrations(hasCustomMetadata, hasVersioning)
+  }
+
+  async hasMigration(migration: keyof typeof DBMigration): Promise<boolean> {
+    const reportedOrdinal = this.latestMigration ? DBMigration[this.latestMigration] : undefined
+    if (reportedOrdinal !== undefined) {
+      return reportedOrdinal >= DBMigration[migration]
+    }
+
+    return tenantHasMigrations(this.tenantId, migration)
+  }
+
+  private async applyScope(
+    tnx: DatabaseTransaction,
+    scope: TransactionScope,
+    connection: TenantConnection = this.connection
+  ): Promise<void> {
+    await connection.setScope(tnx)
+    scope.applied = connection
+  }
+
+  private hasDifferentScopeThanParent(): boolean {
+    return Boolean(
+      this.options.parentConnection?.role &&
+        this.connection.role !== this.options.parentConnection.role
+    )
+  }
+
+  /**
+   * Whether a query on this database must switch the transaction scope first.
+   * When the applied scope is unknown (transaction created outside StoragePgDB),
+   * fall back to comparing roles with the parent connection, which is what an
+   * external caller would have scoped it to.
+   */
+  private scopeSwitchNeeded(scope: TransactionScope | undefined): boolean {
+    const applied = scope?.applied
+    return applied ? applied.role !== this.connection.role : this.hasDifferentScopeThanParent()
+  }
+
+  private scopeToRestoreAfterSwitch(
+    scope: TransactionScope | undefined
+  ): TenantConnection | undefined {
+    return (
+      scope?.applied ??
+      (this.hasDifferentScopeThanParent() ? this.options.parentConnection : undefined)
+    )
+  }
+
+  asCaller() {
+    const callerConnection = this.options.callerConnection ?? this.connection
+    return new StoragePgDB(callerConnection, {
+      ...this.options,
+      callerConnection,
+      parentConnection: this.connection,
+      parentTnx: this.options.tnx,
+    })
+  }
+
   asSuperUser() {
     return new StoragePgDB(this.connection.asSuperUser(), {
       ...this.options,
+      callerConnection: this.options.callerConnection ?? this.connection,
       tnx: this.options.tnx,
-      parentConnection: this.connection,
+      parentConnection: this.options.parentConnection ?? this.connection,
       parentTnx: this.options.tnx,
     })
   }
@@ -179,10 +410,10 @@ export class StoragePgDB implements Database {
     try {
       await this.withTransaction(async (db) => {
         result = await fn(db)
-        throw new TestPermissionRollbackError()
+        throw testPermissionRollbackError
       })
     } catch (e) {
-      if (e instanceof TestPermissionRollbackError) {
+      if (e === testPermissionRollbackError) {
         return result!
       }
       throw e
@@ -234,6 +465,8 @@ export class StoragePgDB implements Database {
     columns: string,
     options: ListBucketOptions | undefined
   ): Promise<IcebergCatalog[]> {
+    const selectedColumns = selectColumns(columns)
+
     return this.runQuery('ListIcebergBuckets', async (db, signal) => {
       const values: unknown[] = []
       const conditions = ['deleted_at IS NULL']
@@ -261,7 +494,7 @@ export class StoragePgDB implements Database {
         db,
         {
           text: `
-            SELECT ${selectColumns(columns)}
+            SELECT ${selectedColumns}
             FROM storage.buckets_analytics
             WHERE ${conditions.join(' AND ')}
             ORDER BY ${orderBy}
@@ -330,7 +563,14 @@ export class StoragePgDB implements Database {
   async createBucket(
     data: Pick<
       Bucket,
-      'id' | 'name' | 'public' | 'owner' | 'file_size_limit' | 'allowed_mime_types' | 'type'
+      | 'id'
+      | 'name'
+      | 'public'
+      | 'owner'
+      | 'file_size_limit'
+      | 'allowed_mime_types'
+      | 'type'
+      | 'versioning_status'
     >
   ) {
     const bucketData: Bucket = {
@@ -343,8 +583,17 @@ export class StoragePgDB implements Database {
       file_size_limit: data.file_size_limit,
     }
 
-    if (await tenantHasMigrations(this.tenantId, 'iceberg-catalog-flag-on-buckets')) {
+    if (await this.hasMigration('iceberg-catalog-flag-on-buckets')) {
       bucketData.type = 'STANDARD'
+    }
+
+    if (await this.hasMigration('object-versioning-core')) {
+      if (data.versioning_status === 'SUSPENDED') {
+        throw ERRORS.InvalidParameter('versioning_status', {
+          message: 'Cannot suspend versioning on a bucket that has never had it enabled',
+        })
+      }
+      bucketData.versioning_status = data.versioning_status ?? 'DISABLED'
     }
 
     try {
@@ -377,14 +626,24 @@ export class StoragePgDB implements Database {
     }
   }
 
+  private async getBucketColumnPolicy(): Promise<SelectColumnPolicy> {
+    if (this.bucketColumnPolicy !== undefined) {
+      return this.bucketColumnPolicy
+    }
+
+    const hasBucketType = await this.hasMigration('iceberg-catalog-flag-on-buckets')
+    const hasVersioningStatus = await this.hasMigration('object-versioning-core')
+    return !hasBucketType
+      ? SelectColumnPolicy.bucketWithoutTypeOrVersioningStatus
+      : !hasVersioningStatus
+        ? SelectColumnPolicy.bucketWithoutVersioningStatus
+        : SelectColumnPolicy.none
+  }
+
   async findBucketById(bucketId: string, columns = 'id', filters?: FindBucketFilters) {
+    const selectedColumns = selectColumns(columns, await this.getBucketColumnPolicy())
+
     const result = await this.runQuery('FindBucketById', async (db, signal) => {
-      let columnNames = columns.split(',').map((column) => column.trim())
-
-      if (!(await tenantHasMigrations(this.tenantId, 'iceberg-catalog-flag-on-buckets'))) {
-        columnNames = columnNames.filter((name) => name !== 'type')
-      }
-
       const conditions = ['id = $1']
       const values: unknown[] = [bucketId]
 
@@ -397,7 +656,7 @@ export class StoragePgDB implements Database {
         db,
         {
           text: `
-            SELECT ${selectColumns(columnNames)}
+            SELECT ${selectedColumns}
             FROM storage.buckets
             WHERE ${conditions.join(' AND ')}
             LIMIT 1
@@ -416,6 +675,106 @@ export class StoragePgDB implements Database {
     }
 
     return result
+  }
+
+  /**
+   * Finds several buckets in one statement, returned in ascending id order.
+   * A locking read (forShare/forUpdate) therefore locks the rows in that same
+   * order, so callers locking overlapping bucket sets cannot deadlock each other.
+   */
+  async findBucketsById(bucketIds: string[], columns = 'id', filters?: FindBucketFilters) {
+    const uniqueIds = [...new Set(bucketIds)]
+    if (uniqueIds.length === 0) {
+      return []
+    }
+
+    const selectedColumns = selectColumns(columns, await this.getBucketColumnPolicy())
+
+    const buckets = await this.runQuery('FindBucketsById', async (db, signal) => {
+      const conditions = ['id = ANY($1::text[])']
+      const values: unknown[] = [uniqueIds]
+
+      if (typeof filters?.isPublic !== 'undefined') {
+        values.push(filters.isPublic)
+        conditions.push(`public = $${values.length}`)
+      }
+
+      const result = await this.query<Bucket>(
+        db,
+        {
+          text: `
+            SELECT ${selectedColumns}
+            FROM storage.buckets
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY id
+            ${lockClause(filters)}
+          `,
+          values,
+        },
+        signal
+      )
+
+      return result.rows
+    })
+
+    if (!filters?.dontErrorOnEmpty && buckets.length < uniqueIds.length) {
+      const found = new Set(buckets.map((bucket) => bucket.id))
+      throw ERRORS.NoSuchBucket(uniqueIds.find((id) => !found.has(id)) ?? uniqueIds.join(','))
+    }
+
+    return buckets
+  }
+
+  async findLifecycleBucket(bucketId: string): Promise<LifecycleBucket> {
+    await assertLifecycleSchemaReady(this, bucketId)
+
+    const bucket = await this.findBucketById(bucketId, LIFECYCLE_BUCKET_COLUMNS)
+    assertStandardLifecycleBucket(bucket)
+    return bucket as LifecycleBucket
+  }
+
+  async putLifecycleConfiguration(
+    bucketId: string,
+    configuration: BucketLifecycleConfiguration
+  ): Promise<LifecycleBucket> {
+    return this.mutateLifecycleConfiguration({
+      bucketId,
+      queryName: 'PutLifecycleConfiguration',
+      unchanged: (locked) =>
+        lifecycleConfigurationsEqual(locked.lifecycle_configuration, configuration),
+      write: (unchanged) => ({
+        text: `
+                  UPDATE storage.buckets
+                  SET lifecycle_configuration = $2::jsonb,
+                      lifecycle_configuration_generation = $3::uuid
+                  WHERE id = $1
+                  RETURNING ${selectColumns(LIFECYCLE_BUCKET_COLUMNS)}
+                `,
+        values: [
+          bucketId,
+          JSON.stringify(unchanged ? unchanged.lifecycle_configuration : configuration),
+          unchanged ? unchanged.lifecycle_configuration_generation : randomUUID(),
+        ],
+      }),
+    })
+  }
+
+  async deleteLifecycleConfiguration(bucketId: string): Promise<LifecycleBucket> {
+    return this.mutateLifecycleConfiguration({
+      bucketId,
+      queryName: 'DeleteLifecycleConfiguration',
+      unchanged: (locked) => locked.lifecycle_configuration === null,
+      write: () => ({
+        text: `
+                  UPDATE storage.buckets
+                  SET lifecycle_configuration = NULL,
+                      lifecycle_configuration_generation = NULL
+                  WHERE id = $1
+                  RETURNING ${selectColumns(LIFECYCLE_BUCKET_COLUMNS)}
+                `,
+        values: [bucketId],
+      }),
+    })
   }
 
   async countObjectsInBucket(bucketId: string, limit?: number): Promise<number> {
@@ -462,11 +821,28 @@ export class StoragePgDB implements Database {
     columns = 'id',
     limit = 10,
     before?: Date,
-    nextToken?: string
+    nextToken?: string,
+    nextTokenVersion?: string | null,
+    filters?: {
+      noncurrentVersions?: ObjectListingFilterMode
+      deleteMarkers?: ObjectListingFilterMode
+    }
   ) {
+    const selectedColumns = selectColumns(columns)
+    const hasVersioning = filters ? await this.hasMigration('object-versioning-core') : false
+
     const result = await this.runQuery('ListObjects', async (db, signal) => {
       const conditions = ['bucket_id = $1']
       const values: unknown[] = [bucketId]
+
+      if (hasVersioning && filters) {
+        conditions.push(
+          ...buildVersioningConditions(
+            filters.noncurrentVersions ?? 'include',
+            filters.deleteMarkers ?? 'include'
+          )
+        )
+      }
 
       if (before) {
         values.push(before.toISOString())
@@ -475,7 +851,19 @@ export class StoragePgDB implements Database {
 
       if (nextToken) {
         values.push(nextToken)
-        conditions.push(`name COLLATE "C" > $${values.length}`)
+        const namePlaceholder = values.length
+
+        if (nextTokenVersion === null) {
+          conditions.push(`name COLLATE "C" > $${namePlaceholder}`)
+        } else if (nextTokenVersion !== undefined) {
+          values.push(nextTokenVersion)
+          conditions.push(`name COLLATE "C" >= $${namePlaceholder}`)
+          conditions.push(
+            `((name COLLATE "C", version) > ($${namePlaceholder}, $${values.length}) OR (name COLLATE "C" = $${namePlaceholder} AND version IS NULL))`
+          )
+        } else {
+          conditions.push(`name COLLATE "C" > $${namePlaceholder}`)
+        }
       }
 
       values.push(limit)
@@ -484,10 +872,10 @@ export class StoragePgDB implements Database {
         db,
         {
           text: `
-            SELECT ${selectColumns(columns)}
+            SELECT ${selectedColumns}
             FROM storage.objects
             WHERE ${conditions.join(' AND ')}
-            ORDER BY name COLLATE "C"
+            ORDER BY name COLLATE "C", version
             LIMIT $${values.length}
           `,
           values,
@@ -511,13 +899,44 @@ export class StoragePgDB implements Database {
         order?: string
         column?: string
         after?: string
+        afterVersion?: string
+        afterArchivedAt?: string
       }
+      noncurrentVersions?: ObjectListingFilterMode
+      deleteMarkers?: ObjectListingFilterMode
+      exactMatch?: boolean
     }
   ) {
+    let useNewSearchVersion2 = true
+    let hasSortSupport = false
+
+    if (options?.delimiter) {
+      if (isMultitenant) {
+        useNewSearchVersion2 = await this.hasMigration('search-v2')
+      }
+
+      if (useNewSearchVersion2 && options.delimiter === '/') {
+        hasSortSupport =
+          (await this.hasMigration('add-search-v2-sort-support')) ||
+          (await this.hasMigration('search-v2-optimised'))
+      }
+    }
+
+    const hasVersioningStatus = await this.hasMigration('list-objects-with-versions')
+    const noncurrentVersions = hasVersioningStatus
+      ? (options?.noncurrentVersions ?? 'exclude')
+      : 'exclude'
+    const deleteMarkers = hasVersioningStatus ? (options?.deleteMarkers ?? 'exclude') : 'exclude'
+    const multiRow = noncurrentVersions === 'only' || noncurrentVersions === 'include'
+
     return this.runQuery('ListObjectsV2', async (db, signal) => {
-      if (!options?.delimiter) {
+      if (!options?.delimiter || options?.exactMatch) {
         const values: unknown[] = [bucketId, options?.maxKeys || 100]
         const conditions = ['bucket_id = $1']
+
+        if (hasVersioningStatus) {
+          conditions.push(...buildVersioningConditions(noncurrentVersions, deleteMarkers))
+        }
 
         const allowedSortColumns = new Set(['updated_at', 'created_at'])
         const allowedSortOrders = new Set(['asc', 'desc'])
@@ -525,31 +944,59 @@ export class StoragePgDB implements Database {
           options?.sortBy?.column && allowedSortColumns.has(options.sortBy.column)
             ? options.sortBy.column
             : undefined
+        const sortColumnExpression = sortColumn
+          ? `COALESCE(date_trunc('milliseconds', ${quoteIdentifier(sortColumn)}), 'epoch'::timestamptz)`
+          : undefined
         const sortOrder =
           options?.sortBy?.order && allowedSortOrders.has(options.sortBy.order)
             ? options.sortBy.order
             : 'asc'
         const pageOperator = sortOrder === 'asc' ? '>' : '<'
 
-        if (options?.prefix) {
+        if (options?.exactMatch) {
+          values.push(options.nextToken ?? options.prefix ?? '')
+          conditions.push(`name COLLATE "C" = $${values.length}`)
+        } else if (options?.prefix) {
           values.push(`${escapeLike(options.prefix)}%`)
-          conditions.push(`name LIKE $${values.length}`)
+          conditions.push(`name COLLATE "C" LIKE $${values.length}`)
         }
 
         if (options?.startAfter && !options?.nextToken) {
           values.push(options.startAfter)
-          conditions.push(`name COLLATE "C" > $${values.length}`)
+          conditions.push(`name COLLATE "C" ${pageOperator} $${values.length}`)
         }
 
         if (options?.nextToken) {
-          if (sortColumn && options.sortBy?.after) {
-            values.push(options.sortBy.after, options.nextToken)
+          if (sortColumn) {
+            values.push(options.sortBy?.after ?? null, options.nextToken)
+            const tsPlaceholder = values.length - 1
+            const namePlaceholder = values.length
+            let storedVersionClause = "''"
+            let cursorVersionClause = "''"
+            if (multiRow) {
+              storedVersionClause = "COALESCE(version, '')"
+              values.push(options.sortBy?.afterVersion || '')
+              cursorVersionClause = `$${values.length}`
+            }
             conditions.push(
-              `ROW(date_trunc('milliseconds', ${quoteIdentifier(
-                sortColumn
-              )}), name COLLATE "C") ${pageOperator} ROW(COALESCE(NULLIF($${
-                values.length - 1
-              }, '')::timestamptz, 'epoch'::timestamptz), $${values.length})`
+              `ROW(${sortColumnExpression}, name COLLATE "C", ${storedVersionClause}) ${pageOperator} ROW(date_trunc('milliseconds', COALESCE(NULLIF($${tsPlaceholder}, '')::timestamptz, 'epoch'::timestamptz)), $${namePlaceholder}, ${cursorVersionClause})`
+            )
+          } else if (multiRow) {
+            values.push(
+              options.nextToken,
+              options.sortBy?.afterArchivedAt || '',
+              options.sortBy?.afterVersion || ''
+            )
+            const namePlaceholder = values.length - 2
+            const tsPlaceholder = values.length - 1
+            const versionPlaceholder = values.length
+            const archivedAt =
+              "COALESCE(date_trunc('milliseconds', archived_at), 'infinity'::timestamptz)"
+            conditions.push(
+              `name COLLATE "C" ${pageOperator === '>' ? '>=' : '<='} $${namePlaceholder}`
+            )
+            conditions.push(
+              `(name COLLATE "C" ${pageOperator} $${namePlaceholder} OR (name COLLATE "C" = $${namePlaceholder} AND (NULLIF($${tsPlaceholder}, '') IS NULL OR ${archivedAt} < NULLIF($${tsPlaceholder}, '')::timestamptz OR (${archivedAt} = NULLIF($${tsPlaceholder}, '')::timestamptz AND COALESCE(version, '') > $${versionPlaceholder}))))`
             )
           } else {
             values.push(options.nextToken)
@@ -557,15 +1004,16 @@ export class StoragePgDB implements Database {
           }
         }
 
-        const result = await this.query<Obj>(
+        const result = await this.query<ObjectListEntry>(
           db,
           {
             text: `
               SELECT id, name, metadata, updated_at, created_at, last_accessed_at
+                ${hasVersioningStatus ? ', version, archived_at, is_delete_marker, is_versioned' : ''}
               FROM storage.objects
               WHERE ${conditions.join(' AND ')}
-              ORDER BY ${sortColumn ? `${quoteIdentifier(sortColumn)} ${sortOrder}, ` : ''}
-                name COLLATE "C" ${sortOrder}
+              ORDER BY ${sortColumnExpression ? `${sortColumnExpression} ${sortOrder}, ` : ''}
+                name COLLATE "C" ${sortOrder}${!sortColumn && multiRow ? ", COALESCE(date_trunc('milliseconds', archived_at), 'infinity'::timestamptz) DESC, COALESCE(version, '') ASC" : ''}${sortColumn && multiRow ? `, COALESCE(version, '') ${sortOrder}` : ''}
               LIMIT $2
             `,
             values,
@@ -576,25 +1024,28 @@ export class StoragePgDB implements Database {
         return result.rows
       }
 
-      let useNewSearchVersion2 = true
-
-      if (isMultitenant) {
-        useNewSearchVersion2 = await tenantHasMigrations(this.tenantId, 'search-v2')
-      }
-
       if (useNewSearchVersion2 && options?.delimiter === '/') {
-        let paramPlaceholders = '$1,$2,$3,$4,$5'
         const sortParams: (string | null)[] = []
-        const hasSortSupport =
-          (await tenantHasMigrations(this.tenantId, 'add-search-v2-sort-support')) ||
-          (await tenantHasMigrations(this.tenantId, 'search-v2-optimised'))
 
-        if (hasSortSupport) {
-          paramPlaceholders += ',$6,$7,$8'
+        // Versioning parameters occupy positions after the sort parameters in
+        // search_v2's signature, so include the sort defaults even if a
+        // non-linear migration state reports versioning without sort support.
+        if (hasSortSupport || hasVersioningStatus) {
           sortParams.push(
             options?.sortBy?.order || 'asc',
             options?.sortBy?.column || 'name',
             options?.sortBy?.after || null
+          )
+        }
+
+        const versioningParams: (string | boolean | null)[] = []
+        if (hasVersioningStatus) {
+          versioningParams.push(
+            noncurrentVersions,
+            deleteMarkers,
+            options?.sortBy?.afterArchivedAt || null,
+            options?.sortBy?.afterVersion || '',
+            options?.nextToken !== undefined
           )
         }
 
@@ -606,9 +1057,11 @@ export class StoragePgDB implements Database {
           levels,
           options?.startAfter || '',
           ...sortParams,
+          ...versioningParams,
         ]
+        const paramPlaceholders = searchParams.map((_, index) => `$${index + 1}`).join(',')
 
-        const result = await this.query<Obj>(
+        const result = await this.query<ObjectListEntry>(
           db,
           {
             text: `select * from storage.search_v2(${paramPlaceholders})`,
@@ -620,18 +1073,32 @@ export class StoragePgDB implements Database {
         return result.rows
       }
 
-      const result = await this.query<Obj>(
+      const listParamPlaceholders = hasVersioningStatus
+        ? '$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11'
+        : '$1,$2,$3,$4,$5,$6'
+      const listValues: unknown[] = [
+        bucketId,
+        options?.prefix,
+        options?.delimiter,
+        options?.maxKeys,
+        options?.startAfter || '',
+        options?.nextToken || '',
+      ]
+      if (hasVersioningStatus) {
+        listValues.push(
+          options?.sortBy?.order || 'asc',
+          noncurrentVersions,
+          deleteMarkers,
+          options?.sortBy?.afterArchivedAt || null,
+          options?.sortBy?.afterVersion || ''
+        )
+      }
+
+      const result = await this.query<ObjectListEntry>(
         db,
         {
-          text: 'select * from storage.list_objects_with_delimiter($1,$2,$3,$4,$5,$6)',
-          values: [
-            bucketId,
-            options?.prefix,
-            options?.delimiter,
-            options?.maxKeys,
-            options?.startAfter || '',
-            options?.nextToken || '',
-          ],
+          text: `select * from storage.list_objects_with_delimiter(${listParamPlaceholders})`,
+          values: listValues,
         },
         signal
       )
@@ -659,14 +1126,9 @@ export class StoragePgDB implements Database {
   }
 
   async listBuckets(columns = 'id', options?: ListBucketOptions) {
-    return this.runQuery('ListBuckets', async (db, signal) => {
-      const columnNames = columns.split(',').map((column) => column.trim())
-      const selectColumnNames = columnNames.filter((name) => name !== 'type')
-      const selectedColumns = selectColumnNames.length ? selectColumns(selectColumnNames) : ''
-      const selectClause = columnNames.includes('type')
-        ? [selectedColumns, `'STANDARD' AS "type"`].filter(Boolean).join(', ')
-        : selectedColumns || quoteIdentifier('id')
+    const selectedColumns = selectColumns(columns, SelectColumnPolicy.syntheticBucket)
 
+    return this.runQuery('ListBuckets', async (db, signal) => {
       const conditions: string[] = []
       const values: unknown[] = []
 
@@ -695,7 +1157,7 @@ export class StoragePgDB implements Database {
         db,
         {
           text: `
-            SELECT ${selectClause}
+            SELECT ${selectedColumns}
             FROM storage.buckets
             ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
             ${orderBy}
@@ -710,7 +1172,7 @@ export class StoragePgDB implements Database {
     })
   }
 
-  listMultipartUploads(
+  async listMultipartUploads(
     bucketId: string,
     options?: {
       prefix?: string
@@ -720,6 +1182,10 @@ export class StoragePgDB implements Database {
       maxKeys?: number
     }
   ) {
+    const hasRawPrefixParam = options?.deltimeter
+      ? await this.hasMigration('list-objects-with-versions')
+      : false
+
     return this.runQuery('ListMultipartsUploads', async (db, signal) => {
       if (!options?.deltimeter) {
         const conditions = ['bucket_id = $1']
@@ -727,17 +1193,29 @@ export class StoragePgDB implements Database {
 
         if (options?.prefix) {
           values.push(`${escapeLike(options.prefix)}%`)
-          conditions.push(`key ILIKE $${values.length}`)
+          conditions.push(`key COLLATE "C" LIKE $${values.length}`)
         }
 
-        if (options?.nextUploadKeyToken && !options.nextUploadToken) {
+        if (options?.nextUploadKeyToken) {
           values.push(options.nextUploadKeyToken)
-          conditions.push(`key COLLATE "C" > $${values.length}`)
-        }
+          const keyMarkerIndex = values.length
 
-        if (options?.nextUploadToken) {
-          values.push(options.nextUploadToken)
-          conditions.push(`id COLLATE "C" > $${values.length}`)
+          if (options.nextUploadToken) {
+            // Upload IDs do not follow creation order. A missing marker repeats
+            // the remaining same-key uploads instead of skipping them.
+            values.push(options.nextUploadToken)
+            conditions.push(
+              `(key COLLATE "C" > $${keyMarkerIndex} OR (key COLLATE "C" = $${keyMarkerIndex} AND COALESCE((created_at, id COLLATE "C") > (
+                SELECT marker.created_at, marker.id COLLATE "C"
+                FROM storage.s3_multipart_uploads AS marker
+                WHERE marker.bucket_id = $1
+                  AND marker.key COLLATE "C" = $${keyMarkerIndex}
+                  AND marker.id = $${values.length}
+              ), TRUE)))`
+            )
+          } else {
+            conditions.push(`key COLLATE "C" > $${keyMarkerIndex}`)
+          }
         }
 
         values.push(options?.maxKeys || 100)
@@ -749,7 +1227,7 @@ export class StoragePgDB implements Database {
               SELECT id, key, created_at
               FROM storage.s3_multipart_uploads
               WHERE ${conditions.join(' AND ')}
-              ORDER BY key COLLATE "C", created_at
+              ORDER BY key COLLATE "C", created_at, id COLLATE "C"
               LIMIT $${values.length}
             `,
             values,
@@ -763,7 +1241,7 @@ export class StoragePgDB implements Database {
       const result = await this.query<S3MultipartUpload>(
         db,
         {
-          text: 'select * from storage.list_multipart_uploads_with_delimiter($1,$2,$3,$4,$5,$6)',
+          text: `select * from storage.list_multipart_uploads_with_delimiter($1,$2,$3,$4,$5,$6${hasRawPrefixParam ? ',$7' : ''})`,
           values: [
             bucketId,
             options?.prefix ? escapeLike(options.prefix) : options?.prefix,
@@ -771,6 +1249,7 @@ export class StoragePgDB implements Database {
             options?.maxKeys,
             options?.nextUploadKeyToken || '',
             options.nextUploadToken || '',
+            ...(hasRawPrefixParam ? [options?.prefix ?? ''] : []),
           ],
         },
         signal
@@ -782,7 +1261,7 @@ export class StoragePgDB implements Database {
 
   async updateBucket(
     bucketId: string,
-    fields: Pick<Bucket, 'public' | 'file_size_limit' | 'allowed_mime_types'>
+    fields: Pick<Bucket, 'public' | 'file_size_limit' | 'allowed_mime_types' | 'versioning_status'>
   ) {
     const entries = Object.entries(fields).filter(([, value]) => value !== undefined)
 
@@ -790,19 +1269,52 @@ export class StoragePgDB implements Database {
       return
     }
 
+    if (
+      fields.versioning_status === undefined ||
+      !(await this.hasMigration('object-versioning-core'))
+    ) {
+      return this.updateBucketFields(bucketId, entries)
+    }
+
+    return this.withTransaction(async (db) => {
+      const currentBucket = await db.findBucketById(bucketId, 'versioning_status', {
+        forUpdate: true,
+      })
+      const previousStatus = currentBucket.versioning_status ?? 'DISABLED'
+      const nextStatus = fields.versioning_status
+
+      if (
+        nextStatus !== previousStatus &&
+        (nextStatus === 'DISABLED' || (previousStatus === 'DISABLED' && nextStatus === 'SUSPENDED'))
+      ) {
+        throw ERRORS.InvalidParameter('versioning_status', {
+          message: `Cannot transition bucket versioning status from ${previousStatus} to ${nextStatus}`,
+        })
+      }
+
+      return db.updateBucketFields(bucketId, entries)
+    })
+  }
+
+  private async updateBucketFields(bucketId: string, entries: [string, unknown][]) {
     const result = await this.runQuery('UpdateBucket', async (db, signal) => {
       const values = entries.map(([, value]) => value)
       const setClause = entries
         .map(([column], index) => `${quoteIdentifier(column)} = $${index + 1}`)
         .join(', ')
+      const idParam = `$${entries.length + 1}`
 
-      return this.query(
+      return this.query<Pick<Bucket, 'public'>>(
         db,
         {
           text: `
+            WITH previous_bucket AS (
+              SELECT public FROM storage.buckets WHERE id = ${idParam}
+            )
             UPDATE storage.buckets
             SET ${setClause}
-            WHERE id = $${entries.length + 1}
+            WHERE id = ${idParam}
+            RETURNING (SELECT public FROM previous_bucket) AS public
           `,
           values: [...values, bucketId],
         },
@@ -813,56 +1325,139 @@ export class StoragePgDB implements Database {
     if (result.rowCount === 0) {
       throw ERRORS.NoSuchBucket(bucketId)
     }
+
+    return { previous: { public: result.rows[0].public } }
   }
 
-  async upsertObject(
-    data: Pick<Obj, 'name' | 'owner' | 'bucket_id' | 'metadata' | 'user_metadata' | 'version'>
-  ) {
-    const objectData = this.normalizeColumns({
-      name: data.name,
-      owner: isUuid(data.owner || '') ? data.owner : undefined,
-      owner_id: data.owner,
-      bucket_id: data.bucket_id,
-      metadata: data.metadata,
-      user_metadata: data.user_metadata,
-      version: data.version,
+  /**
+   * Reads the bucket's versioning_status and runs fn against a transaction
+   * that holds a shared lock on the bucket row for the duration. Concurrent
+   * object writes can share this lock, while a versioning-status update must
+   * wait until every write using the old status has completed.
+   */
+  private async withLockedVersioningStatus<T>(
+    bucketId: string,
+    fn: (db: StoragePgDB, versioningStatus: BucketVersioningStatus) => Promise<T>,
+    knownStatus?: BucketVersioningStatus
+  ): Promise<T> {
+    if (knownStatus !== undefined) {
+      // The caller read the status under the bucket's shared lock earlier in
+      // this transaction, so the row is already held until it ends.
+      return fn(this, knownStatus)
+    }
+
+    if (!(await this.hasMigration('object-versioning-core'))) {
+      return fn(this, 'DISABLED')
+    }
+
+    return this.withTransaction(async (db) => {
+      const statusDb = db.asSuperUser()
+      const bucket = await statusDb.findBucketById(bucketId, 'versioning_status', {
+        forShare: true,
+      })
+
+      return fn(db, bucket.versioning_status ?? 'DISABLED')
     })
-    const updateData = this.normalizeColumns({
-      metadata: data.metadata,
-      user_metadata: data.user_metadata,
-      version: data.version,
-      owner: isUuid(data.owner || '') ? data.owner : undefined,
-      owner_id: data.owner,
+  }
+
+  /**
+   * Writes the new current row for a key, using the strategy appropriate for
+   * the bucket's versioning status. Shared by real uploads (upsertObject) and
+   * "delete without a versionId" (which just writes a delete-marker as the
+   * new current row instead of physically deleting anything).
+   */
+  private async writeCurrentVersion(
+    operationName: string,
+    bucketId: string,
+    name: string,
+    versioningStatus: BucketVersioningStatus,
+    row: {
+      owner?: string
+      metadata?: Record<string, unknown> | null
+      user_metadata?: Record<string, unknown> | null
+      version: string
+      is_delete_marker: boolean
+    },
+    probe = false
+  ): Promise<WrittenObject> {
+    const hasVersioning = await this.hasMigration('object-versioning-core')
+    const objectData = this.normalizeRecordColumns({
+      name,
+      bucket_id: bucketId,
+      owner: isUuid(row.owner || '') ? row.owner : undefined,
+      owner_id: row.owner,
+      metadata: row.metadata,
+      user_metadata: row.user_metadata,
+      version: row.version,
+      ...(hasVersioning
+        ? {
+            is_delete_marker: row.is_delete_marker,
+            // A probe row is versioned so it can only conflict with the
+            // current-version arbiter, never with the null-version index.
+            is_versioned: probe || versioningStatus === 'ENABLED',
+          }
+        : {}),
     })
+    const insert = buildInsert(objectData)
+    const updateRecord = objectData as Record<string, unknown>
+    const updateClauses = Object.keys(updateRecord)
+      .filter(
+        (column) =>
+          updateRecord[column] !== undefined && column !== 'name' && column !== 'bucket_id'
+      )
+      .map((column) => `${quoteIdentifier(column)} = EXCLUDED.${quoteIdentifier(column)}`)
 
-    const result = await this.runQuery('UpsertObject', async (db, signal) => {
-      const insert = buildInsert(objectData)
-      const updateRecord = updateData as Record<string, unknown>
-      const updateClauses: string[] = []
+    // A probe's DO UPDATE must leave the versioning flags of the current row
+    // alone: flipping is_versioned on it would collide with the key's
+    // null-version row on idx_objects_null_version.
+    const probeUpdateClauses = updateClauses.filter(
+      (clause) => !clause.startsWith('"is_versioned"') && !clause.startsWith('"is_delete_marker"')
+    )
 
-      for (const column in updateRecord) {
-        if (!Object.prototype.hasOwnProperty.call(updateRecord, column)) {
-          continue
-        }
+    let conflictClause = ''
+    if (versioningStatus === 'SUSPENDED') {
+      conflictClause = `
+        ON CONFLICT (bucket_id, name COLLATE "C") WHERE NOT is_versioned
+        DO UPDATE SET ${[...updateClauses, 'archived_at = NULL'].join(', ')}
+      `
+    } else if (versioningStatus === 'DISABLED') {
+      const conflictTarget = (await this.hasMigration('objects-current-version-index'))
+        ? 'ON CONFLICT (bucket_id, name COLLATE "C") WHERE archived_at IS NULL'
+        : 'ON CONFLICT (name, bucket_id)'
+      conflictClause = `${conflictTarget} DO UPDATE SET ${(probe ? probeUpdateClauses : updateClauses).join(', ')}`
+    }
 
-        if (updateRecord[column] === undefined) {
-          continue
-        }
-
-        updateClauses.push(`${quoteIdentifier(column)} = EXCLUDED.${quoteIdentifier(column)}`)
+    const result = await this.runQuery(operationName, async (db, signal) => {
+      if (versioningStatus !== 'DISABLED') {
+        // archived_at orders a key's versions (listings, promotion), so it
+        // must follow the order in which writers held the key lock. now() is
+        // the transaction start, which precedes the lock and can be older
+        // than a write that already committed; clock_timestamp() is the
+        // moment this statement runs, after the lock was taken.
+        await this.query(
+          db,
+          {
+            text: `
+              UPDATE storage.objects SET archived_at = clock_timestamp()
+              WHERE bucket_id = $1
+                AND name COLLATE "C" = $2
+                AND archived_at IS NULL
+                ${versioningStatus === 'SUSPENDED' ? 'AND is_versioned' : ''}
+            `,
+            values: [bucketId, name],
+          },
+          signal
+        )
       }
 
-      const updateClause = updateClauses.join(', ')
-
-      return this.query<Obj>(
+      return this.query<ReplacedRowColumns>(
         db,
         {
           text: `
             INSERT INTO storage.objects (${insert.columns})
             VALUES (${insert.placeholders})
-            ON CONFLICT (name, bucket_id)
-            ${updateClause ? `DO UPDATE SET ${updateClause}` : 'DO NOTHING'}
-            RETURNING *
+            ${conflictClause}
+            RETURNING *, ${replacedRowColumns(hasVersioning)}
           `,
           values: insert.values,
         },
@@ -870,15 +1465,52 @@ export class StoragePgDB implements Database {
       )
     })
 
-    return result.rows[0]
+    return withReplacedRow(result.rows[0])
+  }
+
+  async upsertObject(
+    data: Pick<Obj, 'name' | 'owner' | 'bucket_id' | 'metadata' | 'user_metadata' | 'version'>,
+    options: UpsertObjectOptions = {}
+  ): Promise<WrittenObject> {
+    const bucketId = data.bucket_id as string
+    const row = {
+      owner: data.owner,
+      metadata: data.metadata,
+      user_metadata: data.user_metadata,
+      version: data.version as string,
+      is_delete_marker: false,
+    }
+
+    if (options.currentVersion) {
+      // The DISABLED shape is a single INSERT ... ON CONFLICT (current row) DO
+      // UPDATE: it checks the INSERT and UPDATE policies for the key, needs no
+      // bucket status lock, archives nothing and resolves a race with a
+      // concurrent writer by waiting for its row instead of failing.
+      return this.writeCurrentVersion(
+        'UpsertObjectProbe',
+        bucketId,
+        data.name,
+        'DISABLED',
+        row,
+        true
+      )
+    }
+
+    return this.withLockedVersioningStatus(
+      bucketId,
+      (db, versioningStatus) =>
+        db.writeCurrentVersion('UpsertObject', bucketId, data.name, versioningStatus, row),
+      options.versioningStatus
+    )
   }
 
   async updateObject(
     bucketId: string,
     name: string,
-    data: Pick<Obj, 'owner' | 'metadata' | 'version' | 'name' | 'bucket_id' | 'user_metadata'>
+    data: Pick<Obj, 'owner' | 'metadata' | 'version' | 'name' | 'bucket_id' | 'user_metadata'>,
+    currentVersion?: string
   ) {
-    const objectData = this.normalizeColumns({
+    const objectData = this.normalizeRecordColumns({
       name: data.name,
       bucket_id: data.bucket_id,
       owner: isUuid(data.owner || '') ? data.owner : undefined,
@@ -888,19 +1520,31 @@ export class StoragePgDB implements Database {
       version: data.version,
     })
 
+    const update = buildUpdate(objectData)
+    const conditions = [
+      `bucket_id = $${update.values.length + 1}`,
+      `name COLLATE "C" = $${update.values.length + 2}`,
+    ]
+    const values = [...update.values, bucketId, name]
+
+    if (currentVersion !== undefined) {
+      values.push(currentVersion)
+      conditions.push(`version = $${values.length}`)
+    } else if (await this.hasMigration('object-versioning-core')) {
+      conditions.push('archived_at IS NULL')
+    }
+
     const result = await this.runQuery('UpdateObject', async (db, signal) => {
-      const update = buildUpdate(objectData)
       return this.query<Obj>(
         db,
         {
           text: `
             UPDATE storage.objects
             SET ${update.setClause}
-            WHERE bucket_id = $${update.values.length + 1}
-              AND name = $${update.values.length + 2}
+            WHERE ${conditions.join(' AND ')}
             RETURNING *
           `,
-          values: [...update.values, bucketId, name],
+          values,
         },
         signal
       )
@@ -918,7 +1562,7 @@ export class StoragePgDB implements Database {
     data: Pick<Obj, 'name' | 'owner' | 'bucket_id' | 'metadata' | 'version' | 'user_metadata'>
   ) {
     try {
-      const object = this.normalizeColumns({
+      const object = this.normalizeRecordColumns({
         name: data.name,
         owner: isUuid(data.owner || '') ? data.owner : undefined,
         owner_id: data.owner,
@@ -952,17 +1596,49 @@ export class StoragePgDB implements Database {
     }
   }
 
-  async deleteObject(bucketId: string, objectName: string, version?: string) {
-    const result = await this.runQuery('Delete Object', async (db, signal) => {
-      const conditions = ['name = $1', 'bucket_id = $2']
-      const values: unknown[] = [objectName, bucketId]
+  async deleteObject(
+    bucketId: string,
+    objectName: string,
+    version?: string | null,
+    options: DeleteMarkerOptions & { skipPromotion?: boolean } & VersioningStatusHint = {}
+  ) {
+    if (version === undefined) {
+      const marker = await this.withLockedVersioningStatus(
+        bucketId,
+        async (db, versioningStatus) => {
+          if (versioningStatus === 'DISABLED') {
+            return undefined
+          }
+          return db.writeCurrentVersion('DeleteObject', bucketId, objectName, versioningStatus, {
+            owner: options.owner,
+            version: randomUUID(),
+            is_delete_marker: true,
+            metadata: null,
+            user_metadata: null,
+          })
+        },
+        options.versioningStatus
+      )
 
-      if (version) {
-        values.push(version)
-        conditions.push(`version = $${values.length}`)
+      if (marker !== undefined) {
+        return marker
       }
+    }
 
-      return this.query<Obj>(
+    const conditions = ['name COLLATE "C" = $1', 'bucket_id = $2']
+    const values: unknown[] = [objectName, bucketId]
+
+    if (version === null) {
+      conditions.push('version IS NULL')
+    } else if (version !== undefined) {
+      values.push(version)
+      conditions.push(`version = $${values.length}`)
+    } else if (await this.hasMigration('object-versioning-core')) {
+      conditions.push('archived_at IS NULL')
+    }
+
+    const result = await this.runQuery('Delete Object', async (db, signal) => {
+      const deleted = await this.query<Obj>(
         db,
         {
           text: `
@@ -974,14 +1650,147 @@ export class StoragePgDB implements Database {
         },
         signal
       )
+
+      const object = deleted.rows[0]
+      // Promotion locks its candidate row: a candidate hard-deleted by a
+      // concurrent transaction is skipped in favour of the next one instead of
+      // the UPDATE matching nothing and leaving the key without a current row.
+      if (
+        object?.archived_at === null &&
+        version !== undefined &&
+        !options.skipPromotion &&
+        (await this.hasMigration('object-versioning-core'))
+      ) {
+        await this.query(
+          db,
+          {
+            text: `
+              UPDATE storage.objects
+              SET archived_at = NULL
+              WHERE id = (
+                SELECT id
+                FROM storage.objects
+                WHERE bucket_id = $1 AND name COLLATE "C" = $2
+                ORDER BY archived_at DESC NULLS LAST, created_at DESC, version DESC
+                LIMIT 1
+                FOR UPDATE
+              )
+            `,
+            values: [bucketId, objectName],
+          },
+          signal
+        )
+      }
+
+      return deleted
     })
 
     return result.rows[0]
   }
 
-  async deleteObjects(bucketId: string, objectNames: string[], by: keyof Obj = 'name') {
+  /**
+   * Batched equivalent of writeCurrentVersion's delete-marker path - used by
+   * bulk deleteObjects (by: 'name') under ENABLED/SUSPENDED, never by the
+   * admin by: 'id' sweep, which always hard-deletes regardless of versioning
+   * status.
+   */
+  private async writeDeleteMarkers(
+    bucketId: string,
+    names: string[],
+    versioningStatus: 'ENABLED' | 'SUSPENDED',
+    owner?: string
+  ) {
+    const uniqueNames = [...new Set(names)]
+    const versions = uniqueNames.map(() => randomUUID())
+    const ownerUuid = isUuid(owner || '') ? owner : null
+
+    const result = await this.runQuery('DeleteObjectsWriteMarkers', async (db, signal) => {
+      // clock_timestamp(), not now(): see writeCurrentVersion.
+      await this.query(
+        db,
+        {
+          text: `
+            UPDATE storage.objects SET archived_at = clock_timestamp()
+            WHERE bucket_id = $1
+              AND name COLLATE "C" = ANY($2::text[])
+              AND archived_at IS NULL
+              ${versioningStatus === 'SUSPENDED' ? 'AND is_versioned' : ''}
+          `,
+          values: [bucketId, uniqueNames],
+        },
+        signal
+      )
+
+      return this.query<ReplacedRowColumns>(
+        db,
+        {
+          text: `
+            INSERT INTO storage.objects (bucket_id, name, version, is_delete_marker, is_versioned, owner, owner_id)
+            SELECT $1, t.name, t.version, true, $4, $5::uuid, $6::text
+            FROM unnest($2::text[], $3::text[]) AS t(name, version)
+            ${
+              versioningStatus === 'SUSPENDED'
+                ? `ON CONFLICT (bucket_id, name COLLATE "C") WHERE NOT is_versioned
+                   DO UPDATE SET
+                     version = EXCLUDED.version,
+                     is_delete_marker = true,
+                     metadata = NULL,
+                     user_metadata = NULL,
+                     owner = EXCLUDED.owner,
+                     owner_id = EXCLUDED.owner_id,
+                     archived_at = NULL`
+                : ''
+            }
+            RETURNING *, ${replacedRowColumns(true)}
+          `,
+          values: [
+            bucketId,
+            uniqueNames,
+            versions,
+            versioningStatus === 'ENABLED',
+            ownerUuid,
+            owner ?? null,
+          ],
+        },
+        signal
+      )
+    })
+
+    return result.rows.map(withReplacedRow)
+  }
+
+  async deleteObjects(
+    bucketId: string,
+    objectNames: string[],
+    by: keyof Obj = 'name',
+    options: DeleteMarkerOptions & { skipDeleteMarkers?: boolean } & VersioningStatusHint = {}
+  ) {
     if (objectNames.length === 0) {
       return []
+    }
+
+    if (by === 'name' && !options.skipDeleteMarkers) {
+      const markers = await this.withLockedVersioningStatus(
+        bucketId,
+        async (db, versioningStatus) => {
+          if (versioningStatus === 'DISABLED') {
+            return undefined
+          }
+          return db.writeDeleteMarkers(bucketId, objectNames, versioningStatus, options.owner)
+        },
+        options.versioningStatus
+      )
+
+      if (markers !== undefined) {
+        return markers
+      }
+    }
+
+    const targetColumn = by === 'name' ? 'name COLLATE "C"' : quoteIdentifier(String(by))
+    const conditions = ['bucket_id = $1', `${targetColumn} = ANY($2)`]
+
+    if (by === 'name' && (await this.hasMigration('object-versioning-core'))) {
+      conditions.push('archived_at IS NULL')
     }
 
     const result = await this.runQuery('DeleteObjects', async (db, signal) => {
@@ -990,8 +1799,7 @@ export class StoragePgDB implements Database {
         {
           text: `
             DELETE FROM storage.objects
-            WHERE bucket_id = $1
-              AND ${quoteIdentifier(String(by))} = ANY($2)
+            WHERE ${conditions.join(' AND ')}
             RETURNING *
           `,
           values: [bucketId, objectNames],
@@ -1003,54 +1811,81 @@ export class StoragePgDB implements Database {
     return result.rows
   }
 
-  async deleteObjectVersions(bucketId: string, objectNames: { name: string; version: string }[]) {
+  async deleteObjectVersions(
+    bucketId: string,
+    objectNames: { name: string; version: string }[],
+    options: { skipPromotion?: boolean } = {}
+  ) {
     if (objectNames.length === 0) {
       return []
     }
 
     const result = await this.runQuery('DeleteObjects', async (db, signal) => {
-      const { placeholders, values } = buildTupleValues(objectNames)
+      const names = objectNames.map((entry) => entry.name)
+      const versions = objectNames.map((entry) => entry.version)
 
-      return this.query<Obj>(
+      const deleted = await this.query<Obj>(
         db,
         {
           text: `
             DELETE FROM storage.objects
             WHERE bucket_id = $1
-              AND (name, version) IN (${placeholders})
+              AND (name COLLATE "C", version) IN (SELECT * FROM unnest($2::text[], $3::text[]))
             RETURNING *
           `,
-          values: [bucketId, ...values],
+          values: [bucketId, names, versions],
         },
         signal
       )
+
+      if (
+        !options.skipPromotion &&
+        deleted.rows.some((object) => object.archived_at === null) &&
+        (await this.hasMigration('object-versioning-core'))
+      ) {
+        const namesToPromote = [
+          ...new Set(
+            deleted.rows
+              .filter((object) => object.archived_at === null)
+              .map((object) => object.name)
+          ),
+        ]
+
+        await this.query(
+          db,
+          {
+            text: `
+              UPDATE storage.objects AS target
+              SET archived_at = NULL
+              FROM unnest($2::text[]) AS promoted(name)
+              CROSS JOIN LATERAL (
+                SELECT candidate.id
+                FROM storage.objects AS candidate
+                WHERE candidate.bucket_id = $1 AND candidate.name COLLATE "C" = promoted.name
+                ORDER BY candidate.archived_at DESC NULLS LAST, candidate.created_at DESC, candidate.version DESC
+                LIMIT 1
+                FOR UPDATE
+              ) AS next_version
+              WHERE target.id = next_version.id
+            `,
+            values: [bucketId, namesToPromote],
+          },
+          signal
+        )
+      }
+
+      return deleted
     })
 
     return result.rows
   }
 
-  async updateObjectMetadata(bucketId: string, objectName: string, metadata: ObjectMetadata) {
-    const result = await this.runQuery('UpdateObjectMetadata', async (db, signal) => {
-      return this.query<Obj>(
-        db,
-        {
-          text: `
-            UPDATE storage.objects
-            SET metadata = $1
-            WHERE bucket_id = $2
-              AND name = $3
-            RETURNING *
-          `,
-          values: [metadata, bucketId, objectName],
-        },
-        signal
-      )
-    })
-
-    return result.rows[0]
-  }
-
   async updateObjectOwner(bucketId: string, objectName: string, owner?: string) {
+    const conditions = ['bucket_id = $3', 'name COLLATE "C" = $4']
+    if (await this.hasMigration('object-versioning-core')) {
+      conditions.push('archived_at IS NULL')
+    }
+
     const result = await this.runQuery('UpdateObjectOwner', async (db, signal) => {
       return this.query<Obj>(
         db,
@@ -1061,8 +1896,7 @@ export class StoragePgDB implements Database {
               last_accessed_at = now(),
               owner = $1,
               owner_id = $2
-            WHERE bucket_id = $3
-              AND name = $4
+            WHERE ${conditions.join(' AND ')}
             RETURNING *
           `,
           values: [isUuid(owner || '') ? owner : null, owner, bucketId, objectName],
@@ -1083,21 +1917,42 @@ export class StoragePgDB implements Database {
     bucketId: string,
     objectName: string,
     columns = 'id',
-    filters?: FindObjectFilters
+    filters?: FindObjectFilters,
+    version?: string | null
   ) {
+    const selectedColumns = selectColumns(columns, await this.getObjectColumnPolicy())
+    const conditions = ['name COLLATE "C" = $1', 'bucket_id = $2']
+    const values: unknown[] = [objectName, bucketId]
+
+    const hasVersioning = await this.hasMigration('object-versioning-core')
+    if (version === null) {
+      conditions.push('version IS NULL')
+    } else if (version !== undefined) {
+      values.push(version)
+      conditions.push(`version = $${values.length}`)
+    } else if (hasVersioning && !filters?.includeNoncurrent) {
+      conditions.push('archived_at IS NULL')
+    }
+    if (hasVersioning && filters?.excludeDeleteMarkers) {
+      conditions.push('is_delete_marker = false')
+    }
+    if (hasVersioning && filters?.isVersioned !== undefined) {
+      values.push(filters.isVersioned)
+      conditions.push(`is_versioned = $${values.length}`)
+    }
+
     const result = await this.runQuery('FindObject', async (db, signal) => {
       return this.query<Obj>(
         db,
         {
           text: `
-            SELECT ${selectColumns(this.normalizeColumns(columns))}
+            SELECT ${selectedColumns}
             FROM storage.objects
-            WHERE name = $1
-              AND bucket_id = $2
+            WHERE ${conditions.join(' AND ')}
             LIMIT 1
             ${objectLockClause(filters)}
           `,
-          values: [objectName, bucketId],
+          values,
         },
         signal
       )
@@ -1111,9 +1966,25 @@ export class StoragePgDB implements Database {
     return object
   }
 
-  async findObjects(bucketId: string, objectNames: string[], columns = 'id') {
+  async findObjects(
+    bucketId: string,
+    objectNames: string[],
+    columns = 'id',
+    filters: FindObjectFilters = {}
+  ) {
     if (objectNames.length === 0) {
       return []
+    }
+
+    const selectedColumns = selectColumns(columns, await this.getObjectColumnPolicy())
+    const conditions = ['bucket_id = $1', 'name COLLATE "C" = ANY($2::text[])']
+    const shouldLock = filters.forUpdate || filters.forShare || filters.forKeyShare
+
+    if (await this.hasMigration('object-versioning-core')) {
+      conditions.push('archived_at IS NULL')
+      if (filters.excludeDeleteMarkers) {
+        conditions.push('is_delete_marker = false')
+      }
     }
 
     const result = await this.runQuery('FindObjects', async (db, signal) => {
@@ -1121,10 +1992,11 @@ export class StoragePgDB implements Database {
         db,
         {
           text: `
-            SELECT ${selectColumns(this.normalizeColumns(columns))}
+            SELECT ${selectedColumns}
             FROM storage.objects
-            WHERE bucket_id = $1
-              AND name = ANY($2::text[])
+            WHERE ${conditions.join(' AND ')}
+            ${shouldLock ? 'ORDER BY name COLLATE "C"' : ''}
+            ${objectLockClause(filters)}
           `,
           values: [bucketId, objectNames],
         },
@@ -1135,22 +2007,121 @@ export class StoragePgDB implements Database {
     return result.rows
   }
 
-  async findObjectVersions(bucketId: string, obj: { name: string; version: string }[]) {
+  /**
+   * Finds the current row for each name and the exact row for each
+   * (name, version) pair in one statement. Rows are ordered by (name, version)
+   * so a locking read acquires its row locks in one deterministic order across
+   * both target forms.
+   */
+  async findObjectTargets(
+    bucketId: string,
+    targets: ObjectTargets,
+    columns = 'id',
+    filters: FindObjectFilters = {}
+  ) {
+    const names = [...new Set(targets.names)]
+    const versionKeys = new Set<string>()
+    const versions = targets.versions.filter((target) => {
+      const key = `${target.name}\0${target.version}`
+      if (versionKeys.has(key)) {
+        return false
+      }
+      versionKeys.add(key)
+      return true
+    })
+
+    if (names.length === 0 && versions.length === 0) {
+      return []
+    }
+
+    const selectedColumns = selectColumns(columns, await this.getObjectColumnPolicy())
+    const hasVersioning = await this.hasMigration('object-versioning-core')
+    const shouldLock = filters.forUpdate || filters.forShare || filters.forKeyShare
+    const values: unknown[] = [bucketId]
+    const targetPredicates: string[] = []
+
+    if (names.length > 0) {
+      values.push(names)
+      targetPredicates.push(
+        `(name COLLATE "C" = ANY($${values.length}::text[])${
+          hasVersioning ? ' AND archived_at IS NULL' : ''
+        })`
+      )
+    }
+    if (versions.length > 0) {
+      values.push(
+        versions.map((target) => target.name),
+        versions.map((target) => target.version)
+      )
+      targetPredicates.push(
+        `(name COLLATE "C", version) IN (SELECT * FROM unnest($${values.length - 1}::text[], $${values.length}::text[]))`
+      )
+    }
+
+    // Postgres cannot BitmapOr an OR whose arm contains a subquery join, so a
+    // batch mixing both target forms degrades to walking every row of the
+    // bucket (measured: 301k buffers vs 74 on a 300k-row bucket). Resolving
+    // each form in its own subquery keeps each on its intended index
+    // (idx_objects_current_version / objects_bucket_id_name_version_key) and
+    // locks the union by id; single-form batches have no OR and stay as-is.
+    const targetCondition =
+      targetPredicates.length > 1
+        ? `id IN (${targetPredicates
+            .map(
+              (predicate) => `SELECT id FROM storage.objects WHERE bucket_id = $1 AND ${predicate}`
+            )
+            .join(' UNION ALL ')})`
+        : targetPredicates[0]
+    const conditions = ['bucket_id = $1', targetCondition]
+    if (hasVersioning && filters.excludeDeleteMarkers) {
+      conditions.push('is_delete_marker = false')
+    }
+
+    const result = await this.runQuery('FindObjectTargets', async (db, signal) => {
+      return this.query<Obj>(
+        db,
+        {
+          text: `
+            SELECT ${selectedColumns}
+            FROM storage.objects
+            WHERE ${conditions.join(' AND ')}
+            ${shouldLock ? 'ORDER BY name COLLATE "C", version' : ''}
+            ${objectLockClause(filters)}
+          `,
+          values,
+        },
+        signal
+      )
+    })
+
+    return result.rows
+  }
+
+  async findObjectVersions(
+    bucketId: string,
+    obj: { name: string; version: string }[],
+    columns = 'name, version',
+    filters: FindObjectFilters = {}
+  ) {
     if (obj.length === 0) {
       return []
     }
 
+    const selectedColumns = selectColumns(columns, await this.getObjectColumnPolicy())
+    const shouldLock = filters.forUpdate || filters.forShare || filters.forKeyShare
     const result = await this.runQuery('FindObjectVersions', async (db, signal) => {
       const { placeholders, values } = buildTupleValues(obj)
 
-      return this.query<Pick<Obj, 'name' | 'version'>>(
+      return this.query<Obj>(
         db,
         {
           text: `
-            SELECT name, version
+            SELECT ${selectedColumns}
             FROM storage.objects
             WHERE bucket_id = $1
-              AND (name, version) IN (${placeholders})
+              AND (name COLLATE "C", version) IN (${placeholders})
+            ${shouldLock ? 'ORDER BY name COLLATE "C", version' : ''}
+            ${objectLockClause(filters)}
           `,
           values: [bucketId, ...values],
         },
@@ -1163,7 +2134,7 @@ export class StoragePgDB implements Database {
 
   async mustLockObject(bucketId: string, objectName: string, version?: string) {
     return this.runQuery('MustLockObject', async (db, signal) => {
-      const hash = hashStringToInt(`${bucketId}/${objectName}${version ? `/${version}` : ''}`)
+      const hash = objectLockHash(bucketId, objectName, version)
       const result = await this.query<{ pg_try_advisory_xact_lock: boolean }>(
         db,
         {
@@ -1189,12 +2160,17 @@ export class StoragePgDB implements Database {
     opts?: { timeout: number }
   ) {
     return this.runQuery('WaitObjectLock', async (db, signal) => {
-      const hash = hashStringToInt(`${bucketId}/${objectName}${version ? `/${version}` : ''}`)
+      const hash = objectLockHash(bucketId, objectName, version)
       const lockTimeout = opts?.timeout
 
       if (lockTimeout && lockTimeout > 0) {
         if (this.isMultigresDatabase()) {
-          await this.waitObjectLockWithTopLevelLockTimeout(db, hash, lockTimeout, signal)
+          await this.waitObjectLockWithTopLevelLockTimeout(
+            db,
+            { text: 'SELECT pg_advisory_xact_lock($1)', values: [hash] },
+            lockTimeout,
+            signal
+          )
           return true
         }
 
@@ -1267,13 +2243,107 @@ export class StoragePgDB implements Database {
     })
   }
 
+  /**
+   * Acquires the advisory locks for every key in one statement. Keys are
+   * deduplicated and locked in ascending hash order, so any two callers that
+   * lock overlapping sets through this method cannot deadlock each other.
+   * lock_timeout applies to each lock wait individually.
+   */
+  async waitObjectLocks(keys: ObjectLockKey[], opts?: { timeout?: number }) {
+    const hashes = [
+      ...new Set(keys.map((key) => objectLockHash(key.bucketId, key.objectName, key.version))),
+    ].sort((left, right) => left - right)
+
+    if (hashes.length === 0) {
+      return true
+    }
+
+    return this.runQuery('WaitObjectLocks', async (db, signal) => {
+      const lockTimeout = opts?.timeout
+      const lockStatement = {
+        text: 'SELECT pg_advisory_xact_lock(t.key) FROM unnest($1::bigint[]) AS t(key)',
+        values: [hashes],
+      }
+
+      if (lockTimeout && lockTimeout > 0) {
+        if (this.isMultigresDatabase()) {
+          await this.waitObjectLockWithTopLevelLockTimeout(db, lockStatement, lockTimeout, signal)
+          return true
+        }
+
+        // Same shape as waitObjectLock's CTE. unnest yields keys in array order,
+        // and the aggregate forces every lock to be acquired before the
+        // lock_timeout is restored.
+        const query = `
+          WITH previous_lock_timeout AS MATERIALIZED (
+            SELECT current_setting('lock_timeout') AS value
+          ),
+          set_lock_timeout AS MATERIALIZED (
+            SELECT set_config('lock_timeout', $2, true) AS applied_timeout
+            FROM previous_lock_timeout
+          ),
+          acquire_locks AS MATERIALIZED (
+            SELECT pg_advisory_xact_lock(t.key) AS locked
+            FROM set_lock_timeout, unnest($1::bigint[]) AS t(key)
+          ),
+          locked_keys AS MATERIALIZED (
+            SELECT count(*) AS locked_count
+            FROM acquire_locks
+          ),
+          restore_lock_timeout AS MATERIALIZED (
+            SELECT
+              set_config('lock_timeout', (SELECT value FROM previous_lock_timeout), true) AS restored_timeout,
+              locked_count
+            FROM locked_keys
+          )
+          SELECT locked_count
+          FROM restore_lock_timeout
+        `
+
+        let lockedCount: number
+        try {
+          const result = await db.query<{ locked_count: string | number }>(
+            {
+              text: query,
+              values: [hashes, `${lockTimeout}ms`],
+            },
+            { signal }
+          )
+          lockedCount = Number(result.rows[0]?.locked_count ?? 0)
+        } catch (e) {
+          if (isPgLockTimeoutError(e)) {
+            throw ERRORS.LockTimeout(e)
+          }
+
+          throw mapPgError(e, 'WaitObjectLocks CTE')
+        }
+
+        assertLockedCount(lockedCount, hashes.length)
+        return true
+      }
+
+      try {
+        const result = await db.query(lockStatement, { signal })
+        assertLockedCount(result.rowCount ?? 0, hashes.length)
+      } catch (e) {
+        if (isPgLockTimeoutError(e)) {
+          throw ERRORS.LockTimeout(e)
+        }
+
+        throw mapPgError(e, lockStatement.text)
+      }
+
+      return true
+    })
+  }
+
   private isMultigresDatabase(): boolean {
     return (this.options.databaseEngine ?? databaseEngine) === 'multigres'
   }
 
   private async waitObjectLockWithTopLevelLockTimeout(
-    db: PgExecutor,
-    hash: number,
+    db: DatabaseExecutor,
+    lockStatement: DatabaseStatement,
     lockTimeout: number,
     signal?: AbortSignal
   ): Promise<void> {
@@ -1302,13 +2372,7 @@ export class StoragePgDB implements Database {
     }
 
     try {
-      await db.query(
-        {
-          text: 'SELECT pg_advisory_xact_lock($1)',
-          values: [hash],
-        },
-        { signal }
-      )
+      await db.query(lockStatement, { signal })
     } catch (e) {
       if (isPgLockTimeoutError(e)) {
         throw ERRORS.LockTimeout(e)
@@ -1331,6 +2395,64 @@ export class StoragePgDB implements Database {
   }
 
   async searchObjects(bucketId: string, prefix: string, options: SearchObjectOption) {
+    // An un-migrated tenant's deployed storage.search doesn't have the
+    // noncurrent_versions/delete_markers parameters at all.
+    const hasVersioningStatus = await this.hasMigration('list-objects-with-versions')
+    const noncurrentVersions = hasVersioningStatus
+      ? (options.noncurrentVersions ?? 'exclude')
+      : 'exclude'
+    const deleteMarkers = hasVersioningStatus ? (options.deleteMarkers ?? 'exclude') : 'exclude'
+
+    // A single exact key has nothing to fold into folders and no need for
+    // storage.search's LIKE/level-based prefix matching - bypass it entirely
+    // with a direct query, same approach as listObjectsV2's exactMatch path.
+    if (options.exactMatch) {
+      return this.runQuery('SearchObjectsExactMatch', async (db, signal) => {
+        const conditions = ['bucket_id = $1', 'name COLLATE "C" = $2']
+        const values: unknown[] = [bucketId, prefix]
+
+        if (hasVersioningStatus) {
+          conditions.push(...buildVersioningConditions(noncurrentVersions, deleteMarkers))
+        }
+
+        if (options.search) {
+          values.push(`%${escapeLike(options.search)}%`)
+          conditions.push(`name ILIKE $${values.length}`)
+        }
+
+        const sortColumn = quoteIdentifier(options.sortBy?.column ?? 'name')
+        const sortOrder = normalizeSortOrder(options.sortBy?.order)
+
+        values.push(Math.min(options.limit || 100, SEARCH_OBJECTS_MAX_LIMIT))
+        const limitPlaceholder = values.length
+        values.push(options.offset || 0)
+        const offsetPlaceholder = values.length
+
+        const versionTiebreak = hasVersioningStatus
+          ? `, archived_at DESC, COALESCE(version, '') ASC`
+          : ''
+
+        const result = await this.query<ObjectListEntry>(
+          db,
+          {
+            text: `
+              SELECT id, name, metadata, updated_at, created_at, last_accessed_at
+                ${hasVersioningStatus ? ', version, archived_at, is_delete_marker, is_versioned' : ''}
+              FROM storage.objects
+              WHERE ${conditions.join(' AND ')}
+              ORDER BY ${sortColumn} ${sortOrder}${versionTiebreak}
+              LIMIT $${limitPlaceholder}
+              OFFSET $${offsetPlaceholder}
+            `,
+            values,
+          },
+          signal
+        )
+
+        return result.rows
+      })
+    }
+
     return this.runQuery('SearchObjects', async (db, signal) => {
       const sortColumn = options.sortBy?.column ?? 'name'
       const shouldEscapePattern = sortColumn !== 'name'
@@ -1339,20 +2461,29 @@ export class StoragePgDB implements Database {
         ? escapeLike(options.search || '')
         : options.search || ''
 
-      const result = await this.query<Obj>(
+      const values: unknown[] = [
+        safePrefix,
+        bucketId,
+        options.limit || 100,
+        (safePrefix + safeSearch).split('/').length,
+        options.offset || 0,
+        safeSearch,
+        sortColumn,
+        options.sortBy?.order ?? 'asc',
+      ]
+      const paramPlaceholders = ['$1', '$2', '$3', '$4', '$5', '$6', '$7', '$8']
+      const columns = ['name', 'id', 'updated_at', 'created_at', 'last_accessed_at', 'metadata']
+      if (hasVersioningStatus) {
+        values.push(noncurrentVersions, deleteMarkers)
+        paramPlaceholders.push('$9', '$10')
+        columns.push('version', 'archived_at', 'is_delete_marker', 'is_versioned')
+      }
+
+      const result = await this.query<ObjectListEntry>(
         db,
         {
-          text: 'select * from storage.search($1,$2,$3,$4,$5,$6,$7,$8)',
-          values: [
-            safePrefix,
-            bucketId,
-            options.limit || 100,
-            safePrefix.split('/').length,
-            options.offset || 0,
-            safeSearch,
-            sortColumn,
-            options.sortBy?.order ?? 'asc',
-          ],
+          text: `select ${columns.join(',')} from storage.search(${paramPlaceholders.join(',')})`,
+          values,
         },
         signal
       )
@@ -1386,7 +2517,7 @@ export class StoragePgDB implements Database {
         data.metadata = metadata
       }
 
-      const insert = buildInsert(this.normalizeColumns(data))
+      const insert = buildInsert(this.normalizeRecordColumns(data))
       const result = await this.query<S3MultipartUpload>(
         db,
         {
@@ -1405,14 +2536,14 @@ export class StoragePgDB implements Database {
   }
 
   async findMultipartUpload(uploadId: string, columns = 'id', options?: { forUpdate?: boolean }) {
-    const result = await this.runQuery('FindMultipartUpload', async (db, signal) => {
-      const normalizedColumns = this.normalizeMultipartUploadColumns(columns)
+    const selectedColumns = selectColumns(columns, this.multipartColumnPolicy)
 
+    const result = await this.runQuery('FindMultipartUpload', async (db, signal) => {
       return this.query<S3MultipartUpload>(
         db,
         {
           text: `
-            SELECT ${selectColumns(normalizedColumns)}
+            SELECT ${selectedColumns}
             FROM storage.s3_multipart_uploads
             WHERE id = $1
             LIMIT 1
@@ -1502,14 +2633,16 @@ export class StoragePgDB implements Database {
 
       values.push(options.maxParts)
 
+      // Uploading a part number again replaces the earlier part, so only the
+      // latest row for each part number is listed.
       return this.query<S3PartUpload>(
         db,
         {
           text: `
-            SELECT etag, part_number, size, upload_id, created_at
+            SELECT DISTINCT ON (part_number) etag, part_number, size, upload_id, created_at
             FROM storage.s3_multipart_uploads_parts
             WHERE ${conditions.join(' AND ')}
-            ORDER BY part_number
+            ORDER BY part_number, created_at DESC
             LIMIT $${values.length}
           `,
           values,
@@ -1527,7 +2660,7 @@ export class StoragePgDB implements Database {
       await this.query(
         db,
         `
-          CREATE UNLOGGED TABLE IF NOT EXISTS ${quoteQualifiedIdentifier(tableName)} (
+          CREATE UNLOGGED TABLE IF NOT EXISTS ${quoteS3KeysScratchTable(tableName)} (
             key TEXT COLLATE "C" PRIMARY KEY,
             size BIGINT NOT NULL
           )
@@ -1537,7 +2670,10 @@ export class StoragePgDB implements Database {
     })
   }
 
-  private async dropStaleS3KeysScratchTables(db: PgExecutor, signal?: AbortSignal): Promise<void> {
+  private async dropStaleS3KeysScratchTables(
+    db: DatabaseExecutor,
+    signal?: AbortSignal
+  ): Promise<void> {
     const staleBefore = Date.now() - S3_KEYS_SCRATCH_TABLE_MAX_AGE_MS
     const result = await this.query<{ table_name: string }>(
       db,
@@ -1570,7 +2706,7 @@ export class StoragePgDB implements Database {
 
   async dropS3KeysTempTable(tableName: string): Promise<void> {
     await this.runUnscopedQuery('DropS3KeysTempTable', async (db, signal) => {
-      await this.query(db, `DROP TABLE IF EXISTS ${quoteQualifiedIdentifier(tableName)}`, signal)
+      await this.query(db, `DROP TABLE IF EXISTS ${quoteS3KeysScratchTable(tableName)}`, signal)
     })
   }
 
@@ -1595,7 +2731,7 @@ export class StoragePgDB implements Database {
         {
           text: `
             SELECT key, size
-            FROM ${quoteQualifiedIdentifier(tableName)}
+            FROM ${quoteS3KeysScratchTable(tableName)}
             ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
             ORDER BY key ASC
             LIMIT $${values.length}
@@ -1623,7 +2759,7 @@ export class StoragePgDB implements Database {
         {
           text: `
             SELECT key
-            FROM ${quoteQualifiedIdentifier(tableName)}
+            FROM ${quoteS3KeysScratchTable(tableName)}
             WHERE key = ANY($1::text[])
           `,
           values: [keys],
@@ -1654,7 +2790,7 @@ export class StoragePgDB implements Database {
         db,
         {
           text: `
-            INSERT INTO ${quoteQualifiedIdentifier(tableName)} (key, size)
+            INSERT INTO ${quoteS3KeysScratchTable(tableName)} (key, size)
             VALUES ${placeholders.join(', ')}
             ON CONFLICT DO NOTHING
           `,
@@ -1666,112 +2802,60 @@ export class StoragePgDB implements Database {
   }
 
   async healthcheck() {
-    await this.runQuery('Healthcheck', (db, signal) => {
-      return this.query(db, 'SELECT id from storage.buckets limit 1', signal)
-    })
+    if (databaseHealthcheckUnscoped) {
+      await this.runUnscopedQuery('Healthcheck', healthcheckProbe, HEALTHCHECK_QUERY_OPTIONS)
+    } else {
+      await this.runQuery('Healthcheck', healthcheckProbe)
+    }
   }
 
-  destroyConnection() {
-    return this.connection.dispose()
+  destroyConnection(): void {
+    this.connection.dispose()
   }
 
   /**
    * Excludes columns selection if a specific migration wasn't run.
    */
-  protected normalizeColumns<T extends string | Record<string, unknown>>(columns: T): T {
-    const latestMigration = this.latestMigration
-
-    if (!latestMigration) {
+  protected normalizeRecordColumns<T extends Record<string, unknown>>(columns: T): T {
+    if (this.supportsCustomMetadataColumns) {
       return columns
     }
 
-    const rules = [{ migration: 'custom-metadata', newColumns: ['user_metadata'] }]
-
-    for (const rule of rules) {
-      if (DBMigration[latestMigration] >= DBMigration[rule.migration as keyof typeof DBMigration]) {
+    const normalizedColumns: Record<string, unknown> = {}
+    for (const column in columns) {
+      if (column === 'user_metadata' || !Object.hasOwn(columns, column)) {
         continue
       }
 
-      if (typeof columns === 'string') {
-        const normalizedColumns: string[] = []
-        for (const column of columns.split(',')) {
-          const trimmed = column.trim()
-          if (rule.newColumns.includes(trimmed)) {
-            continue
-          }
-
-          normalizedColumns.push(trimmed)
-        }
-
-        return normalizedColumns.join(',') as T
-      }
-
-      const normalizedColumns: Record<string, unknown> = {}
-      const sourceColumns = columns as Record<string, unknown>
-
-      for (const column in sourceColumns) {
-        if (!Object.prototype.hasOwnProperty.call(sourceColumns, column)) {
-          continue
-        }
-
-        if (rule.newColumns.includes(column)) {
-          continue
-        }
-
-        normalizedColumns[column] = sourceColumns[column]
-      }
-
-      return normalizedColumns as T
+      normalizedColumns[column] = columns[column]
     }
 
-    return columns
-  }
-
-  protected normalizeMultipartUploadColumns(columns: string): string[] {
-    const normalizedColumns: string[] = []
-    const hasMetadataColumn = this.hasMultipartMetadataColumn()
-
-    for (const column of this.normalizeColumns(columns).split(',')) {
-      const trimmed = column.trim()
-      if (!trimmed || (!hasMetadataColumn && trimmed === 'metadata')) {
-        continue
-      }
-
-      normalizedColumns.push(trimmed)
-    }
-
-    return normalizedColumns
+    return normalizedColumns as T
   }
 
   protected hasMultipartMetadataColumn(): boolean {
-    return (
-      !this.latestMigration ||
-      DBMigration[this.latestMigration] >= DBMigration['s3-multipart-uploads-metadata']
-    )
+    return this.supportsMultipartMetadataColumn
   }
 
   protected async runQuery<T>(
     queryName: string,
-    fn: (db: PgExecutor, signal?: AbortSignal) => Promise<T>
+    fn: (db: DatabaseExecutor, signal?: AbortSignal) => Promise<T>
   ): Promise<T> {
-    const startTime = process.hrtime.bigint()
+    const startTime = performance.now()
     const abortSignal = this.connection.getAbortSignal()
     const recordDuration = this.createDurationRecorder(queryName, startTime, abortSignal)
 
     let tnx = this.options.tnx
-    let differentScopes = false
-    let needsNewTransaction = !tnx
+    const needsNewTransaction = !tnx
+    const restoreParentTransactionScope = needsNewTransaction && this.hasDifferentScopeThanParent()
+    // A transaction opened here is private to this query, so its scope holder is too.
+    const scope: TransactionScope = needsNewTransaction ? {} : (this.options.scope ?? {})
+    let scopeAtEntry: TenantConnection | undefined
+    let scopeToRestore: TenantConnection | undefined
     let savepoint: string | undefined
     let savepointEstablished = false
 
     try {
-      differentScopes = Boolean(
-        this.options.parentConnection?.role &&
-          this.connection.role !== this.options.parentConnection?.role
-      )
-      needsNewTransaction = !tnx
-      const usingSavepoint = !needsNewTransaction && differentScopes
-
       if (needsNewTransaction) {
         tnx = await this.connection.transaction()
       }
@@ -1780,15 +2864,17 @@ export class StoragePgDB implements Database {
         throw ERRORS.InternalError(undefined, 'Could not create transaction')
       }
 
-      savepoint = usingSavepoint ? nextSavepointName() : undefined
-
-      if (savepoint) {
+      if (needsNewTransaction) {
+        await this.applyScope(tnx, scope)
+      } else if (this.scopeSwitchNeeded(this.options.scope)) {
+        // A single statement issued under another role than the transaction is
+        // scoped to: switch inside a savepoint and restore before releasing it.
+        scopeAtEntry = scope.applied
+        scopeToRestore = scopeAtEntry ?? this.options.parentConnection
+        savepoint = nextSavepointName()
         await createSavepoint(tnx, savepoint)
         savepointEstablished = true
-      }
-
-      if (needsNewTransaction || differentScopes) {
-        await this.connection.setScope(tnx)
+        await this.applyScope(tnx, scope)
       }
 
       const result = await fn(tnx, abortSignal)
@@ -1798,7 +2884,9 @@ export class StoragePgDB implements Database {
       } else if (savepoint) {
         // Keep scope restoration inside the savepoint. If it fails, rolling back
         // the nested unit is preferable to leaking elevated scope into the parent transaction.
-        await this.options.parentConnection?.setScope(tnx)
+        if (scopeToRestore) {
+          await this.applyScope(tnx, scope, scopeToRestore)
+        }
         await tnx.query(`RELEASE SAVEPOINT ${savepoint}`)
       }
 
@@ -1807,7 +2895,10 @@ export class StoragePgDB implements Database {
       if (savepointEstablished && savepoint && tnx && !tnx.isCompleted()) {
         try {
           await rollbackSavepoint(tnx, savepoint)
+          // Rolling back to the savepoint also reverts transaction-local settings.
+          scope.applied = scopeAtEntry
         } catch (rollbackError) {
+          scope.applied = undefined
           logSchema.warning(logger, '[StoragePgDB] Failed to rollback savepoint', {
             type: 'db',
             tenantId: this.tenantId,
@@ -1842,7 +2933,7 @@ export class StoragePgDB implements Database {
       throw mapPgErrorWithQueryName(e, queryName)
     } finally {
       try {
-        if (!savepoint && differentScopes) {
+        if (restoreParentTransactionScope) {
           await this.restoreParentScopeSafely(queryName)
         }
       } finally {
@@ -1861,6 +2952,9 @@ export class StoragePgDB implements Database {
 
     try {
       await parentConnection.setScope(parentTnx)
+      if (this.options.scope) {
+        this.options.scope.applied = parentConnection
+      }
     } catch (error) {
       logSchema.error(logger, '[StoragePgDB] Failed to restore parent transaction scope', {
         type: 'db',
@@ -1883,42 +2977,103 @@ export class StoragePgDB implements Database {
 
   protected async runUnscopedQuery<T>(
     queryName: string,
-    fn: (db: PgExecutor, signal?: AbortSignal) => Promise<T>
+    fn: (db: DatabaseExecutor, signal?: AbortSignal) => Promise<T>,
+    options?: UnscopedQueryOptions
   ): Promise<T> {
-    const startTime = process.hrtime.bigint()
-    const abortSignal = this.connection.getAbortSignal()
-    const recordDuration = this.createDurationRecorder(queryName, startTime, abortSignal)
+    const startTime = performance.now()
+    const requestAbortSignal = this.connection.getAbortSignal()
+    const recordDuration = this.createDurationRecorder(queryName, startTime, requestAbortSignal)
+    const timeoutMs = normalizeTimeoutMs(options?.timeoutMs)
+
+    let controller: AbortController | undefined
+    let timer: NodeJS.Timeout | undefined
+    let onRequestAbort: (() => void) | undefined
+
+    if (timeoutMs !== undefined) {
+      controller = new AbortController()
+      timer = setTimeout(abortFromTimer, timeoutMs, controller)
+      timer.unref()
+
+      if (requestAbortSignal?.aborted) {
+        controller.abort()
+      } else if (requestAbortSignal) {
+        const timedController = controller
+        onRequestAbort = () => timedController.abort()
+        requestAbortSignal.addEventListener('abort', onRequestAbort, { once: true })
+      }
+    }
 
     try {
-      return await fn(this.connection.pool.acquire(), abortSignal)
+      return await fn(this.connection, controller?.signal ?? requestAbortSignal)
     } catch (e) {
       throw mapPgErrorWithQueryName(e, queryName)
     } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer)
+      }
+      if (onRequestAbort) {
+        requestAbortSignal?.removeEventListener('abort', onRequestAbort)
+      }
       recordDuration()
     }
   }
 
-  protected async query<T extends QueryResultRow = QueryResultRow>(
-    db: PgExecutor,
-    statement: string | PgStatement,
+  protected query<T extends QueryResultRow = QueryResultRow>(
+    db: DatabaseExecutor,
+    statement: string | DatabaseStatement,
     signal?: AbortSignal
   ) {
-    try {
-      return await db.query<T>(statement, { signal })
-    } catch (e) {
-      throw mapPgError(e, typeof statement === 'string' ? statement : statement.text)
+    return executeQuery<T>(db, statement, signal)
+  }
+
+  private async mutateLifecycleConfiguration(options: {
+    bucketId: string
+    queryName: string
+    unchanged: (locked: LifecycleBucket) => boolean
+    write: (unchanged?: LifecycleBucket) => DatabaseStatement
+  }): Promise<LifecycleBucket> {
+    if (!this.options.tnx) {
+      return this.withTransaction((database) => database.mutateLifecycleConfiguration(options))
     }
+
+    const { bucketId } = options
+    await assertLifecycleSchemaReady(this, bucketId)
+
+    const visible = await this.findBucketById(bucketId, 'id,type')
+    assertStandardLifecycleBucket(visible)
+
+    const serviceDatabase = this.asSuperUser()
+    const locked = (await serviceDatabase.findBucketById(bucketId, LIFECYCLE_BUCKET_COLUMNS, {
+      forUpdate: true,
+    })) as LifecycleBucket
+    const unchanged = options.unchanged(locked)
+    // Equivalent PUTs, including reorders, retain the stored order and generation. Probe the exact
+    // row we would persist, including the same generated UUID for changed PUTs.
+    const statement = options.write(unchanged ? locked : undefined)
+    await this.testLifecycleWritePermission(statement)
+
+    if (unchanged) {
+      return locked
+    }
+
+    const result = await serviceDatabase.runQuery(options.queryName, async (db, signal) =>
+      serviceDatabase.query<LifecycleBucket>(db, statement, signal)
+    )
+
+    const bucket = result.rows[0]
+    if (!bucket) throw ERRORS.NoSuchBucket(bucketId)
+    return bucket
   }
 
   private createDurationRecorder(
     queryName: string,
-    startTime: bigint,
+    startTime: number,
     abortSignal?: AbortSignal
   ): () => void {
     const requestAbortedBeforeStart = Boolean(abortSignal?.aborted)
 
     return () => {
-      const duration = Number(process.hrtime.bigint() - startTime) / 1e9
+      const duration = (performance.now() - startTime) / 1000
       // This intentionally reads the signal after the query work settles. The
       // attributes describe request abort observation, not proof that PostgreSQL
       // cancelled this specific statement.
@@ -1932,39 +3087,45 @@ export class StoragePgDB implements Database {
       })
     }
   }
-}
 
-function selectColumns(columns: string | string[]): string {
-  const selected: string[] = []
-
-  if (Array.isArray(columns)) {
-    for (const column of columns) {
-      if (column.length === 0) {
-        continue
-      }
-
-      if (column === '*') {
-        selected.push('*')
-      } else {
-        selected.push(quoteIdentifier(column))
-      }
-    }
-  } else {
-    for (const column of columns.split(',')) {
-      const trimmed = column.trim()
-      if (trimmed.length === 0) {
-        continue
-      }
-
-      if (trimmed === '*') {
-        selected.push('*')
-      } else {
-        selected.push(quoteIdentifier(trimmed))
+  private async testLifecycleWritePermission(statement: DatabaseStatement): Promise<void> {
+    try {
+      await this.testPermission(async (database) => {
+        await database.runQuery('TestLifecycleWritePermission', async (db, signal) => {
+          const result = await database.query(db, statement, signal)
+          if (result.rowCount !== 1)
+            throw ERRORS.AccessDenied('Bucket lifecycle update not permitted')
+        })
+      })
+    } catch (error) {
+      const cause = error instanceof StorageBackendError ? error.originalError : error
+      // This AFTER-trigger rejection proves caller RLS passed. testPermission
+      // has rolled back the probe; every other error must still deny the write.
+      if (
+        !(cause instanceof DatabaseError) ||
+        cause.code !== 'PST01' ||
+        cause.schema !== 'storage' ||
+        cause.table !== 'buckets' ||
+        cause.constraint !== 'protect_bucket_control_update_role'
+      ) {
+        throw error
       }
     }
   }
+}
 
-  return selected.length ? selected.join(', ') : quoteIdentifier('id')
+function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
+  if (timeoutMs === undefined || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return undefined
+  }
+
+  return timeoutMs
+}
+
+// Static setTimeout callback taking the controller as an argument
+// so arming the deadline allocates no closure.
+function abortFromTimer(controller: AbortController): void {
+  controller.abort()
 }
 
 function normalizeSortOrder(sortOrder?: string): 'ASC' | 'DESC' {
@@ -2056,6 +3217,62 @@ function buildTupleValues(values: { name: string; version: string }[]): {
   }
 }
 
+function assertStandardLifecycleBucket(bucket: Bucket | LifecycleBucket): void {
+  if (bucket.type !== 'STANDARD') {
+    throw ERRORS.LifecycleRequiresStandardBucket()
+  }
+}
+
+type ReplacedRowColumns = Obj & {
+  replaced_id: string | null
+  replaced_version: string | null
+  replaced_was_marker: boolean | null
+}
+
+/**
+ * RETURNING columns that describe the row an INSERT ... ON CONFLICT DO UPDATE
+ * replaced. A scalar subquery in RETURNING sees the statement's snapshot, so
+ * it reads the row as it was before the update and finds nothing for a fresh
+ * insert.
+ */
+function replacedRowColumns(hasVersioning: boolean): string {
+  const previous = (column: string) =>
+    `(SELECT o.${column} FROM storage.objects o WHERE o.id = storage.objects.id)`
+  return [
+    `${previous('id')} AS replaced_id`,
+    `${previous('version')} AS replaced_version`,
+    `${hasVersioning ? previous('is_delete_marker') : 'false'} AS replaced_was_marker`,
+  ].join(', ')
+}
+
+function withReplacedRow(row: ReplacedRowColumns): WrittenObject {
+  const { replaced_id, replaced_version, replaced_was_marker, ...object } = row
+  if (!replaced_id) {
+    return object
+  }
+  return {
+    ...object,
+    replaced: {
+      id: replaced_id,
+      version: replaced_version,
+      isDeleteMarker: replaced_was_marker === true,
+    },
+  }
+}
+
+function objectLockHash(bucketId: string, objectName: string, version?: string): number {
+  return hashStringToInt(`${bucketId}/${objectName}${version ? `/${version}` : ''}`)
+}
+
+function assertLockedCount(locked: number, expected: number): void {
+  if (locked !== expected) {
+    throw ERRORS.InternalError(
+      undefined,
+      `Expected ${expected} advisory locks to be acquired, got ${locked}`
+    )
+  }
+}
+
 function lockClause(filters?: FindBucketFilters): string {
   if (filters?.forUpdate) {
     return 'FOR UPDATE'
@@ -2119,7 +3336,7 @@ function nextSavepointName(): string {
   return quoteIdentifier(`storage_pg_query_${randomUUID().replace(/-/g, '_')}`)
 }
 
-async function createSavepoint(tnx: PgTransaction, savepoint: string): Promise<void> {
+async function createSavepoint(tnx: DatabaseTransaction, savepoint: string): Promise<void> {
   const query = `SAVEPOINT ${savepoint}`
 
   try {
@@ -2129,7 +3346,7 @@ async function createSavepoint(tnx: PgTransaction, savepoint: string): Promise<v
   }
 }
 
-async function rollbackSavepoint(tnx: PgTransaction, savepoint: string): Promise<void> {
+async function rollbackSavepoint(tnx: DatabaseTransaction, savepoint: string): Promise<void> {
   await tnx.query(`ROLLBACK TO SAVEPOINT ${savepoint}`)
   await tnx.query(`RELEASE SAVEPOINT ${savepoint}`)
 }

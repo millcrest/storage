@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
 import { createDefaultSchema, createResponse } from '../../routes-helper'
+import { fileSizeLimitSchema } from '../../schemas/file-size-limit'
 import { AuthenticatedRequest } from '../../types'
 import { ROUTE_OPERATIONS } from '../operations'
 
@@ -9,23 +10,21 @@ const updateBucketBodySchema = {
   minProperties: 1,
   properties: {
     public: { type: 'boolean', examples: [false] },
-    file_size_limit: {
-      anyOf: [
-        { type: 'integer', examples: [1000], nullable: true, minimum: 0 },
-        { type: 'string', examples: ['100MB'], nullable: true },
-      ],
-    },
+    file_size_limit: fileSizeLimitSchema,
     allowed_mime_types: {
       type: 'array',
       nullable: true,
       items: { type: 'string', examples: [['image/png', 'image/jpg']] },
     },
+    versioning_status: { type: 'string', enum: ['ENABLED', 'SUSPENDED'] },
   },
   anyOf: [
     { required: ['public'] },
     { required: ['file_size_limit'] },
     { required: ['allowed_mime_types'] },
+    { required: ['versioning_status'] },
   ],
+  not: { required: ['lifecycle_configuration'] },
 } as const
 const updateBucketParamsSchema = {
   type: 'object',
@@ -59,13 +58,18 @@ export default async function routes(fastify: FastifyInstance) {
     {
       schema,
       config: {
-        operation: { type: ROUTE_OPERATIONS.UPDATE_BUCKET },
+        operation: ROUTE_OPERATIONS.UPDATE_BUCKET,
       },
     },
     async (request, response) => {
       const { bucketId } = request.params
 
-      const { public: isPublic, file_size_limit, allowed_mime_types } = request.body
+      const {
+        public: isPublic,
+        file_size_limit,
+        allowed_mime_types,
+        versioning_status,
+      } = request.body
 
       await request.storage.updateBucket(bucketId, {
         public: isPublic,
@@ -73,6 +77,7 @@ export default async function routes(fastify: FastifyInstance) {
         allowedMimeTypes: allowed_mime_types
           ? allowed_mime_types?.filter((mime) => mime)
           : allowed_mime_types,
+        versioning_status,
       })
 
       return response.status(200).send(createResponse('Successfully updated'))

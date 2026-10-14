@@ -7,7 +7,7 @@ import {
   QueryVectorsOutput,
 } from '@aws-sdk/client-s3vectors'
 import { signJWT } from '@internal/auth'
-import { ERRORS } from '@internal/errors'
+import { ERRORS, ErrorCode } from '@internal/errors'
 import { SingleShard } from '@internal/sharding'
 import { PgVectorMetadataDB, VectorStore, VectorStoreManager } from '@storage/protocols/vector'
 import { FastifyInstance } from 'fastify'
@@ -37,7 +37,7 @@ function parseJsonBody<Body>(body: string): Body {
 }
 
 async function findVectorIndex(bucketId: string, name: string) {
-  const result = await storageTest.database.connection.pool.acquire().query<{
+  const result = await storageTest.database.connection.query<{
     data_type: string
     dimension: number
     distance_metric: string
@@ -57,7 +57,7 @@ async function findVectorIndex(bucketId: string, name: string) {
 }
 
 async function findVectorBucket(bucketId: string) {
-  const result = await storageTest.database.connection.pool.acquire().query<{
+  const result = await storageTest.database.connection.query<{
     id: string
     created_at: Date
   }>({
@@ -114,7 +114,7 @@ describe('Vectors API', () => {
       shardKey: 'test-bucket',
       capacity: 1000,
     })
-    const mockVectorDB = new PgVectorMetadataDB(storageTest.database.connection.pool.acquire())
+    const mockVectorDB = new PgVectorMetadataDB(storageTest.database.connection)
     s3Vector = new VectorStoreManager(mockVectorStore, mockVectorDB, shard, {
       tenantId: 'test-tenant',
       maxBucketCount: Infinity,
@@ -127,11 +127,10 @@ describe('Vectors API', () => {
 
   afterAll(async () => {
     await appInstance.close()
-    await storageTest.database.connection.dispose()
+    storageTest.database.connection.dispose()
   })
 
   beforeEach(async () => {
-    vi.clearAllMocks()
     vi.resetAllMocks()
 
     getConfig({ reload: true })
@@ -235,18 +234,18 @@ describe('Vectors API', () => {
     })
 
     it('should reject request with invalid JWT role', async () => {
-      const invalidToken = 'invalid-token'
+      const token = await signJWT({ role: 'auth', sub: '1234' }, jwtSecret, '1h')
 
       const response = await appInstance.inject({
         method: 'POST',
         url: '/vector/CreateIndex',
         headers: {
-          authorization: `Bearer ${invalidToken}`,
+          authorization: `Bearer ${token}`,
         },
         payload: validCreateIndexRequest,
       })
 
-      expect(response.statusCode).toBe(400)
+      expect(response.statusCode).toBe(403)
       // Vector service not called when validation fails
     })
 
@@ -434,8 +433,12 @@ describe('Vectors API', () => {
         })
 
         expect(response.statusCode).toBe(404)
-        const body = JSON.parse(response.body)
-        expect(body.error).toBe('Not Found')
+        expect(JSON.parse(response.body)).toEqual({
+          statusCode: '404',
+          error: 'Not Found',
+          message: 'Route POST:/vector/CreateIndex not found',
+          code: ErrorCode.InvalidRequest,
+        })
       } finally {
         await appWithoutVector.close()
       }
@@ -482,6 +485,12 @@ describe('Vectors API', () => {
       })
 
       expect(response.statusCode).toBe(500)
+      expect(response.json()).toEqual({
+        statusCode: '500',
+        error: 'Internal',
+        message: 'Internal Server Error',
+        code: ErrorCode.InternalError,
+      })
       expect(mockVectorStore.createVectorIndex).toHaveBeenCalledTimes(1)
     })
 
@@ -2336,6 +2345,7 @@ describe('Vectors API', () => {
         vectorBucketName: vectorBucketS3,
         indexName: `${tenantId}-${indexName}`,
         indexArn: undefined,
+        nextToken: undefined,
         queryVector: {
           float32: [1.0, 2.0, 3.0],
         },
@@ -2344,6 +2354,65 @@ describe('Vectors API', () => {
         returnMetadata: true,
         filter: undefined,
       })
+    })
+
+    it('should accept topK at the S3-compatible maximum', async () => {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/vector/QueryVectors',
+        headers: {
+          authorization: `Bearer ${serviceToken}`,
+        },
+        payload: {
+          vectorBucketName,
+          indexName,
+          queryVector: {
+            float32: [1.0, 2.0, 3.0],
+          },
+          topK: 10_000,
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(mockVectorStore.queryVectors).toHaveBeenCalledWith(
+        expect.objectContaining({ topK: 10_000 })
+      )
+    })
+
+    it('should forward and return query pagination tokens', async () => {
+      const nextToken = 'x'.repeat(4_096)
+      mockVectorStore.queryVectors.mockResolvedValueOnce({
+        vectors: [],
+        distanceMetric: 'cosine',
+        nextToken: 'next-page-token',
+      } as QueryVectorsOutput)
+
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/vector/QueryVectors',
+        headers: {
+          authorization: `Bearer ${serviceToken}`,
+        },
+        payload: {
+          vectorBucketName,
+          indexName,
+          nextToken,
+          queryVector: {
+            float32: [1.0, 2.0, 3.0],
+          },
+          topK: 10_000,
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(parseJsonBody<QueryVectorsOutput>(response.body)).toMatchObject({
+        vectors: [],
+        distanceMetric: 'cosine',
+        nextToken: 'next-page-token',
+      })
+      expect(mockVectorStore.queryVectors).toHaveBeenCalledWith(
+        expect.objectContaining({ nextToken, topK: 10_000 })
+      )
     })
 
     it('should support metadata filtering', async () => {
@@ -2443,7 +2512,7 @@ describe('Vectors API', () => {
           queryVector: {
             float32: [1.0, 2.0, 3.0],
           },
-          topK: 101,
+          topK: 10_001,
         },
       })
 
@@ -2453,6 +2522,34 @@ describe('Vectors API', () => {
         code: 'InvalidRequest',
       })
       expect(response.body).toContain('topK')
+      expect(mockVectorStore.queryVectors).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      { label: 'empty', nextToken: '' },
+      { label: 'longer than 4096 characters', nextToken: 'x'.repeat(4_097) },
+    ])('should reject a $label nextToken before calling the vector store', async ({
+      nextToken,
+    }) => {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: '/vector/QueryVectors',
+        headers: {
+          authorization: `Bearer ${serviceToken}`,
+        },
+        payload: {
+          vectorBucketName,
+          indexName,
+          nextToken,
+          queryVector: {
+            float32: [1.0, 2.0, 3.0],
+          },
+          topK: 10,
+        },
+      })
+
+      expect(response.statusCode).toBe(400)
+      expect(response.body).toContain('nextToken')
       expect(mockVectorStore.queryVectors).not.toHaveBeenCalled()
     })
 

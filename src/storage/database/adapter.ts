@@ -1,7 +1,18 @@
-import { PgTenantConnection } from '@internal/database'
+import type { TenantConnection, TransactionOptions } from '@internal/database'
 import { DBMigration } from '@internal/database/migrations'
 import { ObjectMetadata } from '../backend'
-import { Bucket, IcebergCatalog, Obj, S3MultipartUpload, S3PartUpload } from '../schemas'
+import {
+  Bucket,
+  BucketLifecycleConfiguration,
+  BucketVersioningStatus,
+  IcebergCatalog,
+  LifecycleBucket,
+  Obj,
+  ObjectListEntry,
+  ObjectListingFilterMode,
+  S3MultipartUpload,
+  S3PartUpload,
+} from '../schemas'
 
 export interface SearchObjectOption {
   search?: string
@@ -11,6 +22,9 @@ export interface SearchObjectOption {
   }
   limit?: number
   offset?: number
+  noncurrentVersions?: ObjectListingFilterMode
+  deleteMarkers?: ObjectListingFilterMode
+  exactMatch?: boolean
 }
 
 export interface FindBucketFilters {
@@ -20,19 +34,82 @@ export interface FindBucketFilters {
   dontErrorOnEmpty?: boolean
 }
 
+export interface ObjectTargets {
+  /** Names whose current row is targeted. */
+  names: string[]
+  /** Exact (name, version) rows that are targeted. */
+  versions: { name: string; version: string }[]
+}
+
+export interface VersioningStatusHint {
+  /**
+   * Versioning status of the bucket as read under its shared status lock earlier
+   * in the same transaction. When given, the write skips its own status lock and
+   * read; the row stays locked until the transaction ends.
+   */
+  versioningStatus?: BucketVersioningStatus
+}
+
+export interface UpsertObjectOptions extends VersioningStatusHint {
+  /**
+   * Write the key's current row as an RLS permission probe: a single
+   * status-independent `INSERT ... ON CONFLICT (current row) DO UPDATE`, run
+   * purely so Postgres evaluates the caller's INSERT/UPDATE policies — no
+   * bucket status lock, nothing archived, and no unique violation against a
+   * concurrent writer (it waits for that row instead of failing). Only
+   * meaningful inside a `testPermission` transaction, which always rolls
+   * back: the row it writes must never commit. This is not a versioning
+   * toggle for real writes.
+   */
+  currentVersion?: boolean
+}
+
+/**
+ * The row a write replaced in place: the DISABLED current row, or the
+ * SUSPENDED null-version row (current or archived). Its previous bytes are
+ * unreferenced once the write commits and must be removed from the backend.
+ */
+export interface ReplacedRow {
+  id: string
+  /** `null` for a legacy row written before uploads carried a version. */
+  version: string | null
+  isDeleteMarker: boolean
+}
+
+export type WrittenObject = Obj & { replaced?: ReplacedRow }
+
+export interface DeleteMarkerOptions {
+  /** The principal deleting; recorded as the owner of any delete marker written. */
+  owner?: string
+}
+
+/**
+ * The backend bytes a write made unreferenced, if any: the content of the row
+ * it replaced in place. Delete markers own no bytes and are skipped.
+ */
+export function replacedContent(written: WrittenObject): { version: string | null } | undefined {
+  const replaced = written.replaced
+  if (!replaced || replaced.isDeleteMarker || replaced.version === written.version) {
+    return undefined
+  }
+  return { version: replaced.version }
+}
+
+export interface ObjectLockKey {
+  bucketId: string
+  objectName: string
+  version?: string
+}
+
 export interface FindObjectFilters {
   forUpdate?: boolean
   forShare?: boolean
   forKeyShare?: boolean
   noWait?: boolean
   dontErrorOnEmpty?: boolean
-}
-
-export interface TransactionOptions {
-  isolation?: string
-  retry?: number
-  readOnly?: boolean
-  timeout?: number
+  excludeDeleteMarkers?: boolean
+  includeNoncurrent?: boolean
+  isVersioned?: boolean
 }
 
 export interface DatabaseOptions<TNX> {
@@ -43,7 +120,7 @@ export interface DatabaseOptions<TNX> {
   host: string
   tnx?: TNX
   parentTnx?: TNX
-  parentConnection?: PgTenantConnection
+  parentConnection?: TenantConnection
 }
 
 export interface ListBucketOptions {
@@ -65,9 +142,15 @@ export interface Database {
   reqId?: string
   sbReqId?: string
   role?: string
-  connection: PgTenantConnection
+  latestMigration?: keyof typeof DBMigration
+  connection: TenantConnection
 
   tenant(): { ref: string; host: string }
+
+  hasMigration(migration: keyof typeof DBMigration): Promise<boolean>
+
+  /** Returns the original caller scope, preserving the current transaction. */
+  asCaller(): Database
 
   asSuperUser(): Database
 
@@ -81,17 +164,42 @@ export interface Database {
   createBucket(
     data: Pick<
       Bucket,
-      'id' | 'name' | 'public' | 'owner' | 'file_size_limit' | 'allowed_mime_types'
+      | 'id'
+      | 'name'
+      | 'public'
+      | 'owner'
+      | 'file_size_limit'
+      | 'allowed_mime_types'
+      | 'versioning_status'
     >
   ): Promise<Pick<Bucket, 'id'>>
 
   createAnalyticsBucket(data: Pick<Bucket, 'name'>): Promise<IcebergCatalog>
 
-  findBucketById<Filters extends FindBucketFilters = FindObjectFilters>(
+  findBucketById<Filters extends FindBucketFilters = FindBucketFilters>(
     bucketId: string,
     columns: string,
     filters?: Filters
   ): Promise<Filters['dontErrorOnEmpty'] extends true ? Bucket | undefined : Bucket>
+
+  /**
+   * Finds several buckets in one statement, in ascending id order (which is
+   * also the lock order for forShare/forUpdate reads).
+   */
+  findBucketsById(
+    bucketIds: string[],
+    columns: string,
+    filters?: FindBucketFilters
+  ): Promise<Bucket[]>
+
+  findLifecycleBucket(bucketId: string): Promise<LifecycleBucket>
+
+  putLifecycleConfiguration(
+    bucketId: string,
+    configuration: BucketLifecycleConfiguration
+  ): Promise<LifecycleBucket>
+
+  deleteLifecycleConfiguration(bucketId: string): Promise<LifecycleBucket>
 
   countObjectsInBucket(bucketId: string, limit?: number): Promise<number>
 
@@ -102,7 +210,12 @@ export interface Database {
     columns: string,
     limit: number,
     before?: Date,
-    nextToken?: string
+    nextToken?: string,
+    nextTokenVersion?: string | null,
+    filters?: {
+      noncurrentVersions?: ObjectListingFilterMode
+      deleteMarkers?: ObjectListingFilterMode
+    }
   ): Promise<Obj[]>
 
   listObjectsV2(
@@ -117,9 +230,14 @@ export interface Database {
         order?: string
         column?: string
         after?: string
+        afterVersion?: string
+        afterArchivedAt?: string
       }
+      noncurrentVersions?: ObjectListingFilterMode
+      deleteMarkers?: ObjectListingFilterMode
+      exactMatch?: boolean
     }
-  ): Promise<Obj[]>
+  ): Promise<ObjectListEntry[]>
 
   listMultipartUploads(
     bucketId: string,
@@ -142,57 +260,101 @@ export interface Database {
     opts?: { timeout?: number }
   ): Promise<boolean>
 
+  /**
+   * Acquires every advisory lock in one round trip, in a deterministic order.
+   */
+  waitObjectLocks(keys: ObjectLockKey[], opts?: { timeout?: number }): Promise<boolean>
+
   updateBucket(
     bucketId: string,
-    fields: Pick<Bucket, 'public' | 'file_size_limit' | 'allowed_mime_types'>
-  ): Promise<void>
+    fields: Pick<Bucket, 'public' | 'file_size_limit' | 'allowed_mime_types' | 'versioning_status'>
+  ): Promise<{ previous: Pick<Bucket, 'public'> } | void>
 
   upsertObject(
-    data: Pick<Obj, 'name' | 'owner' | 'bucket_id' | 'metadata' | 'version' | 'user_metadata'>
-  ): Promise<Obj>
+    data: Pick<Obj, 'name' | 'owner' | 'bucket_id' | 'metadata' | 'version' | 'user_metadata'>,
+    options?: UpsertObjectOptions
+  ): Promise<WrittenObject>
 
   updateObject(
     bucketId: string,
     name: string,
-    data: Pick<Obj, 'owner' | 'metadata' | 'version' | 'name' | 'bucket_id' | 'user_metadata'>
+    data: Pick<Obj, 'owner' | 'metadata' | 'version' | 'name' | 'bucket_id' | 'user_metadata'>,
+    currentVersion?: string
   ): Promise<Obj>
   createObject(
     data: Pick<Obj, 'name' | 'owner' | 'bucket_id' | 'metadata' | 'version' | 'user_metadata'>
   ): Promise<Obj>
 
-  deleteObject(bucketId: string, objectName: string, version?: string): Promise<Obj | undefined>
+  /**
+   * `owner` is the principal performing the delete. A delete without a
+   * version on a versioned bucket writes a delete marker, and that marker is
+   * a row of its own: it carries the owner like an uploaded row does, so
+   * owner-scoped policies keep applying to it.
+   */
+  deleteObject(
+    bucketId: string,
+    objectName: string,
+    version?: string | null,
+    options?: DeleteMarkerOptions & { skipPromotion?: boolean } & VersioningStatusHint
+  ): Promise<WrittenObject | undefined>
 
-  deleteObjects(bucketId: string, objectNames: string[], by: keyof Obj): Promise<Obj[]>
+  deleteObjects(
+    bucketId: string,
+    objectNames: string[],
+    by: keyof Obj,
+    options?: DeleteMarkerOptions & { skipDeleteMarkers?: boolean } & VersioningStatusHint
+  ): Promise<WrittenObject[]>
 
   deleteObjectVersions(
     bucketId: string,
-    objectNames: { name: string; version: string }[]
+    objectNames: { name: string; version: string }[],
+    options?: { skipPromotion?: boolean }
   ): Promise<Obj[]>
-
-  updateObjectMetadata(bucketId: string, objectName: string, metadata: ObjectMetadata): Promise<Obj>
 
   updateObjectOwner(bucketId: string, objectName: string, owner?: string): Promise<Obj>
 
-  findObjects(bucketId: string, objectNames: string[], columns: string): Promise<Obj[]>
+  findObjects(
+    bucketId: string,
+    objectNames: string[],
+    columns: string,
+    filters?: FindObjectFilters
+  ): Promise<Obj[]>
+
+  /**
+   * Current rows for the given names plus the exact rows for the given
+   * (name, version) pairs, in one statement ordered by (name, version).
+   */
+  findObjectTargets(
+    bucketId: string,
+    targets: ObjectTargets,
+    columns?: string,
+    filters?: FindObjectFilters
+  ): Promise<Obj[]>
 
   findObjectVersions(
     bucketId: string,
     objectNames: { name: string; version: string }[],
-    columns: string
+    columns?: string,
+    filters?: FindObjectFilters
   ): Promise<Obj[]>
 
   findObject<Filters extends FindObjectFilters = FindObjectFilters>(
     bucketId: string,
     objectName: string,
     columns: string,
-    filters?: Filters
+    filters?: Filters,
+    version?: string | null
   ): Promise<Filters['dontErrorOnEmpty'] extends true ? Obj | undefined : Obj>
 
-  searchObjects(bucketId: string, prefix: string, options: SearchObjectOption): Promise<Obj[]>
+  searchObjects(
+    bucketId: string,
+    prefix: string,
+    options: SearchObjectOption
+  ): Promise<ObjectListEntry[]>
 
   healthcheck(): Promise<void>
 
-  destroyConnection(): Promise<void>
+  destroyConnection(): void
 
   createMultipartUpload(
     uploadId: string,

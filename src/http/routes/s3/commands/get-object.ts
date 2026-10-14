@@ -17,8 +17,10 @@ const GetObjectInput = {
     type: 'object',
     properties: {
       range: { type: 'string' },
+      'if-match': { type: 'string' },
       'if-none-match': { type: 'string' },
       'if-modified-since': { type: 'string' },
+      'if-unmodified-since': { type: 'string' },
     },
   },
   Querystring: {
@@ -30,6 +32,7 @@ const GetObjectInput = {
       'response-content-encoding': { type: 'string' },
       'response-content-language': { type: 'string' },
       'response-expires': { type: 'string' },
+      versionId: { type: 'string' },
     },
   },
 } as const
@@ -63,6 +66,16 @@ function parseDateHeader(input?: string) {
   }
 }
 
+// RFC 9110 13.1.3 and 13.1.4: an invalid If-Modified-Since or If-Unmodified-Since date is ignored
+function parseConditionalDate(input?: string) {
+  if (input) {
+    const parsedDate = new Date(input)
+    if (!isNaN(parsedDate.getTime())) {
+      return parsedDate
+    }
+  }
+}
+
 export default function GetObject(s3Router: S3Router) {
   s3Router.get(
     '/:Bucket/*?tagging',
@@ -82,7 +95,6 @@ export default function GetObject(s3Router: S3Router) {
     { type: 'iceberg', schema: GetObjectInput, operation: ROUTE_OPERATIONS.S3_GET_OBJECT },
     (req, ctx) => {
       const s3Protocol = new S3ProtocolHandler(ctx.storage, ctx.tenantId, ctx.owner)
-      const ifModifiedSince = req.Headers?.['if-modified-since']
       const icebergBucket = ctx.req.internalIcebergBucketName
       const responseExpires = parseDateHeader(req.Querystring?.['response-expires'])
 
@@ -91,14 +103,17 @@ export default function GetObject(s3Router: S3Router) {
           Bucket: icebergBucket,
           Key: req.Params['*'],
           Range: req.Headers?.['range'],
+          IfMatch: req.Headers?.['if-match'],
           IfNoneMatch: req.Headers?.['if-none-match'],
-          IfModifiedSince: ifModifiedSince ? new Date(ifModifiedSince) : undefined,
+          IfModifiedSince: parseConditionalDate(req.Headers?.['if-modified-since']),
+          IfUnmodifiedSince: parseConditionalDate(req.Headers?.['if-unmodified-since']),
           ResponseContentDisposition: req.Querystring?.['response-content-disposition'],
           ResponseContentType: req.Querystring?.['response-content-type'],
           ResponseCacheControl: req.Querystring?.['response-cache-control'],
           ResponseContentEncoding: req.Querystring?.['response-content-encoding'],
           ResponseContentLanguage: req.Querystring?.['response-content-language'],
           ResponseExpires: responseExpires,
+          VersionId: req.Querystring?.versionId,
         },
         {
           skipDbCheck: true,
@@ -113,7 +128,6 @@ export default function GetObject(s3Router: S3Router) {
     { schema: GetObjectInput, operation: ROUTE_OPERATIONS.S3_GET_OBJECT },
     (req, ctx) => {
       const s3Protocol = new S3ProtocolHandler(ctx.storage, ctx.tenantId, ctx.owner)
-      const ifModifiedSince = req.Headers?.['if-modified-since']
       const responseExpires = parseDateHeader(req.Querystring?.['response-expires'])
 
       return s3Protocol.getObject(
@@ -121,14 +135,17 @@ export default function GetObject(s3Router: S3Router) {
           Bucket: req.Params.Bucket,
           Key: req.Params['*'],
           Range: req.Headers?.['range'],
+          IfMatch: req.Headers?.['if-match'],
           IfNoneMatch: req.Headers?.['if-none-match'],
-          IfModifiedSince: ifModifiedSince ? new Date(ifModifiedSince) : undefined,
+          IfModifiedSince: parseConditionalDate(req.Headers?.['if-modified-since']),
+          IfUnmodifiedSince: parseConditionalDate(req.Headers?.['if-unmodified-since']),
           ResponseContentDisposition: req.Querystring?.['response-content-disposition'],
           ResponseContentType: req.Querystring?.['response-content-type'],
           ResponseCacheControl: req.Querystring?.['response-cache-control'],
           ResponseContentEncoding: req.Querystring?.['response-content-encoding'],
           ResponseContentLanguage: req.Querystring?.['response-content-language'],
           ResponseExpires: responseExpires,
+          VersionId: req.Querystring?.versionId,
         },
         {
           signal: ctx.signals.response,

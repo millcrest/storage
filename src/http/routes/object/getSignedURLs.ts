@@ -18,6 +18,7 @@ const getSignedURLsBodySchema = {
   properties: {
     expiresIn: {
       type: 'integer',
+      finite: true,
       minimum: 1,
       examples: [60000],
     },
@@ -74,7 +75,7 @@ export default async function routes(fastify: FastifyInstance) {
     {
       schema,
       config: {
-        operation: { type: ROUTE_OPERATIONS.SIGN_OBJECT_URLS },
+        operation: ROUTE_OPERATIONS.SIGN_OBJECT_URLS,
         resources: (req: FastifyRequest<getSignedURLsRequestInterface>) => {
           const { paths } = req.body
           return paths.map((path) => `${req.params.bucketName}/${path}`)

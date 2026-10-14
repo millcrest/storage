@@ -18,10 +18,28 @@ const deleteObjectsBodySchema = {
   properties: {
     prefixes: {
       type: 'array',
-      items: { type: 'string' },
+      items: {
+        anyOf: [
+          { type: 'string' },
+          {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              versionId: { type: 'string' },
+            },
+            required: ['path', 'versionId'],
+            additionalProperties: false,
+          },
+        ],
+      },
       minItems: 1,
       description: DELETE_OBJECTS_LIMIT_DESCRIPTION,
-      examples: [['folder/cat.png', 'folder/morecats.png']],
+      examples: [
+        [
+          'folder/cat.png',
+          { path: 'folder/dog.png', versionId: 'eaa8bdb5-2e00-4767-b5a9-d2502efe2196' },
+        ],
+      ],
     },
   },
   required: ['prefixes'],
@@ -50,10 +68,13 @@ export default async function routes(fastify: FastifyInstance) {
     {
       schema,
       config: {
-        operation: { type: ROUTE_OPERATIONS.DELETE_OBJECTS },
+        operation: ROUTE_OPERATIONS.DELETE_OBJECTS,
         resources: (req: FastifyRequest<deleteObjectsInterface>) => {
           const { prefixes } = req.body
-          return prefixes.map((prefix) => `${req.params.bucketName}/${prefix}`)
+          return prefixes.map((prefix) => {
+            const path = typeof prefix === 'string' ? prefix : prefix.path
+            return `${req.params.bucketName}/${path}`
+          })
         },
       },
     },
@@ -63,7 +84,9 @@ export default async function routes(fastify: FastifyInstance) {
 
       await enforceDeleteObjectsLimit(request.tenantId, prefixes.length)
 
-      const results = await request.storage.from(bucketName).deleteObjects(prefixes)
+      const results = await request.storage
+        .from(bucketName)
+        .deleteObjects(prefixes, { owner: request.owner })
 
       return response.status(200).send(results)
     }

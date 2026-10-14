@@ -1,7 +1,8 @@
 import { QueryResultRow } from 'pg'
 import { getConfig, JwksConfigKey } from '../../config'
-import { PgExecutor } from './pg-connection'
-import { quoteIdentifier } from './sql'
+import type { DatabaseExecutor } from './connection'
+import { knownMigrationVersions } from './migrations/guards'
+import { quoteIdentifier } from './postgres/sql'
 
 const { multitenantDatabaseQueryTimeout } = getConfig()
 const QUOTED_ID_COLUMN = quoteIdentifier('id')
@@ -33,10 +34,12 @@ export interface TenantConfigRow {
   feature_vector_buckets?: boolean
   feature_vector_buckets_max_buckets?: number
   feature_vector_buckets_max_indexes?: number
+  feature_object_versioning?: boolean
   migrations_status?: string | null
   migrations_version?: string | null
   tracing_mode?: string | null
   disable_events?: string[] | null
+  subscription_tier?: string | null
   cursor_id?: number
   created_at?: Date
 }
@@ -64,10 +67,12 @@ const tenantWritableColumns = [
   'feature_vector_buckets',
   'feature_vector_buckets_max_buckets',
   'feature_vector_buckets_max_indexes',
+  'feature_object_versioning',
   'migrations_status',
   'migrations_version',
   'tracing_mode',
   'disable_events',
+  'subscription_tier',
 ] as const satisfies readonly (keyof TenantConfigRow)[]
 
 type TenantWritableColumn = (typeof tenantWritableColumns)[number]
@@ -75,7 +80,7 @@ export type TenantConfigRowInput = Partial<Pick<TenantConfigRow, TenantWritableC
 export type TenantCursorRow = Pick<TenantConfigRow, 'id' | 'cursor_id'> & { cursor_id: number }
 
 interface TenantQueryOptions {
-  db?: PgExecutor
+  db?: DatabaseExecutor
   signal?: AbortSignal
   /**
    * Positive values add an internal timeout. Zero or negative values disable
@@ -85,7 +90,7 @@ interface TenantQueryOptions {
 }
 
 export class TenantConfigStorePg {
-  constructor(private db: PgExecutor) {}
+  constructor(private db: DatabaseExecutor) {}
 
   async list(): Promise<TenantConfigRow[]> {
     const result = await this.query<TenantConfigRow>({
@@ -109,7 +114,7 @@ export class TenantConfigStorePg {
     return result.rows[0]
   }
 
-  async insert(tenantInfo: TenantConfigRowInput, db: PgExecutor = this.db): Promise<void> {
+  async insert(tenantInfo: TenantConfigRowInput, db: DatabaseExecutor = this.db): Promise<void> {
     const entries = getTenantEntries(tenantInfo)
     const columns = entries.map(([column]) => quoteIdentifier(column))
     const values = entries.map(([, value]) => value)
@@ -127,7 +132,7 @@ export class TenantConfigStorePg {
     )
   }
 
-  async upsert(tenantInfo: TenantConfigRowInput, db: PgExecutor = this.db): Promise<void> {
+  async upsert(tenantInfo: TenantConfigRowInput, db: DatabaseExecutor = this.db): Promise<void> {
     const entries = getTenantEntries(tenantInfo)
     const columns = entries.map(([column]) => quoteIdentifier(column))
     const values = entries.map(([, value]) => value)
@@ -156,7 +161,7 @@ export class TenantConfigStorePg {
   async update(
     tenantId: string,
     tenantInfo: TenantConfigRowInput,
-    db: PgExecutor = this.db
+    db: DatabaseExecutor = this.db
   ): Promise<number> {
     const entries = getTenantEntries(tenantInfo).filter(([column]) => column !== 'id')
     if (entries.length === 0) {
@@ -176,6 +181,41 @@ export class TenantConfigStorePg {
           WHERE id = $${entries.length + 1}
         `,
         values: [...values, tenantId],
+      },
+      { db }
+    )
+
+    return result.rowCount || 0
+  }
+
+  /**
+   * Record migration state unless the row holds a version this binary does not know,
+   * so an older release can never rewind what a newer release recorded.
+   */
+  async updateMigrationsState(
+    tenantId: string,
+    state: { migrations_version?: string; migrations_status: string },
+    db: DatabaseExecutor = this.db
+  ): Promise<number> {
+    const result = await this.query(
+      {
+        text: `
+          UPDATE tenants
+          SET migrations_version = COALESCE($2, migrations_version),
+              migrations_status = $3
+          WHERE id = $1
+            AND (
+              migrations_version IS NULL
+              OR migrations_version = ''
+              OR migrations_version = ANY($4::text[])
+            )
+        `,
+        values: [
+          tenantId,
+          state.migrations_version ?? null,
+          state.migrations_status,
+          knownMigrationVersions(),
+        ],
       },
       { db }
     )
@@ -229,6 +269,7 @@ export class TenantConfigStorePg {
     return result.rows[0]
   }
 
+  /** Rows holding a version this binary does not know belong to a newer release and are skipped. */
   async listTenantsToMigrateBatch(
     migrationVersion: string,
     lastCursor: number,
@@ -249,10 +290,15 @@ export class TenantConfigStorePg {
               )
               OR migrations_status IS NULL
             )
+            AND (
+              migrations_version IS NULL
+              OR migrations_version = ''
+              OR migrations_version = ANY($5::text[])
+            )
           ORDER BY cursor_id ASC
           LIMIT $4
         `,
-        values: [lastCursor, migrationVersion, failedStatuses, batchSize],
+        values: [lastCursor, migrationVersion, failedStatuses, batchSize, knownMigrationVersions()],
       },
       { signal, timeoutMs: MIGRATION_LIST_QUERY_TIMEOUT_MS }
     )
@@ -289,7 +335,7 @@ export class TenantConfigStorePg {
   }
 
   private query<T extends QueryResultRow = QueryResultRow>(
-    statement: Parameters<PgExecutor['query']>[0],
+    statement: Parameters<DatabaseExecutor['query']>[0],
     options: TenantQueryOptions = {}
   ) {
     const db = options.db ?? this.db

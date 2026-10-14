@@ -1,21 +1,49 @@
 import fastifyMultipart from '@fastify/multipart'
 import { ERRORS } from '@internal/errors'
-import { FastifyInstance, RouteHandlerMethod } from 'fastify'
+import { FastifyInstance, FastifyRequest, RouteHandlerMethod } from 'fastify'
 import { JSONSchema } from 'json-schema-to-ts'
 import { getConfig } from '../../../config'
 import {
   db,
   detectS3IcebergBucket,
+  enforceJwtRole,
   icebergRestCatalog,
   requireTenantFeature,
   signatureV4,
   storage,
   xmlParser,
 } from '../../plugins'
-import { s3ErrorHandler } from './error-handler'
-import { findArrayPathsInSchemas, getRouter, RequestInput, RouteQuery } from './router'
+import { formatS3ErrorResponse, s3ErrorHandler } from './error-handler'
+import { findArraySchemaPaths, getRouter, RequestInput, RouteQuery } from './router'
 
-const { s3ProtocolEnabled } = getConfig()
+const { s3ProtocolEnabled, dbServiceRole } = getConfig()
+const S3_XML_NAMESPACE = 'http://s3.amazonaws.com/doc/2006-03-01/'
+
+const PRESIGN_AUTH_PARAMS = new Set([
+  'x-amz-algorithm',
+  'x-amz-content-sha256',
+  'x-amz-credential',
+  'x-amz-date',
+  'x-amz-expires',
+  'x-amz-security-token',
+  'x-amz-signature',
+  'x-amz-signedheaders',
+])
+
+// Presigners hoist x-amz-* headers into the signed query wins over headers.
+function hoistPresignedHeaders(req: FastifyRequest) {
+  const query = req.query as Record<string, string | string[] | undefined>
+  if (!query?.['X-Amz-Signature']) {
+    return
+  }
+
+  for (const [key, value] of Object.entries(query)) {
+    const name = key.toLowerCase()
+    if (name.startsWith('x-amz-') && !PRESIGN_AUTH_PARAMS.has(name)) {
+      req.headers[name] = value
+    }
+  }
+}
 
 export default async function routes(fastify: FastifyInstance) {
   if (!s3ProtocolEnabled) {
@@ -38,8 +66,13 @@ export default async function routes(fastify: FastifyInstance) {
         const routesByMethod = routes.filter((e) => e.method === method)
         const icebergRoutes = routesByMethod.filter((e) => e.type === 'iceberg')
         const standardRoutes = routesByMethod.filter((e) => e.type === undefined)
+        const bodySchemas = routesByMethod.flatMap((route) =>
+          route.schema.Body ? [route.schema.Body as JSONSchema] : []
+        )
 
         const routeHandler: RouteHandlerMethod = async (req, reply) => {
+          hoistPresignedHeaders(req)
+
           const matchType = req.isIcebergBucket ? 'iceberg' : undefined
           const matchQuery = (req.query as RouteQuery) || {}
           const matchHeaders = (req.headers as Record<string, string>) || {}
@@ -57,73 +90,59 @@ export default async function routes(fastify: FastifyInstance) {
                 })
               }
 
-              try {
-                req.operation = route.operationConfig
+              req.operation = route.operation
 
-                if (req.operation.type && typeof req.opentelemetry === 'function') {
-                  req.opentelemetry()?.span?.setAttribute('http.operation', req.operation.type)
-                }
-
-                const data = {
-                  Params: req.params,
-                  Body: req.body,
-                  Headers: req.headers,
-                  Querystring: req.query,
-                } as RequestInput<typeof route.schema>
-                const isValid = route.validate(data)
-
-                if (!isValid) {
-                  const validationError = ERRORS.InvalidRequest('Invalid request') as Error & {
-                    validation?: unknown
-                  }
-                  // validation property is required to send correct reply in error-handler.ts
-                  validationError.validation = route.validate.errors
-                  throw validationError
-                }
-
-                const output = await route.handler(data, {
-                  req,
-                  storage: req.storage,
-                  tenantId: req.tenantId,
-                  owner: req.owner,
-                  signals: {
-                    get body() {
-                      return req.signals.body.signal
-                    },
-                    get response() {
-                      return req.signals.response.signal
-                    },
-                  },
-                })
-
-                const headers = output.headers
-
-                if (headers) {
-                  for (const header in headers) {
-                    if (!Object.prototype.hasOwnProperty.call(headers, header)) {
-                      continue
-                    }
-
-                    if (headers[header]) {
-                      reply.header(header, headers[header])
-                    }
-                  }
-                }
-                return reply.status(output.statusCode || 200).send(output.responseBody)
-              } catch (e) {
-                if (route.disableContentTypeParser) {
-                  reply.header('connection', 'close')
-                  reply.raw.on('finish', () => {
-                    // wait sometime so that the client can receive the response
-                    setTimeout(() => {
-                      if (!req.raw.destroyed) {
-                        req.raw.destroy()
-                      }
-                    }, 3000)
-                  })
-                }
-                throw e
+              if (req.operation && typeof req.opentelemetry === 'function') {
+                req.opentelemetry()?.span?.setAttribute('http.operation', req.operation)
               }
+
+              const data = {
+                Params: req.params,
+                Body: req.body,
+                Headers: req.headers,
+                Querystring: req.query,
+              } as RequestInput<typeof route.schema>
+              const isValid = route.validate(data)
+
+              if (!isValid) {
+                const validationError = ERRORS.InvalidRequest('Invalid request') as Error & {
+                  validation?: unknown
+                }
+                // validation property is required to send correct reply in error-handler.ts
+                validationError.validation = route.validate.errors
+                throw validationError
+              }
+
+              const output = await route.handler(data, {
+                req,
+                storage: req.storage,
+                tenantId: req.tenantId,
+                owner: req.owner,
+                signals: {
+                  get body() {
+                    return req.signals.body.signal
+                  },
+                  get response() {
+                    return req.signals.response.signal
+                  },
+                },
+              })
+
+              const headers = output.headers
+
+              if (headers) {
+                for (const header in headers) {
+                  if (!Object.prototype.hasOwnProperty.call(headers, header)) {
+                    continue
+                  }
+
+                  const value = headers[header]
+                  if (value || (value === '' && header.startsWith('x-amz-meta-'))) {
+                    reply.header(header, value)
+                  }
+                }
+              }
+              return reply.status(output.statusCode || 200).send(output.responseBody)
             }
           }
 
@@ -131,7 +150,11 @@ export default async function routes(fastify: FastifyInstance) {
         }
 
         fastify.register(async (localFastify) => {
-          localFastify.register(requireTenantFeature('s3Protocol'))
+          localFastify.register(
+            requireTenantFeature('s3Protocol', {
+              formatter: formatS3ErrorResponse,
+            })
+          )
 
           const disableContentParser = routesByMethod?.some(
             (route) => route.disableContentTypeParser
@@ -181,14 +204,17 @@ export default async function routes(fastify: FastifyInstance) {
           localFastify.register(signatureV4)
           localFastify.register(xmlParser, {
             disableContentParser,
-            parseAsArray: findArrayPathsInSchemas(
-              routesByMethod.filter((r) => r.schema.Body).map((r) => r.schema.Body as JSONSchema)
-            ),
+            parseAsArray: findArraySchemaPaths(bodySchemas),
+            responseNamespace: S3_XML_NAMESPACE,
           })
 
           localFastify.register(db)
           localFastify.register(icebergRestCatalog)
           localFastify.register(detectS3IcebergBucket)
+          localFastify.register(enforceJwtRole, {
+            roles: [dbServiceRole],
+            when: (request) => request.isIcebergBucket === true,
+          })
           localFastify.register(storage)
 
           localFastify[method](

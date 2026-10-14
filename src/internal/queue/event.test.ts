@@ -1,3 +1,4 @@
+import { queueJobSchedulingTime } from '@internal/monitoring/metrics'
 import { vi } from 'vitest'
 
 type EventModule = typeof import('./event')
@@ -51,7 +52,6 @@ function createPayload(overrides: Partial<TestPayload> = {}): TestPayload {
 
 describe('Event payload versioning', () => {
   afterEach(() => {
-    vi.restoreAllMocks()
     vi.resetModules()
   })
 
@@ -173,5 +173,26 @@ describe('Event payload versioning', () => {
         }),
       })
     )
+  })
+
+  it('records queue scheduling duration from numeric monotonic timestamps', async () => {
+    const { eventModule, queueModule } = await loadQueueModules({
+      pgQueueEnable: true,
+    })
+    const TestEvent = defineTestEvent(eventModule.Event)
+    const payload = createPayload()
+    const send = vi.fn().mockResolvedValue('job-id')
+    const recordSpy = vi.spyOn(queueJobSchedulingTime, 'record')
+    vi.spyOn(performance, 'now').mockReturnValueOnce(20).mockReturnValueOnce(26)
+
+    vi.spyOn(queueModule.Queue, 'getInstance').mockReturnValue({
+      send,
+    } as unknown as ReturnType<typeof queueModule.Queue.getInstance>)
+
+    await TestEvent.send(payload)
+
+    expect(recordSpy).toHaveBeenCalledWith(0.006, {
+      name: 'test-event',
+    })
   })
 })

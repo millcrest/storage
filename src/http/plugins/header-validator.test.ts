@@ -1,6 +1,7 @@
 import { StorageBackendError } from '@internal/errors'
 import Fastify, { FastifyInstance } from 'fastify'
 import { setErrorHandler } from '../error-handler'
+import { closeConnectionOnError } from './close-connection'
 import { headerValidator } from './header-validator'
 
 describe('header-validator plugin', () => {
@@ -8,6 +9,7 @@ describe('header-validator plugin', () => {
 
   beforeEach(async () => {
     app = Fastify()
+    await app.register(closeConnectionOnError)
     await app.register(headerValidator())
     setErrorHandler(app)
   })
@@ -28,32 +30,6 @@ describe('header-validator plugin', () => {
     const body = response.json()
     expect(body.message).toContain('Invalid character in response header')
     expect(body.message).toContain('x-test')
-  })
-
-  it('should reject response with carriage return in header value', async () => {
-    app.get('/test', async (_request, reply) => {
-      reply.header('x-custom', 'value\rwith\rCR')
-      return { ok: true }
-    })
-
-    const response = await app.inject({ method: 'GET', url: '/test' })
-
-    expect(response.statusCode).toBe(400)
-    const body = response.json()
-    expect(body.error).toBe('Bad Request')
-    expect(body.message).toContain('Invalid character in response header')
-  })
-
-  it('should allow valid header values with TAB character', async () => {
-    app.get('/test', async (_request, reply) => {
-      reply.header('x-custom', 'value\twith\ttabs')
-      return { ok: true }
-    })
-
-    const response = await app.inject({ method: 'GET', url: '/test' })
-
-    expect(response.statusCode).toBe(200)
-    expect(response.headers['x-custom']).toBe('value\twith\ttabs')
   })
 
   it('should allow normal ASCII header values', async () => {

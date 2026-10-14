@@ -3,6 +3,7 @@ import { ImageRenderer } from '@storage/renderer'
 import { FastifyInstance } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
 import { getConfig } from '../../../config'
+import { sharedErrorResponseSchemas } from '../../schemas/error'
 import { transformationOptionsSchema } from '../../schemas/transformations'
 import { ROUTE_OPERATIONS } from '../operations'
 
@@ -18,10 +19,11 @@ const renderPublicImageParamsSchema = {
 } as const
 
 const renderImageQuerySchema = {
-  type: 'object',
+  ...transformationOptionsSchema,
   properties: {
-    ...transformationOptionsSchema,
+    ...transformationOptionsSchema.properties,
     download: { type: 'string', examples: ['filename.png'] },
+    versionId: { type: 'string', examples: ['eaa8bdb5-2e00-4767-b5a9-d2502efe2196'] },
   },
 } as const
 
@@ -39,15 +41,15 @@ export default async function routes(fastify: FastifyInstance) {
         params: renderPublicImageParamsSchema,
         querystring: renderImageQuerySchema,
         summary,
-        response: { '4xx': { $ref: 'errorSchema#', description: 'Error response' } },
+        response: sharedErrorResponseSchemas,
         tags: ['transformation'],
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.RENDER_PUBLIC_IMAGE },
+        operation: ROUTE_OPERATIONS.RENDER_PUBLIC_IMAGE,
       },
     },
     async (request, response) => {
-      const { download } = request.query
+      const { download, versionId } = request.query
       const { bucketName } = request.params
       const objectName = request.params['*']
 
@@ -56,7 +58,7 @@ export default async function routes(fastify: FastifyInstance) {
         request.storage.asSuperUser().findBucket(bucketName, 'id,public', {
           isPublic: true,
         }),
-        bucketRef.findObject(objectName, 'id,version,metadata'),
+        bucketRef.findObject(objectName, 'id,version,metadata', undefined, versionId),
       ])
 
       const s3Key = `${request.tenantId}/${bucketName}/${objectName}`

@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
 import { getConfig } from '../../../config'
+import { sharedErrorResponseSchemas } from '../../schemas/error'
 import { ROUTE_OPERATIONS } from '../operations'
 
 const { storageS3Bucket } = getConfig()
@@ -18,6 +19,7 @@ const getObjectQuerySchema = {
   type: 'object',
   properties: {
     download: { type: 'string', examples: ['filename.jpg', null] },
+    versionId: { type: 'string', examples: ['eaa8bdb5-2e00-4767-b5a9-d2502efe2196'] },
   },
 } as const
 
@@ -40,24 +42,24 @@ export default async function routes(fastify: FastifyInstance) {
         params: getPublicObjectParamsSchema,
         querystring: getObjectQuerySchema,
         summary,
-        response: { '4xx': { $ref: 'errorSchema#', description: 'Error response' } },
+        response: sharedErrorResponseSchemas,
         tags: ['object'],
       },
       config: {
-        operation: { type: ROUTE_OPERATIONS.GET_PUBLIC_OBJECT },
+        operation: ROUTE_OPERATIONS.GET_PUBLIC_OBJECT,
       },
     },
     async (request, response) => {
       const { bucketName } = request.params
       const objectName = request.params['*']
-      const { download } = request.query
+      const { download, versionId } = request.query
 
       const bucketRef = request.storage.asSuperUser().from(bucketName)
       const [, obj] = await Promise.all([
         request.storage.asSuperUser().findBucket(bucketName, 'id,public', {
           isPublic: true,
         }),
-        bucketRef.findObject(objectName, 'id,version,metadata'),
+        bucketRef.findObject(objectName, 'id,version,metadata', undefined, versionId),
       ])
 
       // send the object from s3

@@ -1,6 +1,9 @@
 import { FromSchema } from 'json-schema-to-ts'
 import { bucketSchema } from './bucket'
 
+export const OBJECT_LISTING_FILTER_MODES = ['exclude', 'include', 'only'] as const
+export type ObjectListingFilterMode = (typeof OBJECT_LISTING_FILTER_MODES)[number]
+
 export const objectSchema = {
   $id: 'objectSchema',
   type: 'object',
@@ -20,6 +23,9 @@ export const objectSchema = {
     user_metadata: {
       anyOf: [{ type: 'object', additionalProperties: true }, { type: 'null' }],
     },
+    archived_at: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+    is_delete_marker: { type: 'boolean' },
+    is_versioned: { type: 'boolean' },
     buckets: bucketSchema,
   },
   required: ['name'],
@@ -41,3 +47,18 @@ export const objectSchema = {
 } as const
 
 export type Obj = FromSchema<typeof objectSchema>
+
+export const objectListEntrySchema = {
+  $id: 'objectListEntrySchema',
+  type: 'object',
+  properties: {
+    ...objectSchema.properties,
+    version: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+    is_delete_marker: { anyOf: [{ type: 'boolean' }, { type: 'null' }] },
+    is_versioned: { anyOf: [{ type: 'boolean' }, { type: 'null' }] },
+  },
+  required: ['name'],
+  additionalProperties: false,
+} as const
+
+export type ObjectListEntry = FromSchema<typeof objectListEntrySchema>

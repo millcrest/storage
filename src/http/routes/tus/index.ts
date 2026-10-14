@@ -6,16 +6,28 @@ import { createAgent } from '@internal/http'
 import { logSchema } from '@internal/monitoring'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
 import { getFileSizeLimit } from '@storage/limits'
-import { AlsMemoryKV, FileStore, LockNotifier, PgLocker, UploadId } from '@storage/protocols/tus'
+import {
+  AlsMemoryKV,
+  FileStore,
+  LockNotifier,
+  PgLocker,
+  S3Store,
+  UploadId,
+} from '@storage/protocols/tus'
 import { S3Locker } from '@storage/protocols/tus/s3-locker'
-import { S3Store } from '@tus/s3-store'
 import { DataStore, Server, ServerOptions } from '@tus/server'
-import { FastifyInstance } from 'fastify'
+import type {
+  FastifyInstance,
+  FastifyReply,
+  FastifyRequest,
+  HookHandlerDoneFunction,
+} from 'fastify'
 import fastifyPlugin from 'fastify-plugin'
 import * as http from 'http'
 import type { ServerRequest as Request } from 'srvx'
 import { getConfig } from '../../../config'
 import { db, dbSuperUser, registerJwtAuth, storage } from '../../plugins'
+import { closeConnectionAfterResponse } from '../../plugins/close-connection'
 import { ROUTE_OPERATIONS } from '../operations'
 import {
   generateUrl,
@@ -27,6 +39,7 @@ import {
   onResponseError,
   onUploadFinish,
   SIGNED_URL_SUFFIX,
+  verifySignedUploadRequest,
 } from './lifecycle'
 
 const {
@@ -59,7 +72,7 @@ function createTusStore(agent: { httpsAgent: https.Agent; httpAgent: http.Agent 
         requestHandler: new NodeHttpHandler({
           ...agent,
           connectionTimeout: 5000,
-          requestTimeout: storageS3ClientTimeout,
+          socketTimeout: storageS3ClientTimeout,
         }),
         bucket: storageS3Bucket,
         region: storageS3Region,
@@ -74,24 +87,27 @@ function createTusStore(agent: { httpsAgent: https.Agent; httpAgent: http.Agent 
   })
 }
 
+export function createTusLockS3Client(agent: { httpsAgent: https.Agent; httpAgent: http.Agent }) {
+  const client = new S3Client({
+    requestHandler: new NodeHttpHandler({
+      ...agent,
+      connectionTimeout: 5000,
+      socketTimeout: storageS3ClientTimeout,
+    }),
+    region: storageS3Region,
+    endpoint: storageS3Endpoint,
+    forcePathStyle: storageS3ForcePathStyle,
+  })
+  client.middlewareStack.remove('loggerMiddleware')
+  return client
+}
+
 function createTusServer(
   lockNotifier: LockNotifier,
   agent: { httpsAgent: https.Agent; httpAgent: http.Agent }
 ) {
   const datastore = createTusStore(agent)
-  const sharedS3Client =
-    tusLockType === 's3'
-      ? new S3Client({
-          requestHandler: new NodeHttpHandler({
-            ...agent,
-            connectionTimeout: 5000,
-            requestTimeout: storageS3ClientTimeout,
-          }),
-          region: storageS3Region,
-          endpoint: storageS3Endpoint,
-          forcePathStyle: storageS3ForcePathStyle,
-        })
-      : undefined
+  const sharedS3Client = tusLockType === 's3' ? createTusLockS3Client(agent) : undefined
   const serverOptions: ServerOptions & {
     datastore: DataStore
   } = {
@@ -99,7 +115,7 @@ function createTusServer(
     datastore,
     disableTerminationForFinishedUploads: true,
     locker: (rawReq: Request) => {
-      const req = rawReq.node?.req as MultiPartRequest
+      const req = rawReq.runtime?.node?.req as MultiPartRequest
 
       if (!req) {
         throw ERRORS.InternalError(undefined, 'Request object is missing')
@@ -136,7 +152,7 @@ function createTusServer(
     respectForwardedHeaders: true,
     allowedHeaders: ['Authorization', 'X-Upsert', 'Upload-Expires', 'ApiKey', 'x-signature'],
     maxSize: async (rawReq, uploadId) => {
-      const req = rawReq.node?.req as MultiPartRequest
+      const req = rawReq.runtime?.node?.req as MultiPartRequest
 
       if (!req.upload.tenantId) {
         return uploadFileSizeLimit
@@ -147,6 +163,7 @@ function createTusServer(
       }
 
       const resourceId = UploadId.fromString(uploadId)
+      await verifySignedUploadRequest(req, resourceId)
 
       const bucket = await req.upload.storage
         .asSuperUser()
@@ -195,6 +212,7 @@ export default async function routes(fastify: FastifyInstance) {
 
     fastify.register(authenticatedRoutes, {
       tusServer,
+      signed: false,
     })
   })
 
@@ -206,7 +224,7 @@ export default async function routes(fastify: FastifyInstance) {
 
       fastify.register(authenticatedRoutes, {
         tusServer,
-        operation: '_signed',
+        signed: true,
       })
     },
     { prefix: SIGNED_URL_SUFFIX }
@@ -216,6 +234,7 @@ export default async function routes(fastify: FastifyInstance) {
   fastify.register(async (fastify) => {
     fastify.register(publicRoutes, {
       tusServer,
+      signed: false,
     })
   })
 
@@ -227,15 +246,46 @@ export default async function routes(fastify: FastifyInstance) {
 
       fastify.register(publicRoutes, {
         tusServer,
-        operation: '_signed',
+        signed: true,
       })
     },
     { prefix: SIGNED_URL_SUFFIX }
   )
 }
 
-const authenticatedRoutes = fastifyPlugin(
-  async (fastify: FastifyInstance, options: { tusServer: Server; operation?: string }) => {
+function setTusRequestContext(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  done: HookHandlerDoneFunction,
+  isSigned: boolean
+) {
+  // TUS protocol rejections write directly and skip Fastify's onSend hook.
+  const writeHead = reply.raw.writeHead
+  reply.raw.writeHead = (...args) => {
+    if (args[0] >= 400) {
+      closeConnectionAfterResponse(req.raw, reply.raw, req.raw.executionError)
+    }
+    return Reflect.apply(writeHead, reply.raw, args)
+  }
+  reply.raw.once('close', () => req.db?.dispose())
+
+  ;(req.raw as MultiPartRequest).log = req.log
+  ;(req.raw as MultiPartRequest).upload = {
+    tenantId: req.tenantId,
+    storage: req.storage,
+    owner: req.owner,
+    db: req.db,
+    isUpsert: req.headers['x-upsert'] === 'true',
+    isSigned,
+    reqId: req.id,
+    sbReqId: req.sbReqId,
+  }
+  done()
+}
+
+export const authenticatedRoutes = fastifyPlugin(
+  async (fastify: FastifyInstance, options: { tusServer: Server; signed: boolean }) => {
+    const operationSuffix = options.signed ? '_signed' : ''
     fastify.register(async function authorizationContext(fastify) {
       fastify.addContentTypeParser('application/offset+octet-stream', (request, payload, done) =>
         done(null)
@@ -247,25 +297,16 @@ const authenticatedRoutes = fastifyPlugin(
         })
       })
 
-      fastify.addHook('preHandler', async (req) => {
-        ;(req.raw as MultiPartRequest).log = req.log
-        ;(req.raw as MultiPartRequest).upload = {
-          tenantId: req.tenantId,
-          storage: req.storage,
-          owner: req.owner,
-          db: req.db,
-          isUpsert: req.headers['x-upsert'] === 'true',
-          reqId: req.id,
-          sbReqId: req.sbReqId,
-        }
-      })
+      fastify.addHook('preHandler', (req, res, done) =>
+        setTusRequestContext(req, res, done, options.signed)
+      )
 
       fastify.post(
         '/',
         {
           schema: { summary: 'Handle POST request for TUS Resumable uploads', tags: ['resumable'] },
           config: {
-            operation: { type: `${ROUTE_OPERATIONS.TUS_CREATE_UPLOAD}${options.operation || ''}` },
+            operation: `${ROUTE_OPERATIONS.TUS_CREATE_UPLOAD}${operationSuffix}`,
           },
         },
         async (req, res) => {
@@ -278,7 +319,7 @@ const authenticatedRoutes = fastifyPlugin(
         {
           schema: { summary: 'Handle POST request for TUS Resumable uploads', tags: ['resumable'] },
           config: {
-            operation: { type: `${ROUTE_OPERATIONS.TUS_CREATE_UPLOAD}${options.operation || ''}` },
+            operation: `${ROUTE_OPERATIONS.TUS_CREATE_UPLOAD}${operationSuffix}`,
           },
         },
         async (req, res) => {
@@ -291,7 +332,7 @@ const authenticatedRoutes = fastifyPlugin(
         {
           schema: { summary: 'Handle PUT request for TUS Resumable uploads', tags: ['resumable'] },
           config: {
-            operation: { type: `${ROUTE_OPERATIONS.TUS_UPLOAD_PART}${options.operation || ''}` },
+            operation: `${ROUTE_OPERATIONS.TUS_UPLOAD_PART}${operationSuffix}`,
           },
         },
         async (req, res) => {
@@ -306,7 +347,7 @@ const authenticatedRoutes = fastifyPlugin(
             tags: ['resumable'],
           },
           config: {
-            operation: { type: `${ROUTE_OPERATIONS.TUS_UPLOAD_PART}${options.operation || ''}` },
+            operation: `${ROUTE_OPERATIONS.TUS_UPLOAD_PART}${operationSuffix}`,
           },
         },
         async (req, res) => {
@@ -318,7 +359,7 @@ const authenticatedRoutes = fastifyPlugin(
         {
           schema: { summary: 'Handle HEAD request for TUS Resumable uploads', tags: ['resumable'] },
           config: {
-            operation: { type: `${ROUTE_OPERATIONS.TUS_GET_UPLOAD}${options.operation || ''}` },
+            operation: `${ROUTE_OPERATIONS.TUS_GET_UPLOAD}${operationSuffix}`,
           },
         },
         async (req, res) => {
@@ -333,7 +374,7 @@ const authenticatedRoutes = fastifyPlugin(
             tags: ['resumable'],
           },
           config: {
-            operation: { type: `${ROUTE_OPERATIONS.TUS_DELETE_UPLOAD}${options.operation || ''}` },
+            operation: `${ROUTE_OPERATIONS.TUS_DELETE_UPLOAD}${operationSuffix}`,
           },
         },
         async (req, res) => {
@@ -345,24 +386,16 @@ const authenticatedRoutes = fastifyPlugin(
 )
 
 export const publicRoutes = fastifyPlugin(
-  async (fastify: FastifyInstance, options: { tusServer: Server; operation?: string }) => {
+  async (fastify: FastifyInstance, options: { tusServer: Server; signed: boolean }) => {
+    const operationSuffix = options.signed ? '_signed' : ''
     fastify.register(async (fastify) => {
       fastify.addContentTypeParser('application/offset+octet-stream', (request, payload, done) =>
         done(null)
       )
 
-      fastify.addHook('preHandler', async (req) => {
-        ;(req.raw as MultiPartRequest).log = req.log
-        ;(req.raw as MultiPartRequest).upload = {
-          tenantId: req.tenantId,
-          storage: req.storage,
-          owner: req.owner,
-          db: req.db,
-          isUpsert: req.headers['x-upsert'] === 'true',
-          reqId: req.id,
-          sbReqId: req.sbReqId,
-        }
-      })
+      fastify.addHook('preHandler', (req, res, done) =>
+        setTusRequestContext(req, res, done, options.signed)
+      )
 
       fastify.options(
         '/',
@@ -373,7 +406,7 @@ export const publicRoutes = fastifyPlugin(
             description: 'Handle OPTIONS request for TUS Resumable uploads',
           },
           config: {
-            operation: { type: `${ROUTE_OPERATIONS.TUS_OPTIONS}${options.operation || ''}` },
+            operation: `${ROUTE_OPERATIONS.TUS_OPTIONS}${operationSuffix}`,
           },
         },
         async (req, res) => {
@@ -390,7 +423,7 @@ export const publicRoutes = fastifyPlugin(
             description: 'Handle OPTIONS request for TUS Resumable uploads',
           },
           config: {
-            operation: { type: `${ROUTE_OPERATIONS.TUS_OPTIONS}${options.operation || ''}` },
+            operation: `${ROUTE_OPERATIONS.TUS_OPTIONS}${operationSuffix}`,
           },
         },
         async (req, res) => {

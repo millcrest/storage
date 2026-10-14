@@ -315,17 +315,13 @@ describe('HashSpillWritable', () => {
     const sink = new HashSpillWritable({ limitInMemoryBytes: limit, tmpRoot })
 
     // Stub createWriteStream to fail on creation
-    const spy = vi.spyOn(fs, 'createWriteStream').mockImplementation(() => {
+    vi.spyOn(fs, 'createWriteStream').mockImplementation(() => {
       throw Object.assign(new Error('simulated createWriteStream failure'), { code: 'EACCES' })
     })
 
-    try {
-      await expect(pipeline(readableFrom(payload), sink)).rejects.toThrow(
-        /createWriteStream failure|EACCES|simulated/i
-      )
-    } finally {
-      spy.mockRestore()
-    }
+    await expect(pipeline(readableFrom(payload), sink)).rejects.toThrow(
+      /createWriteStream failure|EACCES|simulated/i
+    )
 
     await expect(waitForHashspillDirs(tmpRoot, 0)).resolves.toBe(0)
   })
@@ -420,17 +416,14 @@ describe('HashSpillWritable', () => {
     const fixedTimestamp = 1234567890123
     vi.spyOn(Date, 'now').mockReturnValue(fixedTimestamp)
 
+    const sinks: HashSpillWritable[] = []
+    let jobs: Promise<string>[] = []
     try {
-      const jobs = Array.from({ length: N }, async (_, idx) => {
+      jobs = Array.from({ length: N }, async (_, idx) => {
         const payload = randBuf(limit + 50 + idx)
         const sink = new HashSpillWritable({ limitInMemoryBytes: limit, tmpRoot })
+        sinks.push(sink)
         await pipeline(readableFrom(payload), sink)
-
-        // Verify file was created successfully despite same timestamp
-        const spillPath = await findSpillFilePath(tmpRoot)
-        expect(spillPath).not.toBeNull()
-
-        await sink.cleanup()
         return sink.digestHex()
       })
 
@@ -438,10 +431,23 @@ describe('HashSpillWritable', () => {
       const digests = await Promise.all(jobs)
       expect(digests).toHaveLength(N)
 
-      await expect(waitForHashspillDirs(tmpRoot, 0)).resolves.toBe(0)
+      // Verify all N unique directories exist concurrently despite identical timestamps
+      const entries = await dirEntries(tmpRoot)
+      const spillDirs = entries.filter((n) => n.startsWith('hashspill-'))
+      expect(spillDirs).toHaveLength(N)
+
+      // Verify each directory contains exactly one spill file with the mocked timestamp prefix
+      for (const dirName of spillDirs) {
+        const files = await fsp.readdir(path.join(tmpRoot, dirName))
+        expect(files).toHaveLength(1)
+        expect(files[0].startsWith(`${fixedTimestamp}-`)).toBe(true)
+      }
     } finally {
-      vi.restoreAllMocks()
+      await Promise.allSettled(jobs)
+      await Promise.all(sinks.map((s) => s.cleanup()))
     }
+
+    await expect(waitForHashspillDirs(tmpRoot, 0)).resolves.toBe(0)
   })
 
   test('concurrent readers on same spilled stream with mixed cleanup strategies', async () => {

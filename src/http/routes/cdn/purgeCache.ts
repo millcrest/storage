@@ -1,3 +1,4 @@
+import { CdnCacheManager } from '@storage/cdn/cdn-cache-manager'
 import { FastifyInstance } from 'fastify'
 import { FromSchema } from 'json-schema-to-ts'
 import { createDefaultSchema, createResponse } from '../../routes-helper'
@@ -50,6 +51,8 @@ interface PurgeTenantRequestInterface extends AuthenticatedRequest {
 }
 
 export default async function routes(fastify: FastifyInstance) {
+  const cdnCache = new CdnCacheManager()
+
   // Purge tenant cache
   fastify.delete<PurgeTenantRequestInterface>(
     '/',
@@ -60,13 +63,13 @@ export default async function routes(fastify: FastifyInstance) {
         tags: ['cdn'],
       }),
       config: {
-        operation: { type: ROUTE_OPERATIONS.PURGE_TENANT_CACHE },
+        operation: ROUTE_OPERATIONS.PURGE_TENANT_CACHE,
       },
     },
     async (request, response) => {
       const { transformations } = request.query
 
-      await request.cdnCache.purge({
+      await cdnCache.purge({
         type: transformations ? 'tenant-transforms' : 'tenant',
         tenant: request.tenantId,
       })
@@ -86,14 +89,14 @@ export default async function routes(fastify: FastifyInstance) {
         tags: ['cdn'],
       }),
       config: {
-        operation: { type: ROUTE_OPERATIONS.PURGE_BUCKET_CACHE },
+        operation: ROUTE_OPERATIONS.PURGE_BUCKET_CACHE,
       },
     },
     async (request, response) => {
       const { bucketName } = request.params
       const { transformations } = request.query
 
-      await request.cdnCache.purge({
+      await cdnCache.purge({
         type: transformations ? 'bucket-transforms' : 'bucket',
         bucket: bucketName,
         tenant: request.tenantId,
@@ -114,7 +117,7 @@ export default async function routes(fastify: FastifyInstance) {
         tags: ['cdn'],
       }),
       config: {
-        operation: { type: ROUTE_OPERATIONS.PURGE_OBJECT_CACHE },
+        operation: ROUTE_OPERATIONS.PURGE_OBJECT_CACHE,
       },
     },
     async (request, response) => {
@@ -122,7 +125,7 @@ export default async function routes(fastify: FastifyInstance) {
       const objectName = request.params['*']
       const { transformations } = request.query
 
-      await request.cdnCache.purge({
+      await cdnCache.purge({
         type: transformations ? 'object-transforms' : 'object',
         bucket: bucketName,
         objectName,

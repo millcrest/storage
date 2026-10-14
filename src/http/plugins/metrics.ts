@@ -19,7 +19,7 @@ function parseMetricSizeHeader(value: number | string | string[] | undefined): n
 
 interface MetricsOptions {
   enabledEndpoint?: boolean
-  excludeRoutes?: string[]
+  excludeRoutes?: Set<string>
 }
 
 export const metrics = (options: MetricsOptions = {}) =>
@@ -47,7 +47,7 @@ export const metricsEndpoint = ({ enabledEndpoint }: MetricsOptions) => {
 
 interface HttpMetricsOptions {
   /** Routes to exclude from metrics collection */
-  excludeRoutes?: string[]
+  excludeRoutes?: Set<string>
 }
 
 /**
@@ -58,37 +58,43 @@ interface HttpMetricsOptions {
 export const httpMetrics = (options: HttpMetricsOptions = {}) =>
   fastifyPlugin(
     async (fastify) => {
-      const excludeRoutes = options.excludeRoutes || [
-        '/metrics',
-        '/status',
-        '/health',
-        '/healthcheck',
-      ]
+      const excludeRoutes = options.excludeRoutes?.size
+        ? options.excludeRoutes
+        : new Set(['/metrics', '/status', '/health', '/healthcheck'])
+      const excludePrefixes = Array.from(excludeRoutes, (route) => route + '/')
 
       // Hook into request lifecycle to measure duration
-      fastify.addHook('onRequest', async (request) => {
+      fastify.addHook('onRequest', (request, _reply, done) => {
         // Store start time on request for later use
-        request.metricsStartTime = process.hrtime.bigint()
+        request.metricsStartTime = performance.now()
+        done()
       })
 
-      fastify.addHook('onResponse', async (request, reply) => {
+      fastify.addHook('onResponse', (request, reply, done) => {
         const route = request.routeOptions?.url || 'unknown'
 
-        // Skip excluded routes (match start of path)
-        if (excludeRoutes.some((r) => route === r || route.startsWith(r + '/'))) {
+        // Skip excluded routes (exact match or subpath)
+        if (excludeRoutes.has(route)) {
+          done()
           return
+        }
+        for (let i = 0; i < excludePrefixes.length; i++) {
+          if (route.startsWith(excludePrefixes[i])) {
+            done()
+            return
+          }
         }
 
         const startTime = request.metricsStartTime
-        if (!startTime) return
+        if (startTime === undefined) {
+          done()
+          return
+        }
 
         // Calculate duration in seconds
-        const endTime = process.hrtime.bigint()
-        const durationNs = endTime - startTime
-        const durationSeconds = Number(durationNs) / 1e9
+        const durationSeconds = (performance.now() - startTime) / 1000
 
-        const operation =
-          request.operation?.type || request.routeOptions?.config?.operation?.type || 'unknown'
+        const operation = request.operation || request.routeOptions?.config?.operation || 'unknown'
 
         // Record request size from content-length header
         const requestContentLength = request.headers['content-length']
@@ -106,6 +112,7 @@ export const httpMetrics = (options: HttpMetricsOptions = {}) =>
           operation,
           reply.statusCode
         )
+        done()
       })
     },
     { name: 'http-metrics' }
@@ -114,6 +121,6 @@ export const httpMetrics = (options: HttpMetricsOptions = {}) =>
 // Extend FastifyRequest to include metricsStartTime
 declare module 'fastify' {
   interface FastifyRequest {
-    metricsStartTime?: bigint
+    metricsStartTime?: number
   }
 }

@@ -5,11 +5,14 @@ import { getConfig } from '../../config'
 const apiKeyPlugin = fastifyPlugin(
   async (fastify) => {
     const { adminApiKeys } = getConfig()
-    const apiKeys = new Set(adminApiKeys.split(','))
-    fastify.addHook('onRequest', async (request, reply) => {
+    const apiKeys = new Set(adminApiKeys.split(',').filter(Boolean))
+    fastify.addHook('onRequest', (request, reply, done) => {
       if (typeof request.headers.apikey !== 'string' || !apiKeys.has(request.headers.apikey)) {
-        return reply.status(401).send()
+        reply.status(401).send()
+        return
       }
+
+      done()
     })
   },
   { name: 'auth-admin-api-key' }

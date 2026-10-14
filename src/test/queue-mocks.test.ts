@@ -81,13 +81,7 @@ async function loadWebhookModule() {
 
 describe('Webhook queue handlers', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
     mockGetTenantConfig.mockResolvedValue({ disableEvents: [] })
-  })
-
-  afterEach(() => {
-    vi.restoreAllMocks()
-    vi.unstubAllGlobals()
   })
 
   it('skips sends when the tenant disables a specific webhook target', async () => {
@@ -176,7 +170,7 @@ describe('Webhook queue handlers', () => {
     const { Webhook } = await loadWebhookModule()
 
     await expect(Webhook.handle(makeJob() as never)).rejects.toThrow(
-      'Failed to send webhook for event ObjectCreated:Post to https://example.com/webhook: timeout of 4000ms exceeded'
+      'Failed to send webhook for event ObjectCreated:Post to https://example.com/webhook: timeout of 6000ms exceeded'
     )
 
     expect(mockLogEvent).toHaveBeenCalledWith(
@@ -190,7 +184,7 @@ describe('Webhook queue handlers', () => {
     )
     expect(mockLoggerError).toHaveBeenCalledWith(
       expect.objectContaining({
-        error: 'timeout of 4000ms exceeded',
+        error: 'timeout of 6000ms exceeded',
         tenantId: 'tenant-a',
         reqId: 'req-123',
         sbReqId: 'sb-req-123',

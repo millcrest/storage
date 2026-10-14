@@ -28,10 +28,6 @@ async function importOtelMetricsModule() {
 }
 
 describe('otel metrics', () => {
-  const originalOtelExporterEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT
-  const originalOtelMetricsEndpoint = process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-  const originalOtelMetricsHeaders = process.env.OTEL_EXPORTER_OTLP_METRICS_HEADERS
-
   afterEach(async () => {
     const otelGlobalState = globalThis as typeof globalThis & OTelGlobalState
 
@@ -40,33 +36,18 @@ describe('otel metrics', () => {
       delete otelGlobalState.__otelMetricsShutdown
     }
 
-    if (originalOtelExporterEndpoint === undefined) {
-      delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT
-    } else {
-      process.env.OTEL_EXPORTER_OTLP_ENDPOINT = originalOtelExporterEndpoint
-    }
-
-    if (originalOtelMetricsEndpoint === undefined) {
-      delete process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-    } else {
-      process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = originalOtelMetricsEndpoint
-    }
-
-    if (originalOtelMetricsHeaders === undefined) {
-      delete process.env.OTEL_EXPORTER_OTLP_METRICS_HEADERS
-    } else {
-      process.env.OTEL_EXPORTER_OTLP_METRICS_HEADERS = originalOtelMetricsHeaders
-    }
-
     for (const moduleId of mockedMetricsModules) {
       vi.doUnmock(moduleId)
     }
 
-    vi.restoreAllMocks()
     vi.resetModules()
   })
 
   test('still shuts down meter provider when unregister throws', async () => {
+    vi.stubEnv(
+      'OTEL_EXPORTER_OTLP_METRICS_HEADERS',
+      'authorization=Basic dXNlcjpwYXNz==,x-api-key=metrics-token'
+    )
     const shutdown = vi.fn().mockResolvedValue(undefined)
     const unregisterError = new Error('metrics unregister failed')
     const unregisterMetricInstrumentations = vi.fn(() => {
@@ -89,6 +70,9 @@ describe('otel metrics', () => {
         getMetricsRequestHandler: vi.fn(),
       }
     })
+    const OTLPMetricExporter = vi.fn(function (_options: unknown) {
+      return {}
+    })
     const RuntimeNodeInstrumentation = vi.fn(function () {
       return {}
     })
@@ -108,6 +92,7 @@ describe('otel metrics', () => {
         version: 'test-version',
         otelMetricsExportIntervalMs: 1000,
         otelMetricsEnabled: true,
+        otlpMetricsEndpoint: 'http://metrics-collector:4317',
         otelMetricsTemporality: 'CUMULATIVE',
         prometheusMetricsEnabled: true,
         region: 'local',
@@ -126,9 +111,7 @@ describe('otel metrics', () => {
       },
     }))
     vi.doMock('@opentelemetry/exporter-metrics-otlp-grpc', () => ({
-      OTLPMetricExporter: vi.fn(function () {
-        return {}
-      }),
+      OTLPMetricExporter,
     }))
     vi.doMock('@opentelemetry/exporter-prometheus', () => ({
       PrometheusExporter,
@@ -164,6 +147,11 @@ describe('otel metrics', () => {
 
     expect(unregisterMetricInstrumentations).toHaveBeenCalledTimes(1)
     expect(shutdown).toHaveBeenCalledTimes(1)
+    expect(OTLPMetricExporter).toHaveBeenCalledWith(
+      expect.objectContaining({ url: 'http://metrics-collector:4317' })
+    )
+    expect(OTLPMetricExporter.mock.calls[0][0]).not.toHaveProperty('headers')
+    expect(OTLPMetricExporter.mock.calls[0][0]).not.toHaveProperty('metadata')
     expect(unregisterMetricInstrumentations.mock.invocationCallOrder[0]).toBeLessThan(
       shutdown.mock.invocationCallOrder[0]
     )
@@ -175,9 +163,6 @@ describe('otel metrics', () => {
   })
 
   test('registers metric views for HTTP size cardinality and runtime GC buckets', async () => {
-    delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT
-    delete process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-
     const registerInstrumentations = vi.fn(() => vi.fn())
     const HostMetrics = vi.fn(function () {
       return {
@@ -296,9 +281,6 @@ describe('otel metrics', () => {
   })
 
   test('does not create a Prometheus reader when Prometheus metrics are disabled', async () => {
-    delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT
-    delete process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-
     const registerInstrumentations = vi.fn(() => vi.fn())
     const HostMetrics = vi.fn(function () {
       return {
@@ -389,9 +371,6 @@ describe('otel metrics', () => {
   })
 
   test('uses Watt worker identity as the OTel service instance id', async () => {
-    delete process.env.OTEL_EXPORTER_OTLP_ENDPOINT
-    delete process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-
     const registerInstrumentations = vi.fn(() => vi.fn())
     const resourceFromAttributes = vi.fn((attributes) => attributes)
     const HostMetrics = vi.fn(function () {
